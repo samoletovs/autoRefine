@@ -1,0 +1,99 @@
+name: "autoRefine — Evaluate All Projects"
+
+on:
+  schedule:
+    # Weekly: Wednesday 06:00 UTC
+    - cron: '0 6 * * 3'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Run mode'
+        required: false
+        default: 'evaluate'
+        type: choice
+        options:
+          - evaluate
+          - plan
+      repo:
+        description: 'Single repo to evaluate (leave empty for all)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    env:
+      FOUNDRY_PROJECT_ENDPOINT: ${{ secrets.FOUNDRY_PROJECT_ENDPOINT }}
+      TELEGRAM_NOTIFY_URL: ${{ secrets.TELEGRAM_NOTIFY_URL }}
+    steps:
+      - name: Checkout autoRefine
+        uses: actions/checkout@v4
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+      - name: Checkout governance (for manifest)
+        uses: actions/checkout@v4
+        with:
+          repository: samoletovs/nauroLabs-github
+          path: .github-gov
+          token: ${{ secrets.GH_PAT }}
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Run autoRefine
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          MODE="${{ github.event.inputs.mode || 'evaluate' }}"
+          REPO_FLAG=""
+          if [ -n "${{ github.event.inputs.repo }}" ]; then
+            REPO_FLAG="--repo samoletovs/${{ github.event.inputs.repo }}"
+          else
+            REPO_FLAG="--manifest .github-gov/config/workspace-manifest.json"
+          fi
+
+          python -m agent.main $REPO_FLAG --mode $MODE \
+            --workdir /tmp/autorefine \
+            > /tmp/autorefine-report.json 2>&1 || true
+
+          cat /tmp/autorefine-report.json
+
+      - name: Notify Telegram
+        if: always()
+        run: |
+          if [ -z "$TELEGRAM_NOTIFY_URL" ]; then
+            echo "TELEGRAM_NOTIFY_URL not set; skipping"
+            exit 0
+          fi
+
+          SUMMARY=$(tail -20 /tmp/autorefine-report.json 2>/dev/null || echo "No report")
+
+          python3 - <<'PY' || echo "::warning::Telegram notification failed"
+          import json, os, sys, urllib.request, urllib.error
+          url = os.environ["TELEGRAM_NOTIFY_URL"]
+          msg = f"🔧 autoRefine weekly evaluation complete\n\n{os.environ.get('SUMMARY', 'See workflow logs')}"
+          data = json.dumps({"text": msg}).encode()
+          req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+          try:
+              urllib.request.urlopen(req, timeout=10)
+          except urllib.error.HTTPError as e:
+              print(f"Telegram error: {e}")
+          PY

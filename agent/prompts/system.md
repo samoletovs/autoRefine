@@ -39,7 +39,10 @@ You can:
 
 ## Output format
 
-When evaluating, produce a structured report:
+You MUST always call the `submit_plan` tool to deliver your final evaluation.
+Do NOT write the plan as a text message — use the tool.
+
+When evaluating, your submit_plan call should include:
 
 ```
 ## Evaluation: {project_name}

@@ -36,145 +36,53 @@ ENDPOINT = os.environ.get("FOUNDRY_PROJECT_ENDPOINT", "")
 
 SYSTEM_PROMPT = (Path(__file__).parent / "prompts" / "system.md").read_text(encoding="utf-8")
 
-# ── Tool definitions (JSON schema for function-calling) ──────────────────────
 
-TOOL_DEFINITIONS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "read_project_file",
-            "description": "Read a file from the project repository. Use to inspect source code, configs, docs.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Relative path from project root, e.g. 'src/App.tsx' or 'package.json'",
-                    },
-                    "max_lines": {
-                        "type": "integer",
-                        "description": "Maximum number of lines to return (default 200)",
-                        "default": 200,
-                    },
-                },
-                "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_directory",
-            "description": "List files and subdirectories in a project directory.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Relative path from project root. Use '.' for root.",
-                        "default": ".",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_web",
-            "description": "Search the web for information about similar products, features, or best practices. Use to research competitors listed in project.yaml.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Search query, e.g. 'Fitbod app key features 2026'",
-                    },
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "run_project_tests",
-            "description": "Run the project's test suite. Returns pass/fail and output.",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "submit_plan",
-            "description": "Submit a structured improvement plan. Call this when you have analyzed the project and are ready to recommend improvements.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "score": {
-                        "type": "integer",
-                        "description": "Overall project quality score 0-100",
-                    },
-                    "summary": {
-                        "type": "string",
-                        "description": "2-3 sentence executive summary of findings",
-                    },
-                    "improvements": {
-                        "type": "array",
-                        "description": "Ordered list of recommended improvements",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "title": {"type": "string"},
-                                "description": {"type": "string"},
-                                "priority": {
-                                    "type": "string",
-                                    "enum": ["P0", "P1", "P2", "P3"],
-                                },
-                                "effort": {
-                                    "type": "string",
-                                    "enum": ["S", "M", "L"],
-                                },
-                                "category": {
-                                    "type": "string",
-                                    "enum": [
-                                        "feature",
-                                        "quality",
-                                        "security",
-                                        "performance",
-                                        "ux",
-                                        "docs",
-                                        "tests",
-                                        "deps",
-                                    ],
-                                },
-                                "auto_fixable": {"type": "boolean"},
-                            },
-                            "required": [
-                                "title",
-                                "description",
-                                "priority",
-                                "effort",
-                                "category",
-                            ],
-                        },
-                    },
-                    "research_insights": {
-                        "type": "array",
-                        "description": "Insights from researching similar products",
-                        "items": {"type": "string"},
-                    },
-                },
-                "required": ["score", "summary", "improvements"],
-            },
-        },
-    },
-]
+# ── Tool definitions as typed Python functions (SDK inspects these) ──────────
+
+def read_project_file(path: str, max_lines: int = 200) -> str:
+    """Read a file from the project repository to inspect source code, configs, or docs.
+
+    :param path: Relative path from project root, e.g. 'src/App.tsx' or 'package.json'
+    :param max_lines: Maximum number of lines to return (default 200)
+    """
+    return ""  # Stub — actual execution in TOOL_HANDLERS
+
+
+def list_directory(path: str = ".") -> str:
+    """List files and subdirectories in a project directory.
+
+    :param path: Relative path from project root. Use '.' for root.
+    """
+    return ""
+
+
+def search_web(query: str) -> str:
+    """Search the web for information about similar products, features, or best practices.
+
+    :param query: Search query, e.g. 'Fitbod app key features 2026'
+    """
+    return ""
+
+
+def run_project_tests() -> str:
+    """Run the project's test suite. Returns pass/fail and output."""
+    return ""
+
+
+def submit_plan(
+    score: int,
+    summary: str,
+    improvements: list,
+    research_insights: list | None = None,
+) -> str:
+    """Submit a structured improvement plan after analyzing the project.
+
+    :param score: Overall project quality score 0-100
+    :param summary: 2-3 sentence executive summary of findings
+    :param improvements: Ordered list of recommended improvements (dicts with title, description, priority, effort, category)
+    :param research_insights: Insights from researching similar products
+    """
+    return ""
 
 
 # ── Tool implementations ─────────────────────────────────────────────────────
@@ -303,13 +211,19 @@ TOOL_HANDLERS = {
 
 def create_agent(client: AgentsClient) -> str:
     """Create (or reuse) the autoRefine Foundry agent."""
-    tools = [FunctionTool(functions=TOOL_DEFINITIONS)]
+    tools = FunctionTool(functions={
+        read_project_file,
+        list_directory,
+        search_web,
+        run_project_tests,
+        submit_plan,
+    })
 
     agent = client.create_agent(
         model=DEPLOYMENT,
         name="autorefine",
         instructions=SYSTEM_PROMPT,
-        tools=tools,
+        tools=tools.definitions,
         temperature=0.3,
     )
     log.info("Created agent: %s", agent.id)
