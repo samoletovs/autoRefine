@@ -3,6 +3,7 @@
 import argparse
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -36,10 +37,6 @@ def evaluate_project(project_dir: Path, config: ProjectConfig) -> dict:
     # Technical quality checks (deterministic)
     findings = run_quality_checks(str(project_dir), config)
 
-    # Build evaluation context for LLM
-    context = config.to_context()
-    log.info("Project context:\n%s", context)
-
     report = {
         "project": config.name,
         "stage": config.stage,
@@ -55,6 +52,43 @@ def evaluate_project(project_dir: Path, config: ProjectConfig) -> dict:
         config.name, report["score"], len(findings),
     )
     return report
+
+
+def plan_project(project_dir: Path, config: ProjectConfig, findings: list[dict]) -> dict | None:
+    """Use Foundry agent to create an improvement plan."""
+    endpoint = os.environ.get("FOUNDRY_PROJECT_ENDPOINT", "")
+    if not endpoint:
+        log.error("FOUNDRY_PROJECT_ENDPOINT not set — cannot run plan mode.")
+        log.info("Set it in .env or environment. See .env.example.")
+        return None
+
+    from azure.ai.agents import AgentsClient
+    from azure.identity import DefaultAzureCredential
+
+    from agent.foundry_agent import build_plan_task, create_agent, run_agent
+
+    client = AgentsClient(
+        endpoint=endpoint,
+        credential=DefaultAzureCredential(),
+    )
+
+    agent_id = create_agent(client)
+
+    try:
+        task = build_plan_task(findings, config)
+        plan = run_agent(client, agent_id, project_dir, config, task)
+
+        if plan:
+            log.info(
+                "Plan received: score=%d, %d improvements",
+                plan.get("score", 0),
+                len(plan.get("improvements", [])),
+            )
+        return plan
+    finally:
+        # Clean up agent
+        client.delete_agent(agent_id)
+        log.info("Agent cleaned up.")
 
 
 def main() -> None:
@@ -107,13 +141,34 @@ def main() -> None:
             log.warning("%s has no project.yaml — skipping", name)
             continue
 
+        # Step 1: Always evaluate first (deterministic checks)
+        report = evaluate_project(project_dir, project_config)
+
         if config.mode == "evaluate":
-            report = evaluate_project(project_dir, project_config)
             print(json.dumps(report, indent=2))
 
-        elif config.mode in ("plan", "refine"):
-            log.info("Mode '%s' not yet implemented — coming soon", config.mode)
-            # TODO: Foundry agent integration for planning + execution
+        elif config.mode == "plan":
+            print(json.dumps(report, indent=2))
+            plan = plan_project(project_dir, project_config, report["findings"])
+            if plan:
+                print("\n--- IMPROVEMENT PLAN ---")
+                print(json.dumps(plan, indent=2))
+
+        elif config.mode == "refine":
+            plan = plan_project(project_dir, project_config, report["findings"])
+            if plan:
+                auto_fixable = [
+                    imp for imp in plan.get("improvements", [])
+                    if imp.get("auto_fixable")
+                ]
+                if auto_fixable:
+                    log.info(
+                        "%d auto-fixable improvements found. "
+                        "Execution mode not yet implemented — showing plan.",
+                        len(auto_fixable),
+                    )
+                print(json.dumps(plan, indent=2))
+            # TODO: execute auto-fixable improvements, run tests, create PR
 
     log.info("autoRefine complete.")
 
