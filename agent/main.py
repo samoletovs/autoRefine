@@ -76,7 +76,7 @@ def plan_project(project_dir: Path, config: ProjectConfig, findings: list[dict])
         credential=DefaultAzureCredential(),
     )
 
-    agent_id = create_agent(client)
+    agent_id = create_agent(client, mode="plan")
 
     try:
         task = build_plan_task(findings, config)
@@ -90,7 +90,135 @@ def plan_project(project_dir: Path, config: ProjectConfig, findings: list[dict])
             )
         return plan
     finally:
-        # Clean up agent
+        client.delete_agent(agent_id)
+        log.info("Agent cleaned up.")
+
+
+def refine_project(
+    project_dir: Path,
+    config: ProjectConfig,
+    plan: dict,
+    repo: str,
+    dry_run: bool = False,
+) -> bool:
+    """Use Foundry agent to execute improvements, then create a PR."""
+    endpoint = os.environ.get("FOUNDRY_PROJECT_ENDPOINT", "")
+    if not endpoint:
+        log.error("FOUNDRY_PROJECT_ENDPOINT not set — cannot run refine mode.")
+        return False
+
+    from azure.ai.agents import AgentsClient
+    from azure.identity import DefaultAzureCredential
+
+    from agent.foundry_agent import build_refine_task, create_agent, run_agent
+    from agent.tools.github_tools import (
+        commit_and_push,
+        create_branch,
+        create_pr,
+    )
+
+    client = AgentsClient(
+        endpoint=endpoint,
+        credential=DefaultAzureCredential(),
+    )
+
+    # Create branch
+    import datetime
+
+    today = datetime.date.today().isoformat()
+    branch = f"autorefine/improve-{today}"
+
+    if not create_branch(project_dir, branch):
+        log.warning("Failed to create branch %s — may already exist", branch)
+        # Try with a suffix
+        branch = f"autorefine/improve-{today}-2"
+        if not create_branch(project_dir, branch):
+            log.error("Cannot create branch — skipping refine")
+            return False
+
+    agent_id = create_agent(client, mode="refine")
+
+    try:
+        task = build_refine_task(plan, config)
+        result = run_agent(client, agent_id, project_dir, config, task)
+
+        # Check if agent made any changes
+        import subprocess
+
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(project_dir),
+            capture_output=True,
+            text=True,
+        )
+        changed_files = [
+            line.strip().split(maxsplit=1)[-1]
+            for line in status.stdout.strip().splitlines()
+            if line.strip()
+        ]
+
+        if not changed_files:
+            log.info("No files changed — nothing to commit.")
+            return False
+
+        log.info("Files changed: %s", changed_files)
+
+        if dry_run:
+            log.info("[DRY RUN] Would commit %d files and create PR", len(changed_files))
+            return False
+
+        # Commit and push
+        improvements = plan.get("improvements", [])
+        titles = [imp.get("title", "") for imp in improvements[:5]]
+        commit_msg = (
+            f"feat(autorefine): apply {len(changed_files)} improvements\n\n"
+            + "\n".join(f"- {t}" for t in titles)
+        )
+
+        if not commit_and_push(project_dir, commit_msg, branch):
+            log.error("Failed to push changes")
+            return False
+
+        # Determine base branch
+        base = "main"
+        base_check = subprocess.run(
+            ["git", "branch", "-r", "--list", "origin/master"],
+            cwd=str(project_dir),
+            capture_output=True,
+            text=True,
+        )
+        if "origin/master" in base_check.stdout:
+            base = "master"
+
+        # Create PR
+        pr_body = "## autoRefine Improvements\n\n"
+        pr_body += f"Score before: {plan.get('score', '?')}/100\n\n"
+        pr_body += "### Changes\n"
+        for imp in improvements[:5]:
+            pr_body += f"- **{imp.get('title', '')}**: {imp.get('description', '')}\n"
+        pr_body += (
+            "\n### Safety\n"
+            "All changes were applied by the autoRefine Foundry agent. "
+            "Review carefully before merging.\n"
+        )
+
+        pr_created = create_pr(
+            project_dir,
+            repo,
+            title=f"feat(autorefine): {len(changed_files)} improvements",
+            body=pr_body,
+            branch=branch,
+            base=base,
+        )
+
+        if pr_created:
+            log.info("PR created on %s", repo)
+        else:
+            log.warning("PR creation failed — changes are on branch %s", branch)
+
+        return pr_created
+
+    finally:
         client.delete_agent(agent_id)
         log.info("Agent cleaned up.")
 
@@ -112,7 +240,6 @@ def main() -> None:
     elif args.manifest:
         repos = load_repos_from_manifest(Path(args.manifest))
     else:
-        # Default: use NauroLabs manifest
         if MANIFEST_PATH.exists():
             repos = load_repos_from_manifest(MANIFEST_PATH)
         else:
@@ -159,20 +286,27 @@ def main() -> None:
                 print(json.dumps(plan, indent=2))
 
         elif config.mode == "refine":
+            # Plan first
             plan = plan_project(project_dir, project_config, report["findings"])
-            if plan:
-                auto_fixable = [
-                    imp for imp in plan.get("improvements", [])
-                    if imp.get("auto_fixable")
-                ]
-                if auto_fixable:
-                    log.info(
-                        "%d auto-fixable improvements found. "
-                        "Execution mode not yet implemented — showing plan.",
-                        len(auto_fixable),
-                    )
-                print(json.dumps(plan, indent=2))
-            # TODO: execute auto-fixable improvements, run tests, create PR
+            if not plan:
+                log.warning("No plan generated for %s — skipping refine", name)
+                continue
+
+            print(json.dumps(plan, indent=2))
+
+            # Execute improvements
+            log.info(
+                "Executing %d improvements on %s...",
+                len(plan.get("improvements", [])),
+                name,
+            )
+            success = refine_project(
+                project_dir, project_config, plan, repo, dry_run=config.dry_run,
+            )
+            if success:
+                log.info("PR created for %s", name)
+            else:
+                log.info("No PR created for %s (no changes or dry run)", name)
 
     log.info("autoRefine complete.")
 

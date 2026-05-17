@@ -85,6 +85,25 @@ def submit_plan(
     return ""
 
 
+def write_project_file(path: str, content: str) -> str:
+    """Write or overwrite a file in the project repository. Use for applying improvements.
+
+    :param path: Relative path from project root, e.g. 'src/utils/helpers.ts'
+    :param content: The full file content to write
+    """
+    return ""
+
+
+def apply_improvement(title: str, description: str, files_changed: list) -> str:
+    """Signal that an improvement has been applied. Call after writing all files for one improvement.
+
+    :param title: Title of the improvement being applied
+    :param description: Brief description of what was changed
+    :param files_changed: List of file paths that were modified
+    """
+    return ""
+
+
 # ── Tool implementations ─────────────────────────────────────────────────────
 
 def _handle_read_project_file(project_dir: Path, args: dict) -> str:
@@ -146,19 +165,67 @@ def _handle_list_directory(project_dir: Path, args: dict) -> str:
 
 
 def _handle_search_web(_project_dir: Path, args: dict) -> str:
-    """Web search via a lightweight approach (httpx + search API or fallback)."""
+    """Web search via DuckDuckGo HTML (no API key needed)."""
+    import re as _re
+
+    import httpx
+
     query = args.get("query", "")
     if not query:
         return json.dumps({"error": "Empty query"})
 
-    # Use gh CLI's copilot search as a fallback if no search API key
-    # For now, return a stub that the agent can work with
     log.info("Web search: %s", query)
-    return json.dumps({
-        "query": query,
-        "note": "Web search not yet connected. Use your training knowledge about these products.",
-        "suggestion": "Analyze based on common knowledge of the similar products listed in project.yaml.",
-    })
+
+    try:
+        resp = httpx.get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": query},
+            headers={"User-Agent": "autoRefine/1.0 (project improvement agent)"},
+            timeout=15,
+            follow_redirects=True,
+        )
+        resp.raise_for_status()
+
+        # Extract result snippets from DDG HTML
+        results = []
+        # DDG HTML results are in <a class="result__a"> and <a class="result__snippet">
+        title_pattern = _re.compile(
+            r'<a[^>]*class="result__a"[^>]*>(.*?)</a>', _re.DOTALL
+        )
+        snippet_pattern = _re.compile(
+            r'<a[^>]*class="result__snippet"[^>]*>(.*?)</a>', _re.DOTALL
+        )
+        url_pattern = _re.compile(
+            r'<a[^>]*class="result__url"[^>]*href="([^"]*)"', _re.DOTALL
+        )
+
+        titles = title_pattern.findall(resp.text)
+        snippets = snippet_pattern.findall(resp.text)
+        urls = url_pattern.findall(resp.text)
+
+        for i in range(min(5, len(titles))):
+            # Strip HTML tags from snippets
+            title = _re.sub(r"<[^>]+>", "", titles[i]).strip()
+            snippet = _re.sub(r"<[^>]+>", "", snippets[i]).strip() if i < len(snippets) else ""
+            url = urls[i] if i < len(urls) else ""
+            results.append({"title": title, "snippet": snippet, "url": url})
+
+        if not results:
+            return json.dumps({
+                "query": query,
+                "results": [],
+                "note": "No results found. Use your training knowledge instead.",
+            })
+
+        return json.dumps({"query": query, "results": results})
+
+    except (httpx.HTTPError, httpx.TimeoutException) as e:
+        log.warning("Web search failed: %s", e)
+        return json.dumps({
+            "query": query,
+            "error": f"Search failed: {e}",
+            "note": "Use your training knowledge about these products.",
+        })
 
 
 def _handle_run_tests(project_dir: Path, _args: dict) -> str:
@@ -198,26 +265,73 @@ def _handle_submit_plan(_project_dir: Path, args: dict) -> str:
     return json.dumps({"status": "plan_received", "improvements_count": len(args.get("improvements", []))})
 
 
+def _handle_write_project_file(project_dir: Path, args: dict) -> str:
+    """Write a file in the project (for refine mode)."""
+    rel_path = args.get("path", "")
+    content = args.get("content", "")
+
+    if not rel_path:
+        return json.dumps({"error": "No path specified"})
+
+    target = project_dir / rel_path
+
+    # Security: don't escape project directory
+    try:
+        target.resolve().relative_to(project_dir.resolve())
+    except ValueError:
+        return json.dumps({"error": "Path traversal blocked"})
+
+    # Don't allow writing to dangerous paths
+    dangerous = {".git", ".env", "node_modules", ".github/workflows"}
+    for d in dangerous:
+        if rel_path.startswith(d):
+            return json.dumps({"error": f"Cannot write to {d}/ — protected path"})
+
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        return json.dumps({"status": "written", "path": rel_path, "bytes": len(content)})
+    except OSError as e:
+        return json.dumps({"error": str(e)})
+
+
+def _handle_apply_improvement(_project_dir: Path, args: dict) -> str:
+    """Acknowledge an improvement was applied."""
+    return json.dumps({
+        "status": "improvement_applied",
+        "title": args.get("title", ""),
+        "files_changed": args.get("files_changed", []),
+    })
+
+
 TOOL_HANDLERS = {
     "read_project_file": _handle_read_project_file,
     "list_directory": _handle_list_directory,
     "search_web": _handle_search_web,
     "run_project_tests": _handle_run_tests,
     "submit_plan": _handle_submit_plan,
+    "write_project_file": _handle_write_project_file,
+    "apply_improvement": _handle_apply_improvement,
 }
 
 
 # ── Agent orchestration ──────────────────────────────────────────────────────
 
-def create_agent(client: AgentsClient) -> str:
-    """Create (or reuse) the autoRefine Foundry agent."""
-    tools = FunctionTool(functions={
+def create_agent(client: AgentsClient, mode: str = "plan") -> str:
+    """Create the autoRefine Foundry agent. In refine mode, includes write tools."""
+    tool_functions = {
         read_project_file,
         list_directory,
         search_web,
         run_project_tests,
         submit_plan,
-    })
+    }
+
+    if mode == "refine":
+        tool_functions.add(write_project_file)
+        tool_functions.add(apply_improvement)
+
+    tools = FunctionTool(functions=tool_functions)
 
     agent = client.create_agent(
         model=DEPLOYMENT,
@@ -226,7 +340,7 @@ def create_agent(client: AgentsClient) -> str:
         tools=tools.definitions,
         temperature=0.3,
     )
-    log.info("Created agent: %s", agent.id)
+    log.info("Created agent: %s (mode=%s)", agent.id, mode)
     return agent.id
 
 
@@ -345,3 +459,33 @@ def build_plan_task(findings: list[dict], config: ProjectConfig) -> str:
 
 Focus on actionable, specific improvements — not generic advice.
 {findings_text}{similar_text}"""
+
+
+def build_refine_task(plan: dict, config: ProjectConfig) -> str:
+    """Build the task prompt for refine mode — execute auto-fixable improvements."""
+    improvements = plan.get("improvements", [])
+
+    items_text = ""
+    for i, imp in enumerate(improvements, 1):
+        items_text += f"{i}. [{imp.get('priority', 'P2')}] {imp.get('title', '')}: {imp.get('description', '')}\n"
+
+    return f"""You have an improvement plan for this project. Your job is to EXECUTE the improvements.
+
+## Improvements to apply
+{items_text}
+
+## Instructions
+1. Read the relevant source files to understand the current code.
+2. For each improvement you can confidently implement:
+   a. Use write_project_file to create or modify files.
+   b. Call apply_improvement when done with each improvement.
+3. After all changes, run the test suite to verify nothing broke.
+4. If tests fail, read the output and fix the issue.
+5. Finally, call submit_plan with an updated score reflecting the improvements.
+
+## Rules
+- Only implement improvements you are confident about (>80% certainty).
+- Skip improvements that require domain expertise you don't have.
+- Never modify .env, .git, node_modules, or workflow files.
+- Keep changes minimal and focused — don't refactor unrelated code.
+- If a test fails after your changes, revert that specific change."""
