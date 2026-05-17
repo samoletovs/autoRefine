@@ -109,7 +109,7 @@ def apply_improvement(title: str, description: str, files_changed: list) -> str:
 def _handle_read_project_file(project_dir: Path, args: dict) -> str:
     """Read a file from the project."""
     rel_path = args.get("path", "")
-    max_lines = args.get("max_lines", 200)
+    max_lines = int(args.get("max_lines", 200))
     target = project_dir / rel_path
 
     if not target.exists():
@@ -428,12 +428,73 @@ def run_agent(
     for msg in messages:
         if msg.role == MessageRole.AGENT:
             for block in msg.text_messages:
-                log.info("Agent response:\n%s", block.text.value)
+                agent_text = block.text.value
+                log.info("Agent response:\n%s", agent_text)
+
+                # Fallback: if agent didn't call submit_plan, parse from text
+                if plan_result is None and "Score:" in agent_text:
+                    plan_result = _parse_plan_from_text(agent_text)
+                    if plan_result:
+                        log.info("Parsed plan from text response (submit_plan not called)")
 
     # Clean up
     client.threads.delete(thread.id)
 
     return plan_result
+
+
+def _parse_plan_from_text(text: str) -> dict | None:
+    """Fallback parser: extract a plan from the agent's text response."""
+    import re as _re
+
+    plan: dict = {"score": 50, "summary": "", "improvements": [], "research_insights": []}
+
+    # Extract score
+    score_match = _re.search(r"Score:\s*(\d+)/100", text)
+    if score_match:
+        plan["score"] = int(score_match.group(1))
+
+    # Extract summary from the first paragraph after "Findings"
+    lines = text.splitlines()
+
+    # Extract improvements from numbered items with priority tags
+    current_title = ""
+    current_desc = ""
+    current_priority = "P2"
+    for line in lines:
+        # Match lines like: 1. **Title** — description or 1. [P0] **Title**: description
+        imp_match = _re.match(
+            r"\d+\.\s+(?:\[P(\d)\]\s+)?\*\*(.+?)\*\*\s*[ù—:\-]+\s*(.*)", line
+        )
+        if imp_match:
+            if current_title:
+                plan["improvements"].append({
+                    "title": current_title,
+                    "description": current_desc,
+                    "priority": current_priority,
+                    "effort": "M",
+                    "category": "quality",
+                })
+            p = imp_match.group(1)
+            current_priority = f"P{p}" if p else "P2"
+            current_title = imp_match.group(2).strip()
+            current_desc = imp_match.group(3).strip()
+
+    # Append last improvement
+    if current_title:
+        plan["improvements"].append({
+            "title": current_title,
+            "description": current_desc,
+            "priority": current_priority,
+            "effort": "M",
+            "category": "quality",
+        })
+
+    if not plan["improvements"]:
+        return None
+
+    plan["summary"] = f"Score {plan['score']}/100 with {len(plan['improvements'])} improvements identified."
+    return plan
 
 
 def build_plan_task(findings: list[dict], config: ProjectConfig) -> str:
