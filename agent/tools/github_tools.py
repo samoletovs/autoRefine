@@ -94,7 +94,7 @@ def create_pr(
     branch: str,
     base: str = "main",
 ) -> bool:
-    """Create a pull request via gh CLI."""
+    """Create a pull request via gh CLI and enable auto-merge."""
     result = subprocess.run(
         [
             "gh", "pr", "create",
@@ -109,4 +109,22 @@ def create_pr(
         text=True,
         timeout=30,
     )
-    return result.returncode == 0
+    if result.returncode != 0:
+        return False
+
+    # Enable auto-merge (squash) so the PR merges when CI passes
+    subprocess.run(
+        [
+            "gh", "pr", "merge",
+            "--repo", repo,
+            "--head", branch,
+            "--squash",
+            "--auto",
+        ],
+        cwd=str(project_dir),
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    return True
