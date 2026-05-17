@@ -2,8 +2,8 @@ name: "autoRefine — Evaluate All Projects"
 
 on:
   schedule:
-    # Weekly: Wednesday 06:00 UTC
-    - cron: '0 6 * * 3'
+    # Daily at 06:00 UTC
+    - cron: '0 6 * * *'
   workflow_dispatch:
     inputs:
       mode:
@@ -84,16 +84,33 @@ jobs:
             exit 0
           fi
 
-          SUMMARY=$(tail -20 /tmp/autorefine-report.json 2>/dev/null || echo "No report")
+          # Extract scores from the evaluate output
+          SCORES=$(grep -oP '"project":\s*"\K[^"]+|"score":\s*\K\d+' /tmp/autorefine-report.json 2>/dev/null | paste - - | awk '{printf "%s: %s/100\n", $1, $2}' | head -20)
+          TOTAL=$(echo "$SCORES" | wc -l)
+          AVG=$(grep -oP '"score":\s*\K\d+' /tmp/autorefine-report.json 2>/dev/null | awk '{s+=$1; n++} END {if(n>0) printf "%d", s/n; else print "?"}')
 
-          python3 - <<'PY' || echo "::warning::Telegram notification failed"
-          import json, os, sys, urllib.request, urllib.error
+          python3 - <<PY || echo "::warning::Telegram notification failed"
+          import json, os, urllib.request, urllib.error
+
           url = os.environ["TELEGRAM_NOTIFY_URL"]
-          msg = f"🔧 autoRefine weekly evaluation complete\n\n{os.environ.get('SUMMARY', 'See workflow logs')}"
+          scores = os.environ.get("SCORES", "No data")
+          total = os.environ.get("TOTAL", "?")
+          avg = os.environ.get("AVG", "?")
+          mode = "${{ github.event.inputs.mode || 'evaluate' }}"
+
+          msg = f"🔧 autoRefine daily {mode}\n\n"
+          msg += f"📊 {total} projects, avg {avg}/100\n\n"
+          msg += scores
+
           data = json.dumps({"text": msg}).encode()
           req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
           try:
               urllib.request.urlopen(req, timeout=10)
+              print("Telegram notification sent")
           except urllib.error.HTTPError as e:
               print(f"Telegram error: {e}")
           PY
+        env:
+          SCORES: ${{ env.SCORES }}
+          TOTAL: ${{ env.TOTAL }}
+          AVG: ${{ env.AVG }}
