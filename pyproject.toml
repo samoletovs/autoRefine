@@ -1,0 +1,30 @@
+[project]
+name = "autorefine"
+version = "0.1.0"
+description = "AI agent that continuously evaluates and improves software projects"
+requires-python = ">=3.11"
+dependencies = [
+    "azure-ai-projects>=1.0.0",
+    "azure-ai-agents>=1.1.0",
+    "azure-identity>=1.19.0",
+    "openai>=1.55.0",
+    "pyyaml>=6.0.2",
+    "python-dotenv>=1.0.1",
+    "httpx>=0.27.0",
+    "azure-monitor-opentelemetry>=1.6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.7.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

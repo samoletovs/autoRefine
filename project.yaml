@@ -1,0 +1,19 @@
+name: autoRefine
+purpose: "AI agent that continuously evaluates and improves software projects — understands vision, researches competition, plans improvements, executes and tests"
+users: "Developers and teams who want their projects to self-improve"
+stage: mvp
+goals:
+  - "Understand projects technically AND functionally (via project.yaml)"
+  - "Research similar products and identify feature gaps"
+  - "Evaluate code quality, architecture, and user experience"
+  - "Create prioritized improvement plans"
+  - "Ask user when confidence is low, execute autonomously when safe"
+  - "Run tests and create PRs for all changes"
+  - "Generic — works on any GitHub project with a project.yaml"
+similar:
+  - "Dependabot (deps only)"
+  - "Renovate (deps only)"
+  - "Copilot Coding Agent (issue-driven)"
+  - "Sweep AI"
+quality:
+  - tests
