@@ -652,7 +652,8 @@ def enforce_report_retention(token: str) -> None:
         files = sorted(resp.json(), key=lambda f: f["name"])
         while len(files) > MAX_REPORTS:
             oldest = files.pop(0)
-            client.delete(
+            client.request(
+                "DELETE",
                 f"https://api.github.com/repos/{GITHUB_OWNER}/{REPORT_REPO}/contents/{oldest['path']}",
                 json={
                     "message": f"chore(autorefine): prune old report {oldest['name']}",
@@ -764,7 +765,10 @@ def run_health_scan(repos: list[str]) -> dict[str, Any]:
     )
 
     report_path = commit_report(github_token, report)
-    enforce_report_retention(github_token)
+    try:
+        enforce_report_retention(github_token)
+    except Exception as exc:  # never let pruning kill notifications
+        log.warning("Report retention skipped: %s", exc)
 
     created_issues = create_github_issues(
         github_token, analysis.get("issues_to_create", []), repos
