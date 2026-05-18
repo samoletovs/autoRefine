@@ -1,0 +1,74 @@
+name: "autoRefine — Daily Health Scan"
+
+on:
+  schedule:
+    # Twice daily at 06:00 and 18:00 UTC (was agentMode nauro_health_scan timer)
+    - cron: '0 6,18 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  health-scan:
+    runs-on: ubuntu-latest
+    env:
+      AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      NAURO_BOT_TOKEN: ${{ secrets.NAURO_BOT_TOKEN }}
+      NAURO_CHAT_ID: ${{ secrets.NAURO_CHAT_ID }}
+      HEALTH_SCAN_MODEL: gpt-4o-mini
+    steps:
+      - name: Checkout autoRefine
+        uses: actions/checkout@v4
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+      - name: Checkout governance (for manifest)
+        uses: actions/checkout@v4
+        with:
+          repository: samoletovs/nauroLabs-github
+          path: .github-gov
+          token: ${{ secrets.GH_PAT }}
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Run health scan
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          python -m agent.main \
+            --manifest .github-gov/config/workspace-manifest.json \
+            --mode health-scan \
+            > /tmp/autorefine-health.json 2>&1 || true
+
+          echo "--- health-scan output ---"
+          cat /tmp/autorefine-health.json
+
+      - name: Failure notification
+        if: failure()
+        run: |
+          if [ -z "$NAURO_BOT_TOKEN" ] || [ -z "$NAURO_CHAT_ID" ]; then
+            echo "NAURO_BOT_TOKEN or NAURO_CHAT_ID not set; skipping"
+            exit 0
+          fi
+          curl -sf -X POST "https://api.telegram.org/bot${NAURO_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${NAURO_CHAT_ID}" \
+            --data-urlencode "parse_mode=HTML" \
+            --data-urlencode "text=❌ <b>autoRefine health-scan</b> failed — see GitHub Actions log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            || echo "::warning::Telegram failure notification did not send"

@@ -27,7 +27,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       FOUNDRY_PROJECT_ENDPOINT: ${{ secrets.FOUNDRY_PROJECT_ENDPOINT }}
-      TELEGRAM_NOTIFY_URL: ${{ secrets.TELEGRAM_NOTIFY_URL }}
+      NAURO_BOT_TOKEN: ${{ secrets.NAURO_BOT_TOKEN }}
+      NAURO_CHAT_ID: ${{ secrets.NAURO_CHAT_ID }}
     steps:
       - name: Checkout autoRefine
         uses: actions/checkout@v4
@@ -79,8 +80,8 @@ jobs:
       - name: Notify Telegram
         if: always()
         run: |
-          if [ -z "$TELEGRAM_NOTIFY_URL" ]; then
-            echo "TELEGRAM_NOTIFY_URL not set; skipping"
+          if [ -z "$NAURO_BOT_TOKEN" ] || [ -z "$NAURO_CHAT_ID" ]; then
+            echo "NAURO_BOT_TOKEN or NAURO_CHAT_ID not set; skipping"
             exit 0
           fi
 
@@ -89,28 +90,23 @@ jobs:
           TOTAL=$(echo "$SCORES" | wc -l)
           AVG=$(grep -oP '"score":\s*\K\d+' /tmp/autorefine-report.json 2>/dev/null | awk '{s+=$1; n++} END {if(n>0) printf "%d", s/n; else print "?"}')
 
-          python3 - <<PY || echo "::warning::Telegram notification failed"
-          import json, os, urllib.request, urllib.error
+          export SCORES TOTAL AVG
 
-          url = os.environ["TELEGRAM_NOTIFY_URL"]
+          python3 - <<'PY' || echo "::warning::Telegram notification failed"
+          import os, sys
+          # Make agent.notify importable from the repo root
+          sys.path.insert(0, os.getcwd())
+          from agent.notify import send_telegram
+
           scores = os.environ.get("SCORES", "No data")
           total = os.environ.get("TOTAL", "?")
           avg = os.environ.get("AVG", "?")
           mode = "${{ github.event.inputs.mode || 'evaluate' }}"
 
-          msg = f"🔧 autoRefine daily {mode}\n\n"
+          msg = f"🔧 <b>autoRefine</b> daily {mode}\n\n"
           msg += f"📊 {total} projects, avg {avg}/100\n\n"
           msg += scores
 
-          data = json.dumps({"text": msg}).encode()
-          req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-          try:
-              urllib.request.urlopen(req, timeout=10)
-              print("Telegram notification sent")
-          except urllib.error.HTTPError as e:
-              print(f"Telegram error: {e}")
+          ok = send_telegram(msg, parse_mode="HTML")
+          print("Telegram notification sent" if ok else "Telegram notification skipped/failed")
           PY
-        env:
-          SCORES: ${{ env.SCORES }}
-          TOTAL: ${{ env.TOTAL }}
-          AVG: ${{ env.AVG }}

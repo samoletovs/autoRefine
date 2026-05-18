@@ -5,8 +5,11 @@ azure-ai-projects>=1.0.0
 azure-ai-agents>=1.1.0
 azure-identity>=1.19.0
 
-# OpenAI-compatible client
+# OpenAI-compatible client (used by foundry agent + health scan)
 openai>=1.55.0
+
+# Azure cost + monitoring (health scan)
+azure-mgmt-costmanagement>=4.0.1
 
 # Config + data
 pyyaml>=6.0.2

@@ -223,11 +223,28 @@ def refine_project(
         log.info("Agent cleaned up.")
 
 
+def run_health_scan_mode(repos: list[str]) -> None:
+    """Run the NauroLabs health scan (GitHub + Azure cost + App Insights + URLs).
+
+    Sends a Telegram summary via agent.notify and commits a markdown
+    report to the governance repo. Distinct from per-project evaluation.
+    """
+    from agent.health_scan import run_health_scan
+
+    short_repos = [r.split("/")[-1] for r in repos]
+    summary = run_health_scan(short_repos)
+    print(json.dumps(summary, indent=2))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="autoRefine — project improvement agent")
     parser.add_argument("--repo", type=str, help="Single repo (owner/name)")
     parser.add_argument("--manifest", type=str, help="Path to workspace-manifest.json")
-    parser.add_argument("--mode", choices=["evaluate", "plan", "refine"], default="evaluate")
+    parser.add_argument(
+        "--mode",
+        choices=["evaluate", "plan", "refine", "health-scan"],
+        default="evaluate",
+    )
     parser.add_argument("--model", default="gpt-4o-mini")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--workdir", default="/tmp/autorefine")
@@ -245,6 +262,13 @@ def main() -> None:
         else:
             log.error("No --repo or --manifest specified and no default manifest found.")
             sys.exit(1)
+
+    # health-scan mode short-circuits the per-project clone+evaluate loop.
+    if args.mode == "health-scan":
+        log.info("autoRefine starting — mode=health-scan, %d repos", len(repos))
+        run_health_scan_mode(repos)
+        log.info("autoRefine complete.")
+        return
 
     config = AutoRefineConfig(
         repos=repos,
