@@ -667,7 +667,14 @@ def enforce_report_retention(token: str) -> None:
 def create_github_issues(
     token: str, issues: list[dict[str, Any]], allowed_repos: list[str]
 ) -> list[str]:
-    """Create GitHub issues for critical findings, assigned to Copilot."""
+    """Create GitHub issues for critical findings.
+
+    Note: we deliberately do NOT set ``assignees``. The Copilot coding agent
+    bot ("copilot-swe-agent") is only assignable on Copilot Pro+/Business
+    plans and must be enabled per-repo, neither of which currently apply to
+    this workspace. Issues are filtered by label instead (e.g. ``autorefine``,
+    ``tech-debt``).
+    """
     headers = {
         "Authorization": f"token {token}",
         "Accept": "application/vnd.github+json",
@@ -685,7 +692,6 @@ def create_github_issues(
                     f"---\n*Auto-created by autoRefine health scan*"
                 ),
                 "labels": issue.get("labels", ["tech-debt", "autorefine"]),
-                "assignees": ["copilot-swe-agent[bot]"],
             }
             resp = client.post(
                 f"https://api.github.com/repos/{GITHUB_OWNER}/{repo}/issues",
@@ -719,7 +725,7 @@ def build_telegram_summary(
     if alerts:
         parts.extend(alerts[:3])
     if created_issues:
-        parts.append(f"📋 Created {len(created_issues)} issues for Copilot")
+        parts.append(f"📋 Created {len(created_issues)} tech-debt issue(s)")
     if report_path:
         parts.append(
             f'<a href="https://github.com/{GITHUB_OWNER}/{REPORT_REPO}/blob/{REPORT_BRANCH}/{report_path}">Full report</a>'

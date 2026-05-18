@@ -36,7 +36,7 @@ def test_build_summary_with_focus_and_alerts() -> None:
     assert "focus on era" in msg
     assert "alert one" in msg
     assert "alert four" not in msg  # capped at 3
-    assert "Created 1 issues" in msg
+    assert "Created 1 tech-debt issue" in msg
     assert 'href="https://github.com/samoletovs/nauroLabs-github' in msg
 
 
