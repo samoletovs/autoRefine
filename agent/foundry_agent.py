@@ -14,8 +14,11 @@ import json
 import logging
 import os
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any, TypeVar
 
+import httpx
 from azure.ai.agents import AgentsClient
 from azure.ai.agents.models import (
     FunctionTool,
@@ -25,7 +28,14 @@ from azure.ai.agents.models import (
     SubmitToolOutputsAction,
     ToolOutput,
 )
-from azure.identity import DefaultAzureCredential
+from azure.core.exceptions import HttpResponseError
+from tenacity import (
+    RetryCallState,
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_random_exponential,
+)
 
 from agent.config import ProjectConfig
 
@@ -33,12 +43,60 @@ log = logging.getLogger(__name__)
 
 DEFAULT_DEPLOYMENT = os.environ.get("FOUNDRY_DEFAULT_DEPLOYMENT", "gpt-4o-mini")
 ENDPOINT = os.environ.get("FOUNDRY_PROJECT_ENDPOINT", "")
+MAX_FOUNDRY_RETRY_ATTEMPTS = 5
+RETRYABLE_FOUNDRY_STATUS_CODES = {429, 502, 503, 504}
 
 # Back-compat alias. Older imports referenced DEPLOYMENT directly; keep it
 # pointing at the env-resolved default so any cached imports still work.
 DEPLOYMENT = DEFAULT_DEPLOYMENT
 
 SYSTEM_PROMPT = (Path(__file__).parent / "prompts" / "system.md").read_text(encoding="utf-8")
+
+T = TypeVar("T")
+
+
+def _is_retryable_foundry_exception(exception: BaseException) -> bool:
+    """Return True only for transient Foundry/network errors worth retrying."""
+    if isinstance(exception, HttpResponseError):
+        status_code = getattr(exception, "status_code", None)
+        if status_code is None and getattr(exception, "response", None) is not None:
+            status_code = getattr(exception.response, "status_code", None)
+        return status_code in RETRYABLE_FOUNDRY_STATUS_CODES
+
+    return isinstance(
+        exception,
+        (httpx.RemoteProtocolError, httpx.ConnectError, httpx.TimeoutException),
+    )
+
+
+def _log_retry_attempt(retry_state: RetryCallState) -> None:
+    """Emit retry diagnostics for transient Foundry failures."""
+    if retry_state.outcome is None or not retry_state.outcome.failed:
+        return
+    exception = retry_state.outcome.exception()
+    if exception is None:
+        return
+    operation = str(retry_state.args[0]) if retry_state.args else "Foundry call"
+    log.warning(
+        "Retrying %s after attempt %d/%d due to %s: %s",
+        operation,
+        retry_state.attempt_number,
+        MAX_FOUNDRY_RETRY_ATTEMPTS,
+        type(exception).__name__,
+        exception,
+    )
+
+
+@retry(
+    retry=retry_if_exception(_is_retryable_foundry_exception),
+    wait=wait_random_exponential(multiplier=1, max=60),
+    stop=stop_after_attempt(MAX_FOUNDRY_RETRY_ATTEMPTS),
+    reraise=True,
+    before_sleep=_log_retry_attempt,
+)
+def _call_foundry_with_retry(operation: str, fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+    """Call a Foundry SDK operation with transient-failure retries."""
+    return fn(*args, **kwargs)
 
 
 # ── Tool definitions as typed Python functions (SDK inspects these) ──────────
@@ -313,7 +371,12 @@ def run_agent(
     )
 
     # Run the agent
-    run = client.runs.create(thread_id=thread.id, agent_id=agent_id)
+    run = _call_foundry_with_retry(
+        "client.runs.create",
+        client.runs.create,
+        thread_id=thread.id,
+        agent_id=agent_id,
+    )
     log.info("Run started: %s", run.id)
 
     # Poll for completion, handling tool calls
@@ -345,7 +408,9 @@ def run_agent(
                             output=output,
                         ))
 
-                run = client.runs.submit_tool_outputs(
+                run = _call_foundry_with_retry(
+                    "client.runs.submit_tool_outputs",
+                    client.runs.submit_tool_outputs,
                     thread_id=thread.id,
                     run_id=run.id,
                     tool_outputs=tool_outputs,
@@ -355,7 +420,12 @@ def run_agent(
         # Poll
         import time
         time.sleep(1)
-        run = client.runs.get(thread_id=thread.id, run_id=run.id)
+        run = _call_foundry_with_retry(
+            "client.runs.get",
+            client.runs.get,
+            thread_id=thread.id,
+            run_id=run.id,
+        )
 
     if run.status == "failed":
         log.error("Run failed: %s", run.last_error)
@@ -380,7 +450,7 @@ def run_agent(
                         log.info("Parsed plan from text response (submit_plan not called)")
 
     # Clean up
-    client.threads.delete(thread.id)
+    _call_foundry_with_retry("client.threads.delete", client.threads.delete, thread.id)
 
     return plan_result
 
