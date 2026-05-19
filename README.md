@@ -19,6 +19,8 @@ project.yaml → Discover → Research → Evaluate → Plan → [Ask?] → Exec
 7. **Test** — runs the project's test suite to validate changes
 8. **PR** — creates a pull request with the improvements
 
+> ⚠️ **Closed-loop warning:** `--mode refine` bypasses the evaluator→builder loop by opening PRs directly. Prefer `--mode file-ideas` so autoRefine files idea memos and lets the Builder implement them.
+
 ## Getting started
 
 ### 1. Add a `project.yaml` to your repo
@@ -54,11 +56,14 @@ cp .env.example .env
 # Evaluate a single project
 python -m agent.main --repo owner/repo --mode evaluate
 
-# Full cycle (evaluate + plan + execute)
+# Evaluate + plan + file idea memos (closed loop)
+python -m agent.main --repo owner/repo --mode file-ideas
+
+# Full cycle (evaluate + plan + execute) — local dev only, bypasses the loop
 python -m agent.main --repo owner/repo --mode refine
 
 # All projects in a manifest
-python -m agent.main --manifest config/workspace-manifest.json --mode refine
+python -m agent.main --manifest config/workspace-manifest.json --mode file-ideas
 ```
 
 ## Project structure
@@ -91,7 +96,10 @@ autoRefine/
 
 autoRefine is a **Foundry hosted agent** with function-calling tools:
 
-- **Model**: `gpt-4o-mini` (upgrades to `gpt-4o` only for complex code analysis)
+- **Model**: `gpt-4o-mini` by default (cheap, runs across 11 repos). Bump to
+  `gpt-5` for one-off deep analysis via `python -m agent.main --model gpt-5`.
+  The closed-loop PR reviewer (deep-review) lives in `samoletovs/nauroLabs-github`
+  and uses Claude Opus 4 (via GitHub Models) — see that repo's AGENT_ROLES.md.
 - **Tools**: GitHub API, web search, file system, test runner, quality checkers
 - **Human-in-the-loop**: agent asks for confirmation on risky or uncertain changes
 - **Safety**: all changes are made on branches, tested, and submitted as PRs — never direct to main
@@ -100,7 +108,7 @@ autoRefine is a **Foundry hosted agent** with function-calling tools:
 
 - Python 3.11+
 - Microsoft Foundry (Azure AI Projects SDK)
-- Azure OpenAI (`gpt-4o-mini` default)
+- Azure OpenAI (`gpt-4o-mini` default, configurable via CLI / env)
 - GitHub API (`gh` CLI + REST)
 - PyYAML for `project.yaml` parsing
 

@@ -17,7 +17,9 @@ jobs:
       AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
       NAURO_BOT_TOKEN: ${{ secrets.NAURO_BOT_TOKEN }}
       NAURO_CHAT_ID: ${{ secrets.NAURO_CHAT_ID }}
-      HEALTH_SCAN_MODEL: gpt-4o-mini
+      # Cheap tier — runs twice daily across 11 repos. Bump via repo variable
+      # ``HEALTH_SCAN_MODEL`` if you want a deep-analysis run. See AGENTS.md.
+      HEALTH_SCAN_MODEL: ${{ vars.HEALTH_SCAN_MODEL || 'gpt-4o-mini' }}
     steps:
       - name: Checkout autoRefine
         uses: actions/checkout@v4

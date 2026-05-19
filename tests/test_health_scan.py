@@ -183,3 +183,62 @@ def test_create_github_issues_caps_at_five() -> None:
 
     assert len(created) == 5
     assert client_instance.post.call_count == 5
+
+
+def test_create_github_issues_assigns_copilot() -> None:
+    issues = [{"repo": "era", "title": "fix bug", "body": "..."}]
+    mock_resp = MagicMock(status_code=201)
+    mock_resp.json.return_value = {
+        "html_url": "https://github.com/samoletovs/era/issues/12",
+        "number": 12,
+    }
+
+    with (
+        patch("agent.health_scan.httpx.Client") as mock_client_cls,
+        patch("agent.health_scan.subprocess.run") as mock_subprocess_run,
+    ):
+        client_instance = mock_client_cls.return_value.__enter__.return_value
+        client_instance.post.return_value = mock_resp
+        mock_subprocess_run.return_value.returncode = 0
+
+        created = health_scan.create_github_issues("tok", issues, allowed_repos=["era"])
+
+    assert created == ["https://github.com/samoletovs/era/issues/12"]
+    mock_subprocess_run.assert_called_once_with(
+        [
+            "gh",
+            "issue",
+            "edit",
+            "12",
+            "--repo",
+            "samoletovs/era",
+            "--add-assignee",
+            "Copilot",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_create_github_issues_can_skip_copilot_assignment() -> None:
+    issues = [{"repo": "era", "title": "fix bug", "body": "..."}]
+    mock_resp = MagicMock(status_code=201)
+    mock_resp.json.return_value = {
+        "html_url": "https://github.com/samoletovs/era/issues/12",
+        "number": 12,
+    }
+
+    with (
+        patch("agent.health_scan.httpx.Client") as mock_client_cls,
+        patch("agent.health_scan.subprocess.run") as mock_subprocess_run,
+    ):
+        client_instance = mock_client_cls.return_value.__enter__.return_value
+        client_instance.post.return_value = mock_resp
+
+        created = health_scan.create_github_issues(
+            "tok", issues, allowed_repos=["era"], assign_copilot=False
+        )
+
+    assert created == ["https://github.com/samoletovs/era/issues/12"]
+    mock_subprocess_run.assert_not_called()

@@ -1,0 +1,402 @@
+# Auto-review and merge — closed-loop canary for cloud-agent PRs.
+#
+# Phase 1a + 1b + 1c deliverable. Implements gates from plan §8.7 with the
+# workflow-driven merge mechanism chosen in §8.9 (GitHub Free + private repos
+# can't use native auto-merge, so we call `gh pr merge` ourselves once all
+# gates pass). Gate predicate lives in scripts/can-auto-merge.py (single
+# source of truth, §8.7). Claude deep-review lives in
+# scripts/claude-deep-review.py with fail-safe degradation (§8.6).
+#
+# Triggers on every PR event from the cloud agent plus check_suite/review
+# events that might unblock a previously-waiting PR. Non-cloud-agent PRs
+# short-circuit.
+#
+# Gates (all must pass to auto-merge):
+#   1. PR author is the cloud agent (otherwise: ignore entirely)
+#   2. PR is open, not draft, not already merged
+#   3. File-tier: every changed file matches the low-risk allowlist
+#   4. Label: no risky labels (bicep/secret/dns/major-bump/auth/breaking-change)
+#   5. Daily cap: fewer than 5 PRs already merged with `auto-merged` label today
+#   6. Deep-review: when high-risk paths are touched, Claude must APPROVE.
+#      Fail-safe: missing key or API failure → degrade to `review-degraded`
+#      label and route to `needs-human` in the morning digest.
+#   7. Native reviewer: at least one APPROVED, no CHANGES_REQUESTED
+#   8. CI: all check runs and statuses on the head SHA are green
+#
+# Failure → label `needs-human` + comment. Sam sees these in the morning digest.
+# Success → label `auto-merged`, squash-merge, delete branch.
+name: "Auto-review and merge"
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize, labeled, unlabeled]
+  pull_request_review:
+    types: [submitted, dismissed]
+  check_suite:
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to re-evaluate'
+        required: true
+        type: number
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  checks: read
+  statuses: read
+
+concurrency:
+  # One evaluation per PR at a time; cancel older runs when a new trigger fires.
+  group: auto-review-${{ github.event.pull_request.number || github.event.inputs.pr_number || github.event.check_suite.id }}
+  cancel-in-progress: true
+
+jobs:
+  resolve:
+    name: Resolve PR context
+    runs-on: ubuntu-latest
+    outputs:
+      pr_number: ${{ steps.find.outputs.pr_number }}
+      pr_actor: ${{ steps.find.outputs.pr_actor }}
+      should_continue: ${{ steps.find.outputs.should_continue }}
+    steps:
+      - id: find
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Cloud agent identities. GitHub names this bot inconsistently
+            // across surfaces; we accept any of these.
+            const cloudAgentActors = new Set([
+              'copilot-swe-agent[bot]',
+              'Copilot',
+              'github-copilot[bot]'
+            ]);
+
+            let prNumber = null;
+            let prActor = null;
+
+            const eventName = context.eventName;
+            const payload = context.payload;
+
+            if (eventName === 'pull_request' || eventName === 'pull_request_review') {
+              prNumber = payload.pull_request.number;
+              prActor = payload.pull_request.user.login;
+            } else if (eventName === 'check_suite') {
+              const prs = payload.check_suite.pull_requests || [];
+              if (prs.length === 0) {
+                core.info('check_suite has no associated PRs; nothing to do');
+                core.setOutput('should_continue', 'false');
+                return;
+              }
+              prNumber = prs[0].number;
+            } else if (eventName === 'workflow_dispatch') {
+              prNumber = parseInt(payload.inputs.pr_number, 10);
+            } else {
+              core.setOutput('should_continue', 'false');
+              return;
+            }
+
+            // Re-fetch the PR if we don't have author info yet.
+            if (!prActor) {
+              const { data: pr } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber
+              });
+              prActor = pr.user.login;
+            }
+
+            const shouldContinue = cloudAgentActors.has(prActor);
+            core.info(`PR #${prNumber} by ${prActor} → continue=${shouldContinue}`);
+            core.setOutput('pr_number', String(prNumber));
+            core.setOutput('pr_actor', prActor);
+            core.setOutput('should_continue', shouldContinue ? 'true' : 'false');
+
+  classify:
+    name: Classify PR (file tier · labels · daily cap)
+    needs: resolve
+    if: needs.resolve.outputs.should_continue == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      low_risk_only: ${{ steps.classify.outputs.low_risk_only }}
+      has_risky_label: ${{ steps.classify.outputs.has_risky_label }}
+      under_daily_cap: ${{ steps.classify.outputs.under_daily_cap }}
+      needs_deep_review: ${{ steps.classify.outputs.needs_deep_review }}
+      gate_failed: ${{ steps.classify.outputs.gate_failed }}
+      merged_today: ${{ steps.classify.outputs.merged_today }}
+      can_merge: ${{ steps.classify.outputs.can_merge }}
+      reason: ${{ steps.classify.outputs.reason }}
+    steps:
+      # Phase 1b refactor (plan §8.7): the gate predicate now lives in
+      # scripts/can-auto-merge.py as a single source of truth. Workflow,
+      # CLI users, and other automations all read the same logic.
+      - name: Checkout repo
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - id: classify
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
+        run: |
+          python scripts/can-auto-merge.py \
+            --repo "${{ github.repository }}" \
+            --pr "$PR_NUMBER" \
+            --format github >> "$GITHUB_OUTPUT"
+          echo "--- snapshot (json) ---"
+          python scripts/can-auto-merge.py \
+            --repo "${{ github.repository }}" \
+            --pr "$PR_NUMBER" \
+            --format json
+
+  deep_review:
+    name: Claude deep-review (optional)
+    needs: [resolve, classify]
+    if: needs.classify.outputs.needs_deep_review == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      verdict: ${{ steps.review.outputs.verdict }}
+      degraded: ${{ steps.review.outputs.degraded }}
+      reason: ${{ steps.review.outputs.reason }}
+    steps:
+      # Phase 1c (plan §8.6): LLM deep-review via GitHub Models. Fail-safe:
+      # if GH_TOKEN is absent or the API call errors, the Python script
+      # returns verdict=SKIPPED + degraded=true, the workflow labels
+      # `review-degraded`, and the merge job escalates to `needs-human`.
+      # No extra API keys needed — GH_TOKEN authenticates both gh CLI and
+      # GitHub Models (https://models.inference.ai.azure.com).
+      - name: Checkout repo
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - id: review
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Use GITHUB_TOKEN (read-only, scoped to this workflow) instead of a
+          # broad PAT. GITHUB_TOKEN is sufficient for GitHub Models API calls.
+          GITHUB_MODELS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Primary deep-review model. Override via repo variable
+          # DEEP_REVIEW_MODEL (e.g. set to "claude-opus-4.7" once it ships
+          # on GitHub Models, with no code change required). Default is the
+          # current best available Claude model.
+          DEEP_REVIEW_MODEL: ${{ vars.DEEP_REVIEW_MODEL || 'claude-opus-4' }}
+          PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
+        run: |
+          python scripts/claude-deep-review.py \
+            --repo "${{ github.repository }}" \
+            --pr "$PR_NUMBER" \
+            --format github >> "$GITHUB_OUTPUT"
+      - name: Post review comment + label if degraded
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
+          VERDICT: ${{ steps.review.outputs.verdict }}
+          DEGRADED: ${{ steps.review.outputs.degraded }}
+          COMMENT_BODY: ${{ steps.review.outputs.comment_body }}
+        with:
+          script: |
+            const prNumber = parseInt(process.env.PR_NUMBER, 10);
+            const verdict = process.env.VERDICT || 'SKIPPED';
+            const degraded = process.env.DEGRADED === 'true';
+            const body = process.env.COMMENT_BODY || '_(no comment body)_';
+            const { owner, repo } = context.repo;
+
+            if (body && body.trim().length > 0) {
+              try {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: prNumber, body
+                });
+              } catch (e) {
+                core.warning(`comment failed: ${e.message}`);
+              }
+            }
+            if (degraded) {
+              try {
+                await github.rest.issues.addLabels({
+                  owner, repo, issue_number: prNumber,
+                  labels: ['review-degraded']
+                });
+              } catch (e) {
+                core.warning(`label failed: ${e.message}`);
+              }
+            }
+            core.info(`deep-review verdict=${verdict} degraded=${degraded}`);
+
+  merge:
+    name: Merge or escalate
+    needs: [resolve, classify, deep_review]
+    # `always()` so we run even when deep_review was skipped (no high-risk paths).
+    if: |
+      always() &&
+      needs.resolve.outputs.should_continue == 'true' &&
+      needs.classify.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
+          LOW_RISK_ONLY: ${{ needs.classify.outputs.low_risk_only }}
+          HAS_RISKY_LABEL: ${{ needs.classify.outputs.has_risky_label }}
+          UNDER_DAILY_CAP: ${{ needs.classify.outputs.under_daily_cap }}
+          NEEDS_DEEP_REVIEW: ${{ needs.classify.outputs.needs_deep_review }}
+          DEEP_REVIEW_VERDICT: ${{ needs.deep_review.outputs.verdict }}
+          DEEP_REVIEW_DEGRADED: ${{ needs.deep_review.outputs.degraded }}
+          DEEP_REVIEW_RESULT: ${{ needs.deep_review.result }}
+        with:
+          script: |
+            const prNumber = parseInt(process.env.PR_NUMBER, 10);
+            const lowRiskOnly = process.env.LOW_RISK_ONLY === 'true';
+            const hasRiskyLabel = process.env.HAS_RISKY_LABEL === 'true';
+            const underDailyCap = process.env.UNDER_DAILY_CAP === 'true';
+            const needsDeepReview = process.env.NEEDS_DEEP_REVIEW === 'true';
+            const deepReviewVerdict = process.env.DEEP_REVIEW_VERDICT || 'NOT_RUN';
+            const deepReviewDegraded = process.env.DEEP_REVIEW_DEGRADED === 'true';
+            const deepReviewResult = process.env.DEEP_REVIEW_RESULT;
+
+            const { owner, repo } = context.repo;
+
+            const escalate = async (reason) => {
+              core.warning(`ESCALATE: ${reason}`);
+              try {
+                await github.rest.issues.addLabels({
+                  owner, repo, issue_number: prNumber, labels: ['needs-human']
+                });
+              } catch (e) {
+                core.warning(`add label failed: ${e.message}`);
+              }
+              try {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: prNumber,
+                  body: `🚦 Auto-merge gate failed: **${reason}**\n\nLabeled \`needs-human\` for Sam's morning digest.`
+                });
+              } catch (e) {
+                core.warning(`comment failed: ${e.message}`);
+              }
+            };
+
+            // Fetch fresh PR state.
+            const { data: pr } = await github.rest.pulls.get({
+              owner, repo, pull_number: prNumber
+            });
+
+            // Gate 1: PR readiness
+            if (pr.merged) { core.info('PR already merged; skipping'); return; }
+            if (pr.state !== 'open') { core.info(`PR state=${pr.state}; skipping`); return; }
+            if (pr.draft) { await escalate('PR is draft'); return; }
+
+            // Gate 2: file-tier
+            if (!lowRiskOnly) { await escalate('file-tier (touches high-risk paths)'); return; }
+
+            // Gate 3: risky label
+            if (hasRiskyLabel) { await escalate('risky-label applied'); return; }
+
+            // Gate 4: daily cap
+            if (!underDailyCap) { await escalate('daily-cap reached (repo and/or org)'); return; }
+
+            // Gate 5: deep review (if high-risk paths were touched)
+            if (needsDeepReview) {
+              if (deepReviewResult !== 'success') {
+                await escalate(`deep-review job result=${deepReviewResult}`);
+                return;
+              }
+              if (deepReviewDegraded) {
+                await escalate('deep-review degraded (Claude unavailable or API error)');
+                return;
+              }
+              if (deepReviewVerdict !== 'APPROVE') {
+                await escalate(`deep-review verdict=${deepReviewVerdict}`);
+                return;
+              }
+            }
+
+            // Gate 6: native reviewer state
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              owner, repo, pull_number: prNumber, per_page: 100
+            });
+            const latestPerReviewer = new Map();
+            for (const r of reviews) {
+              if (r.state === 'COMMENTED') continue;
+              latestPerReviewer.set(r.user.login, r.state);
+            }
+            const reviewStates = Array.from(latestPerReviewer.values());
+            if (reviewStates.includes('CHANGES_REQUESTED')) {
+              await escalate('native reviewer requested changes');
+              return;
+            }
+            if (!reviewStates.includes('APPROVED')) {
+              core.info('no approving review yet; waiting for native reviewer');
+              return;
+            }
+
+            // Gate 7: CI green. Look at both legacy combined status and check runs.
+            const headSha = pr.head.sha;
+
+            const { data: combined } = await github.rest.repos.getCombinedStatusForRef({
+              owner, repo, ref: headSha
+            });
+            if (combined.statuses.length > 0) {
+              if (combined.state === 'pending') {
+                core.info('combined status pending; waiting'); return;
+              }
+              if (combined.state !== 'success') {
+                await escalate(`legacy status state=${combined.state}`); return;
+              }
+            }
+
+            const checkRuns = await github.paginate(github.rest.checks.listForRef, {
+              owner, repo, ref: headSha, per_page: 100
+            });
+            const ownWorkflowName = context.workflow;
+            const otherChecks = checkRuns.filter(c => c.name !== ownWorkflowName);
+            const pending = otherChecks.filter(c => c.status !== 'completed');
+            if (pending.length > 0) {
+              core.info(`${pending.length} check runs still pending; waiting`); return;
+            }
+            const okConclusions = new Set(['success', 'neutral', 'skipped']);
+            const failed = otherChecks.filter(c => !okConclusions.has(c.conclusion));
+            if (failed.length > 0) {
+              await escalate(`CI failed: ${failed.map(c => c.name).join(', ')}`);
+              return;
+            }
+
+            // All gates pass → label first, then merge. Label-first guarantees
+            // the daily-cap counter sees this PR even if branch deletion later
+            // fails.
+            core.info(`✅ All gates passed for PR #${prNumber} — merging`);
+            try {
+              await github.rest.issues.addLabels({
+                owner, repo, issue_number: prNumber, labels: ['auto-merged']
+              });
+            } catch (e) {
+              core.warning(`auto-merged label add failed: ${e.message}`);
+            }
+
+            try {
+              await github.rest.pulls.merge({
+                owner, repo, pull_number: prNumber,
+                merge_method: 'squash',
+                commit_title: `${pr.title} (#${prNumber})`,
+                commit_message: `Auto-merged by .github/workflows/auto-review.yml after passing all gates (§8.7).`
+              });
+            } catch (e) {
+              await escalate(`merge API call failed: ${e.message}`);
+              return;
+            }
+
+            // Best-effort branch delete.
+            try {
+              await github.rest.git.deleteRef({
+                owner, repo, ref: `heads/${pr.head.ref}`
+              });
+              core.info(`Deleted branch ${pr.head.ref}`);
+            } catch (e) {
+              core.info(`Branch delete skipped (${e.message})`);
+            }
+

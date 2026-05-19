@@ -9,11 +9,12 @@ on:
       mode:
         description: 'Run mode'
         required: false
-        default: 'evaluate'
+        default: 'file-ideas'
         type: choice
         options:
-          - evaluate
+          - file-ideas
           - plan
+          - evaluate
       repo:
         description: 'Single repo to evaluate (leave empty for all)'
         required: false
@@ -63,7 +64,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
-          MODE="${{ github.event.inputs.mode || 'evaluate' }}"
+          MODE="${{ github.event.inputs.mode || 'file-ideas' }}"
           REPO_FLAG=""
           if [ -n "${{ github.event.inputs.repo }}" ]; then
             REPO_FLAG="--repo samoletovs/${{ github.event.inputs.repo }}"
@@ -73,24 +74,64 @@ jobs:
 
           python -m agent.main $REPO_FLAG --mode $MODE \
             --workdir /tmp/autorefine \
-            > /tmp/autorefine-report.json 2>&1 || true
+            > /tmp/autorefine-report.json 2>/tmp/autorefine-logs.txt || true
 
+          echo "--- logs ---"
+          cat /tmp/autorefine-logs.txt
+          echo "--- report ---"
           cat /tmp/autorefine-report.json
+
+      - name: Parse scores
+        id: parse-scores
+        run: |
+          report_file="/tmp/autorefine-report.json"
+
+          # Extract only project evaluation JSON objects (has both "score" and "project").
+          # Python handles mixed output (plan mode emits "--- IMPROVEMENT PLAN ---" too).
+          REPORT_OBJECTS=$(python3 -c "
+import sys, json
+dec = json.JSONDecoder()
+with open(sys.argv[1]) as f:
+    content = f.read()
+idx = 0
+while idx < len(content):
+    try:
+        obj, size = dec.raw_decode(content, idx)
+        if isinstance(obj, dict) and 'score' in obj and 'project' in obj:
+            print(json.dumps(obj))
+        idx += size
+    except json.JSONDecodeError:
+        idx += 1
+" "$report_file")
+
+          if [ -z "$REPORT_OBJECTS" ]; then
+            echo "::error::No score found in $report_file"
+            exit 1
+          fi
+
+          # Use jq to format scores and compute average (handles float scores like 72.5)
+          SCORES=$(echo "$REPORT_OBJECTS" | jq -r '"\(.project): \(.score)/100"' | head -20)
+          TOTAL=$(echo "$SCORES" | wc -l)
+          AVG=$(echo "$REPORT_OBJECTS" | jq -rs '[.[].score] | add / length | floor | tostring')
+
+          {
+            printf 'scores<<EOF\n%s\nEOF\n' "$SCORES"
+            printf 'total=%s\n' "$TOTAL"
+            printf 'avg=%s\n' "$AVG"
+            printf 'score=%s\n' "$AVG"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Notify Telegram
         if: always()
+        env:
+          SCORES: ${{ steps.parse-scores.outputs.scores }}
+          TOTAL: ${{ steps.parse-scores.outputs.total }}
+          AVG: ${{ steps.parse-scores.outputs.avg }}
         run: |
           if [ -z "$NAURO_BOT_TOKEN" ] || [ -z "$NAURO_CHAT_ID" ]; then
             echo "NAURO_BOT_TOKEN or NAURO_CHAT_ID not set; skipping"
             exit 0
           fi
-
-          # Extract scores from the evaluate output
-          SCORES=$(grep -oP '"project":\s*"\K[^"]+|"score":\s*\K\d+' /tmp/autorefine-report.json 2>/dev/null | paste - - | awk '{printf "%s: %s/100\n", $1, $2}' | head -20)
-          TOTAL=$(echo "$SCORES" | wc -l)
-          AVG=$(grep -oP '"score":\s*\K\d+' /tmp/autorefine-report.json 2>/dev/null | awk '{s+=$1; n++} END {if(n>0) printf "%d", s/n; else print "?"}')
-
-          export SCORES TOTAL AVG
 
           python3 - <<'PY' || echo "::warning::Telegram notification failed"
           import os, sys
@@ -101,7 +142,7 @@ jobs:
           scores = os.environ.get("SCORES", "No data")
           total = os.environ.get("TOTAL", "?")
           avg = os.environ.get("AVG", "?")
-          mode = "${{ github.event.inputs.mode || 'evaluate' }}"
+          mode = "${{ github.event.inputs.mode || 'file-ideas' }}"
 
           msg = f"🔧 <b>autoRefine</b> daily {mode}\n\n"
           msg += f"📊 {total} projects, avg {avg}/100\n\n"

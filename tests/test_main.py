@@ -133,7 +133,7 @@ def test_main_health_scan_short_circuits_per_repo_flow() -> None:
     ):
         main()
 
-    mock_scan.assert_called_once_with(["owner/repo"])
+    mock_scan.assert_called_once_with(["owner/repo"], assign_copilot=True)
     mock_clone.assert_not_called()
 
 
