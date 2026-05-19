@@ -1,0 +1,95 @@
+name: "Notify Telegram on PR merged"
+
+# Sends a single Telegram message every time a PR is merged into the default
+# branch. This is the low-noise channel that replaces email subscriptions —
+# Sam keeps "Email" turned OFF at https://github.com/settings/notifications
+# and relies on this stream + the GitHub mobile app for everything.
+#
+# Why a dedicated workflow:
+# - The autopilot run already sends a daily 3-line digest, but that fires
+#   once per 24h. Merges happen throughout the day as Copilot ships PRs.
+# - We want one line per merge: title, author, additions/deletions, URL.
+#   Anything richer should be a PR comment, not a Telegram message.
+#
+# Triggers:
+#   pull_request.closed (filtered to merged == true). Fires from the merging
+#   workflow that called `gh pr merge` as well as manual merges via the UI.
+#
+# Required secrets: NAURO_BOT_TOKEN, NAURO_CHAT_ID.
+# If either is missing, the workflow logs a notice and exits 0.
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  # One message per PR; cancel duplicate triggers (e.g., labeled+closed).
+  group: pr-merged-notify-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Telegram summary
+        env:
+          NAURO_BOT_TOKEN: ${{ secrets.NAURO_BOT_TOKEN }}
+          NAURO_CHAT_ID: ${{ secrets.NAURO_CHAT_ID }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_ADDITIONS: ${{ github.event.pull_request.additions }}
+          PR_DELETIONS: ${{ github.event.pull_request.deletions }}
+          PR_CHANGED: ${{ github.event.pull_request.changed_files }}
+          PR_AUTOMERGED: ${{ contains(github.event.pull_request.labels.*.name, 'auto-merged') }}
+          REPO_NAME: ${{ github.repository }}
+        run: |
+          if [ -z "${NAURO_BOT_TOKEN}" ] || [ -z "${NAURO_CHAT_ID}" ]; then
+            echo "::notice::NAURO_BOT_TOKEN or NAURO_CHAT_ID not set; skipping."
+            exit 0
+          fi
+
+          # Choose a leading emoji that signals how the PR landed:
+          #   ✅  auto-merged by the closed-loop gate
+          #   🚢  human-merged or auto-merge label absent
+          if [ "${PR_AUTOMERGED}" = "true" ]; then
+            EMOJI="✅"
+            TAG="auto-merged"
+          else
+            EMOJI="🚢"
+            TAG="merged"
+          fi
+
+          # Body uses Telegram HTML formatting. Title is HTML-escaped to
+          # survive titles that contain &, <, > (common in autopilot titles
+          # like "fix: handle <undefined> in foo").
+          TITLE_ESCAPED=$(python -c "import html,os; print(html.escape(os.environ['PR_TITLE']))")
+
+          MESSAGE=$(printf '%s <b>%s</b> #%s — %s\n<i>%s</i>\n+%s / -%s across %s file(s) by <code>%s</code>\n<a href="%s">View PR</a>' \
+            "${EMOJI}" \
+            "${TAG}" \
+            "${PR_NUMBER}" \
+            "${REPO_NAME}" \
+            "${TITLE_ESCAPED}" \
+            "${PR_ADDITIONS}" \
+            "${PR_DELETIONS}" \
+            "${PR_CHANGED}" \
+            "${PR_AUTHOR}" \
+            "${PR_URL}")
+
+          # Telegram caps text at 4096 chars; our 4-line body is always under
+          # that, but truncate defensively in case a future field gets long.
+          MESSAGE=$(echo "$MESSAGE" | head -c 3900)
+
+          curl -sfS -X POST "https://api.telegram.org/bot${NAURO_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${NAURO_CHAT_ID}" \
+            --data-urlencode "text=${MESSAGE}" \
+            --data-urlencode "parse_mode=HTML" \
+            --data-urlencode "disable_web_page_preview=true" \
+            > /dev/null || echo "::warning::Telegram send failed; PR still merged."

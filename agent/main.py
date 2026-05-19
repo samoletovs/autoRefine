@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -25,6 +26,17 @@ logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(l
 logging.getLogger("azure.identity").setLevel(logging.WARNING)
 
 MANIFEST_PATH = Path(__file__).parent.parent.parent / ".github" / "config" / "workspace-manifest.json"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_IDEA_PRIORITIES = {"P0", "P1"}
+BUGFIX_CATEGORIES = {
+    "bug",
+    "bugs",
+    "defect",
+    "security",
+    "reliability",
+    "stability",
+}
+GOVERNANCE_REPO_URL = "https://github.com/samoletovs/nauroLabs-github.git"
 
 
 def load_repos_from_manifest(manifest_path: Path) -> list[str]:
@@ -58,7 +70,12 @@ def evaluate_project(project_dir: Path, config: ProjectConfig) -> dict:
     return report
 
 
-def plan_project(project_dir: Path, config: ProjectConfig, findings: list[dict]) -> dict | None:
+def plan_project(
+    project_dir: Path,
+    config: ProjectConfig,
+    findings: list[dict],
+    model: str | None = None,
+) -> dict | None:
     """Use Foundry agent to create an improvement plan."""
     endpoint = os.environ.get("FOUNDRY_PROJECT_ENDPOINT", "")
     if not endpoint:
@@ -76,7 +93,7 @@ def plan_project(project_dir: Path, config: ProjectConfig, findings: list[dict])
         credential=DefaultAzureCredential(),
     )
 
-    agent_id = create_agent(client, mode="plan")
+    agent_id = create_agent(client, mode="plan", model=model)
 
     try:
         task = build_plan_task(findings, config)
@@ -94,12 +111,207 @@ def plan_project(project_dir: Path, config: ProjectConfig, findings: list[dict])
         log.info("Agent cleaned up.")
 
 
+def _priority_in_scope(priority: str, allowed: set[str] | None = None) -> bool:
+    allowed_priorities = allowed or DEFAULT_IDEA_PRIORITIES
+    return priority.upper() in allowed_priorities
+
+
+def _map_improvement_type(category: str) -> str:
+    normalized = category.strip().lower()
+    return "bugfix" if normalized in BUGFIX_CATEGORIES else "refactor"
+
+
+def _build_run_references() -> str:
+    refs: list[str] = []
+    sha = os.environ.get("GITHUB_SHA")
+    if sha:
+        refs.append(f"- commit: `{sha}`")
+
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    repository = os.environ.get("GITHUB_REPOSITORY")
+    if run_id and repository:
+        server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+        refs.append(f"- workflow run: {server}/{repository}/actions/runs/{run_id}")
+
+    if not refs:
+        refs.append("- run: local invocation (no GitHub Actions metadata available)")
+    return "\n".join(refs)
+
+
+def _build_idea_memo(improvement: dict, references: str) -> str:
+    title = improvement.get("title", "Untitled improvement")
+    description = improvement.get("description", "No description provided.")
+    priority = improvement.get("priority", "P2")
+    category = improvement.get("category", "quality")
+    idea_type = _map_improvement_type(category)
+
+    return f"""## idea type
+{idea_type}
+
+## source
+autorefine
+
+## problem
+{description}
+
+## proposed approach
+- Implement: {title}
+- Priority: {priority}
+- Category: {category}
+
+## success criteria
+- Improvement is represented as a structured idea memo.
+- The idea includes source/type labels via file-idea.py.
+
+## risk
+- Medium: implementation details still need review by the Builder.
+
+## references
+{references}
+"""
+
+
+def _discover_file_idea_options(script_path: Path) -> set[str]:
+    help_result = subprocess.run(
+        [sys.executable, str(script_path), "--help"],
+        capture_output=True,
+        text=True,
+    )
+    if help_result.returncode != 0:
+        log.warning(
+            "Could not inspect file-idea.py options via --help (code=%d): %s",
+            help_result.returncode,
+            help_result.stderr.strip(),
+        )
+        return set()
+    option_text = f"{help_result.stdout}\n{help_result.stderr}"
+    return {token for token in option_text.split() if token.startswith("--")}
+
+
+def _build_file_idea_command(
+    script_path: Path,
+    repo: str,
+    improvement: dict,
+    references: str,
+    dry_run: bool,
+) -> list[str]:
+    options = _discover_file_idea_options(script_path)
+    title = improvement.get("title", "Untitled improvement").strip()
+    description = improvement.get("description", "").strip() or "No description provided."
+    category = improvement.get("category", "quality")
+    idea_type = _map_improvement_type(category)
+    memo_body = _build_idea_memo(improvement, references)
+
+    cmd = [sys.executable, str(script_path)]
+
+    def _add_option(name: str, value: str) -> None:
+        if name in options and value:
+            cmd.extend([name, value])
+
+    _add_option("--repo", repo)
+    _add_option("--title", f"[idea] {title}")
+    _add_option("--source", "autorefine")
+    _add_option("--type", idea_type)
+    _add_option("--problem", description)
+    _add_option("--approach", f"Implement '{title}' ({improvement.get('priority', 'P2')}).")
+    _add_option("--references", references)
+    for memo_option in ("--body", "--description", "--content"):
+        if memo_option in options:
+            _add_option(memo_option, memo_body)
+            break
+
+    if "--dry-run" in options and dry_run:
+        cmd.append("--dry-run")
+
+    return cmd
+
+
+def _resolve_file_idea_script() -> Path | None:
+    env_root = os.environ.get("NAURO_GOVERNANCE_PATH")
+    if env_root:
+        env_script = Path(env_root) / "scripts" / "file-idea.py"
+        if env_script.exists():
+            return env_script
+
+    governance_checkout_script = REPO_ROOT / ".github-gov" / "scripts" / "file-idea.py"
+    if governance_checkout_script.exists():
+        return governance_checkout_script
+
+    tmp_repo = Path("/tmp/nauroLabs-github")
+    tmp_script = tmp_repo / "scripts" / "file-idea.py"
+    if tmp_script.exists():
+        return tmp_script
+
+    clone = subprocess.run(
+        ["git", "clone", GOVERNANCE_REPO_URL, str(tmp_repo)],
+        capture_output=True,
+        text=True,
+    )
+    if clone.returncode == 0 and tmp_script.exists():
+        return tmp_script
+    if clone.returncode != 0:
+        log.warning("Failed to clone governance repo to %s: %s", tmp_repo, clone.stderr.strip())
+
+    log.error(
+        "Could not resolve scripts/file-idea.py. Set NAURO_GOVERNANCE_PATH or provide .github-gov checkout."
+    )
+    return None
+
+
+def file_ideas_for_plan(
+    repo: str,
+    plan: dict,
+    dry_run: bool = False,
+    allowed_priorities: set[str] | None = None,
+) -> int:
+    script_path = _resolve_file_idea_script()
+    if script_path is None:
+        return 0
+
+    priorities = allowed_priorities or DEFAULT_IDEA_PRIORITIES
+    references = _build_run_references()
+    filed = 0
+    seen_titles: set[str] = set()
+
+    for improvement in plan.get("improvements", []):
+        priority = str(improvement.get("priority", "P2")).upper()
+        if not _priority_in_scope(priority, priorities):
+            continue
+
+        title = str(improvement.get("title", "")).strip()
+        if not title:
+            continue
+
+        title_key = title.lower()
+        # Deduplicate case-insensitively so repeated titles in the same plan file once.
+        if title_key in seen_titles:
+            continue
+        seen_titles.add(title_key)
+
+        cmd = _build_file_idea_command(script_path, repo, improvement, references, dry_run=dry_run)
+        run = subprocess.run(cmd, capture_output=True, text=True)
+        if run.returncode == 0:
+            filed += 1
+            log.info("Filed idea for %s: %s", repo, title)
+        else:
+            log.warning(
+                "Failed to file idea for %s: %s\nstdout=%s\nstderr=%s",
+                repo,
+                title,
+                run.stdout.strip(),
+                run.stderr.strip(),
+            )
+
+    return filed
+
+
 def refine_project(
     project_dir: Path,
     config: ProjectConfig,
     plan: dict,
     repo: str,
     dry_run: bool = False,
+    model: str | None = None,
 ) -> bool:
     """Use Foundry agent to execute improvements, then create a PR."""
     endpoint = os.environ.get("FOUNDRY_PROJECT_ENDPOINT", "")
@@ -136,15 +348,13 @@ def refine_project(
             log.error("Cannot create branch — skipping refine")
             return False
 
-    agent_id = create_agent(client, mode="refine")
+    agent_id = create_agent(client, mode="refine", model=model)
 
     try:
         task = build_refine_task(plan, config)
-        result = run_agent(client, agent_id, project_dir, config, task)
+        run_agent(client, agent_id, project_dir, config, task)
 
         # Check if agent made any changes
-        import subprocess
-
         status = subprocess.run(
             ["git", "status", "--porcelain"],
             cwd=str(project_dir),
@@ -223,7 +433,7 @@ def refine_project(
         log.info("Agent cleaned up.")
 
 
-def run_health_scan_mode(repos: list[str]) -> None:
+def run_health_scan_mode(repos: list[str], assign_copilot: bool = True) -> None:
     """Run the NauroLabs health scan (GitHub + Azure cost + App Insights + URLs).
 
     Sends a Telegram summary via agent.notify and commits a markdown
@@ -232,7 +442,7 @@ def run_health_scan_mode(repos: list[str]) -> None:
     from agent.health_scan import run_health_scan
 
     short_repos = [r.split("/")[-1] for r in repos]
-    summary = run_health_scan(short_repos)
+    summary = run_health_scan(short_repos, assign_copilot=assign_copilot)
     print(json.dumps(summary, indent=2))
 
 
@@ -242,12 +452,25 @@ def main() -> None:
     parser.add_argument("--manifest", type=str, help="Path to workspace-manifest.json")
     parser.add_argument(
         "--mode",
-        choices=["evaluate", "plan", "refine", "health-scan"],
+        choices=["evaluate", "plan", "file-ideas", "refine", "health-scan"],
         default="evaluate",
     )
-    parser.add_argument("--model", default="gpt-4o-mini")
+    parser.add_argument(
+        "--model",
+        default=os.environ.get("FOUNDRY_DEFAULT_DEPLOYMENT", "gpt-4o-mini"),
+        help=(
+            "Foundry deployment name to use for plan/refine modes. "
+            "Defaults to FOUNDRY_DEFAULT_DEPLOYMENT env var, then gpt-4o-mini. "
+            "Set to a higher-tier deployment (e.g. gpt-5) for deep analysis."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--workdir", default="/tmp/autorefine")
+    parser.add_argument(
+        "--no-copilot-assign",
+        action="store_true",
+        help="Disable automatic Copilot assignment for health-scan-created issues",
+    )
     args = parser.parse_args()
 
     # Resolve repo list
@@ -266,9 +489,14 @@ def main() -> None:
     # health-scan mode short-circuits the per-project clone+evaluate loop.
     if args.mode == "health-scan":
         log.info("autoRefine starting — mode=health-scan, %d repos", len(repos))
-        run_health_scan_mode(repos)
+        run_health_scan_mode(repos, assign_copilot=not args.no_copilot_assign)
         log.info("autoRefine complete.")
         return
+    if args.mode == "refine":
+        log.warning(
+            "refine mode bypasses the closed evaluator→builder loop and opens PRs directly; "
+            "use only for local development."
+        )
 
     config = AutoRefineConfig(
         repos=repos,
@@ -304,14 +532,18 @@ def main() -> None:
 
         elif config.mode == "plan":
             print(json.dumps(report, indent=2))
-            plan = plan_project(project_dir, project_config, report["findings"])
+            plan = plan_project(
+                project_dir, project_config, report["findings"], model=config.model,
+            )
             if plan:
                 print("\n--- IMPROVEMENT PLAN ---")
                 print(json.dumps(plan, indent=2))
 
         elif config.mode == "refine":
             # Plan first
-            plan = plan_project(project_dir, project_config, report["findings"])
+            plan = plan_project(
+                project_dir, project_config, report["findings"], model=config.model,
+            )
             if not plan:
                 log.warning("No plan generated for %s — skipping refine", name)
                 continue
@@ -325,12 +557,26 @@ def main() -> None:
                 name,
             )
             success = refine_project(
-                project_dir, project_config, plan, repo, dry_run=config.dry_run,
+                project_dir,
+                project_config,
+                plan,
+                repo,
+                dry_run=config.dry_run,
+                model=config.model,
             )
             if success:
                 log.info("PR created for %s", name)
             else:
                 log.info("No PR created for %s (no changes or dry run)", name)
+
+        elif config.mode == "file-ideas":
+            plan = plan_project(project_dir, project_config, report["findings"])
+            if not plan:
+                log.warning("No plan generated for %s — skipping idea filing", name)
+                continue
+
+            filed_count = file_ideas_for_plan(repo, plan, dry_run=config.dry_run)
+            log.info("Filed %d ideas for %s", filed_count, name)
 
     log.info("autoRefine complete.")
 

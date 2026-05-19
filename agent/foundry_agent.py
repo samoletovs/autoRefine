@@ -35,8 +35,12 @@ from agent.config import ProjectConfig
 
 log = logging.getLogger(__name__)
 
-DEPLOYMENT = os.environ.get("FOUNDRY_DEFAULT_DEPLOYMENT", "gpt-4o-mini")
+DEFAULT_DEPLOYMENT = os.environ.get("FOUNDRY_DEFAULT_DEPLOYMENT", "gpt-4o-mini")
 ENDPOINT = os.environ.get("FOUNDRY_PROJECT_ENDPOINT", "")
+
+# Back-compat alias. Older imports referenced DEPLOYMENT directly; keep it
+# pointing at the env-resolved default so any cached imports still work.
+DEPLOYMENT = DEFAULT_DEPLOYMENT
 
 SYSTEM_PROMPT = (Path(__file__).parent / "prompts" / "system.md").read_text(encoding="utf-8")
 
@@ -395,8 +399,19 @@ def _delete_thread(client: AgentsClient, thread_id: str) -> None:
     client.threads.delete(thread_id)
 
 
-def create_agent(client: AgentsClient, mode: str = "plan") -> str:
-    """Create the autoRefine Foundry agent. In refine mode, includes write tools."""
+def create_agent(
+    client: AgentsClient,
+    mode: str = "plan",
+    model: str | None = None,
+) -> str:
+    """Create the autoRefine Foundry agent. In refine mode, includes write tools.
+
+    :param model: Foundry deployment name to use. Falls back to
+        ``FOUNDRY_DEFAULT_DEPLOYMENT`` env var, then to ``gpt-4o-mini``.
+        Pass a deployment name like ``gpt-5-mini`` (cheap tier) or
+        ``gpt-5`` (deep reasoning) — the CLI ``--model`` arg threads
+        through to here so callers can pick per-run.
+    """
     tool_functions = {
         read_project_file,
         list_directory,
@@ -410,15 +425,16 @@ def create_agent(client: AgentsClient, mode: str = "plan") -> str:
         tool_functions.add(apply_improvement)
 
     tools = FunctionTool(functions=tool_functions)
+    deployment = model or DEFAULT_DEPLOYMENT
 
     agent = client.create_agent(
-        model=DEPLOYMENT,
+        model=deployment,
         name="autorefine",
         instructions=SYSTEM_PROMPT,
         tools=tools.definitions,
         temperature=0.3,
     )
-    log.info("Created agent: %s (mode=%s)", agent.id, mode)
+    log.info("Created agent: %s (mode=%s, model=%s)", agent.id, mode, deployment)
     return agent.id
 
 
@@ -536,8 +552,12 @@ def _parse_plan_from_text(text: str) -> dict | None:
     current_priority = "P2"
     for line in lines:
         # Match lines like: 1. **Title** — description or 1. [P0] **Title**: description
+        # Separator class accepts em-dash, en-dash, hyphen, colon, and middle-dot.
+        # Note: previously contained a mojibake "ù" (U+00F9) here that prevented
+        # lines using Unicode separators (·) from being captured.
         imp_match = _re.match(
-            r"\d+\.\s+(?:\[P(\d)\]\s+)?\*\*(.+?)\*\*\s*[ù—:\-]+\s*(.*)", line
+            r"\d+\.\s+(?:\[P(\d)\]\s+)?\*\*(.+?)\*\*\s*[\u2013\u2014\u00b7:\-]+\s*(.*)",
+            line,
         )
         if imp_match:
             if current_title:
