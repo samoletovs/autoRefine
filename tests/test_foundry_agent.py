@@ -37,8 +37,8 @@ class TestParsePlanFromText:
         assert plan["improvements"][0]["title"] == "Add tests"
 
     def test_middle_dot_separator(self) -> None:
-        """Regression from samoletovs/autoRefine#1: regex had mojibake 'ù'
-        instead of middle dot '·', so '·'-separated rows were dropped."""
+        """Regression from samoletovs/autoRefine#1: UTF-8 mojibake replaced
+        middle dot '·' with 'ù', so '·'-separated rows were dropped."""
         text = "Score: 65/100\n\n1. **Refactor config** \u00b7 split module.\n"
         plan = _parse_plan_from_text(text)
         assert plan is not None
@@ -260,6 +260,12 @@ def test_create_agent_uses_selected_model_and_refine_tools() -> None:
     tool_names = {tool["function"]["name"] for tool in captured["tools"]}
     assert "write_project_file" in tool_names
     assert "apply_improvement" in tool_names
+
+    captured.clear()
+    foundry_agent.create_agent(client, mode="plan", model="gpt-4.1")
+    plan_tool_names = {tool["function"]["name"] for tool in captured["tools"]}
+    assert "write_project_file" not in plan_tool_names
+    assert "apply_improvement" not in plan_tool_names
 
 
 def test_build_plan_task_and_refine_task_include_expected_sections() -> None:

@@ -76,9 +76,9 @@ def test_main_accepts_valid_modes(
         patch.object(sys, "argv", ["autorefine", "--repo", "owner/repo", "--mode", mode]),
         patch("agent.main.clone_repo", return_value=True) as mock_clone,
         patch("agent.main.load_config", return_value=project_config),
-        patch("agent.main.evaluate_project", return_value={"findings": [], "score": 100}),
-        patch("agent.main.plan_project", return_value={"improvements": [], "score": 100}),
-        patch("agent.main.refine_project", return_value=False),
+        patch("agent.main.evaluate_project", return_value={"findings": [], "score": 100}) as mock_eval,
+        patch("agent.main.plan_project", return_value={"improvements": [], "score": 100}) as mock_plan,
+        patch("agent.main.refine_project", return_value=False) as mock_refine,
         patch("agent.main.run_health_scan_mode") as mock_health_scan,
     ):
         main()
@@ -86,6 +86,24 @@ def test_main_accepts_valid_modes(
     if mode == "health-scan":
         mock_health_scan.assert_called_once_with(["owner/repo"], assign_copilot=True)
         mock_clone.assert_not_called()
+        mock_eval.assert_not_called()
+        mock_plan.assert_not_called()
+        mock_refine.assert_not_called()
+    elif mode == "evaluate":
+        mock_clone.assert_called_once()
+        mock_eval.assert_called_once()
+        mock_plan.assert_not_called()
+        mock_refine.assert_not_called()
+    elif mode == "plan":
+        mock_clone.assert_called_once()
+        mock_eval.assert_called_once()
+        mock_plan.assert_called_once()
+        mock_refine.assert_not_called()
+    elif mode == "refine":
+        mock_clone.assert_called_once()
+        mock_eval.assert_called_once()
+        assert mock_plan.call_count == 1
+        mock_refine.assert_called_once()
     else:
         mock_clone.assert_called_once()
 
@@ -112,6 +130,7 @@ def test_main_rejects_invalid_mode() -> None:
         ("owner/re po", 2),
         ("owner/repo!", 2),
         ("own*er/repo", 2),
+        ("owner/..repo", 2),
     ],
 )
 def test_main_rejects_malformed_repo(repo: str, expected_exit_code: int) -> None:

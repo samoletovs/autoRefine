@@ -59,12 +59,9 @@ def _is_valid_repo_slug(repo: str) -> bool:
     if any(ch.isspace() for ch in repo):
         return False
     owner, name = repo.split("/", 1)
-    return (
-        bool(owner)
-        and bool(name)
-        and bool(REPO_SLUG_PATTERN.fullmatch(owner))
-        and bool(REPO_SLUG_PATTERN.fullmatch(name))
-    )
+    if ".." in owner or ".." in name:
+        return False
+    return bool(REPO_SLUG_PATTERN.fullmatch(owner)) and bool(REPO_SLUG_PATTERN.fullmatch(name))
 
 
 def evaluate_project(project_dir: Path, config: ProjectConfig) -> dict:
