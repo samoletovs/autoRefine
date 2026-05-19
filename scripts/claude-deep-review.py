@@ -505,12 +505,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--format", choices=("json", "github"), default="json")
     parser.add_argument(
         "--model",
-        default=os.environ.get("DEEP_REVIEW_MODEL", "").strip() or "claude-opus-4",
+        default=os.environ.get("DEEP_REVIEW_MODEL", "").strip() or "claude-opus-4.7",
         help=(
             "Primary model on GitHub Models. Defaults to $DEEP_REVIEW_MODEL "
-            "or claude-opus-4. To swap to claude-opus-4.7 once available, set "
-            "the repo variable DEEP_REVIEW_MODEL=claude-opus-4.7 — no code "
-            "change required."
+            "or claude-opus-4.7. Override via repo variable DEEP_REVIEW_MODEL."
         ),
     )
     parser.add_argument(
@@ -520,7 +518,7 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Model to try if the primary returns 404 (model_not_found) or "
             "400 (model_unavailable). Repeatable. If omitted, defaults to "
-            "[claude-sonnet-4, gpt-4o]."
+            "[claude-opus-4, claude-sonnet-4.5, claude-sonnet-4, gpt-4.1, gpt-4o]."
         ),
     )
     parser.add_argument("--max-tokens", type=int, default=2048)
@@ -532,7 +530,7 @@ def main(argv: list[str] | None = None) -> int:
 
     fallback_models = (
         args.fallback_model if args.fallback_model is not None
-        else ["claude-sonnet-4", "gpt-4o"]
+        else ["claude-opus-4", "claude-sonnet-4.5", "claude-sonnet-4", "gpt-4.1", "gpt-4o"]
     )
 
     result = review(
