@@ -62,6 +62,9 @@ class AutoRefineConfig:
 
     repos: list[str]  # e.g., ["samoletovs/golazo", "samoletovs/era"]
     mode: str = "evaluate"  # evaluate | plan | refine
+    # Default model: cheap Foundry tier for daily scans of 11 repos.
+    # Override via CLI --model or FOUNDRY_DEFAULT_DEPLOYMENT env var.
+    # See AGENTS.md "Model strategy" for the tiered plan.
     model: str = "gpt-4o-mini"
     dry_run: bool = False
     workdir: Path = field(default_factory=lambda: Path("/tmp/autorefine"))

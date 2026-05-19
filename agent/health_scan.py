@@ -406,6 +406,11 @@ def analyze_with_ai(
             azure_ad_token_provider=token_provider,
         )
 
+    # Resolve model. Default still ``gpt-4o-mini`` for cost-discipline on the
+    # daily 06:00/18:00 health scan, but the deployment is configurable via
+    # ``HEALTH_SCAN_MODEL``. The deep-analysis variant of this scan can be
+    # bumped to ``gpt-5`` or another high-tier deployment per AGENTS.md
+    # "Model strategy".
     model = os.environ.get("HEALTH_SCAN_MODEL", "gpt-4o-mini")
 
     system_prompt = """You are NauroLabs' automated health analyst. Analyze project data, Azure costs, app telemetry, and URL health.
