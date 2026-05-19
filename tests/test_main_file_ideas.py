@@ -13,7 +13,7 @@ def test_map_improvement_type() -> None:
     assert main._map_improvement_type("quality") == "refactor"
 
 
-def test_build_run_references_from_github_actions(monkeypatch) -> None:
+def test_build_run_references_includes_commit_and_workflow_url(monkeypatch) -> None:
     monkeypatch.setenv("GITHUB_SHA", "abc123")
     monkeypatch.setenv("GITHUB_RUN_ID", "987")
     monkeypatch.setenv("GITHUB_REPOSITORY", "samoletovs/autoRefine")
@@ -43,7 +43,7 @@ def test_build_file_idea_command_uses_supported_options(monkeypatch) -> None:
     )
 
     cmd = main._build_file_idea_command(
-        script_path=Path("/tmp/nauroLabs-github/scripts/file-idea.py"),
+        script_path=Path("/tmp/file-idea.py"),
         repo="samoletovs/era",
         improvement={
             "title": "Add tests",
@@ -80,7 +80,7 @@ def test_file_ideas_for_plan_filters_and_deduplicates(monkeypatch) -> None:
 
     calls: list[list[str]] = []
 
-    def _fake_run(cmd, capture_output, text):  # noqa: ANN001
+    def _fake_run(cmd: list[str], capture_output: bool, text: bool) -> SimpleNamespace:
         calls.append(cmd)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 

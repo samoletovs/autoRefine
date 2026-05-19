@@ -36,6 +36,7 @@ BUGFIX_CATEGORIES = {
     "reliability",
     "stability",
 }
+GOVERNANCE_REPO_URL = "https://github.com/samoletovs/nauroLabs-github.git"
 
 
 def load_repos_from_manifest(manifest_path: Path) -> list[str]:
@@ -171,6 +172,13 @@ def _discover_file_idea_options(script_path: Path) -> set[str]:
         capture_output=True,
         text=True,
     )
+    if help_result.returncode != 0:
+        log.warning(
+            "Could not inspect file-idea.py options via --help (code=%d): %s",
+            help_result.returncode,
+            help_result.stderr.strip(),
+        )
+        return set()
     option_text = f"{help_result.stdout}\n{help_result.stderr}"
     return {token for token in option_text.split() if token.startswith("--")}
 
@@ -202,9 +210,10 @@ def _build_file_idea_command(
     _add_option("--problem", description)
     _add_option("--approach", f"Implement '{title}' ({improvement.get('priority', 'P2')}).")
     _add_option("--references", references)
-    _add_option("--body", memo_body)
-    _add_option("--description", memo_body)
-    _add_option("--content", memo_body)
+    for memo_option in ("--body", "--description", "--content"):
+        if memo_option in options:
+            _add_option(memo_option, memo_body)
+            break
 
     if "--dry-run" in options and dry_run:
         cmd.append("--dry-run")
@@ -219,9 +228,9 @@ def _resolve_file_idea_script() -> Path | None:
         if env_script.exists():
             return env_script
 
-    local_checkout_script = REPO_ROOT / ".github-gov" / "scripts" / "file-idea.py"
-    if local_checkout_script.exists():
-        return local_checkout_script
+    governance_checkout_script = REPO_ROOT / ".github-gov" / "scripts" / "file-idea.py"
+    if governance_checkout_script.exists():
+        return governance_checkout_script
 
     tmp_repo = Path("/tmp/nauroLabs-github")
     tmp_script = tmp_repo / "scripts" / "file-idea.py"
@@ -229,12 +238,14 @@ def _resolve_file_idea_script() -> Path | None:
         return tmp_script
 
     clone = subprocess.run(
-        ["git", "clone", "https://github.com/samoletovs/nauroLabs-github.git", str(tmp_repo)],
+        ["git", "clone", GOVERNANCE_REPO_URL, str(tmp_repo)],
         capture_output=True,
         text=True,
     )
     if clone.returncode == 0 and tmp_script.exists():
         return tmp_script
+    if clone.returncode != 0:
+        log.warning("Failed to clone governance repo to %s: %s", tmp_repo, clone.stderr.strip())
 
     log.error(
         "Could not resolve scripts/file-idea.py. Set NAURO_GOVERNANCE_PATH or provide .github-gov checkout."
@@ -267,6 +278,7 @@ def file_ideas_for_plan(
             continue
 
         title_key = title.lower()
+        # Deduplicate case-insensitively so repeated titles in the same plan file once.
         if title_key in seen_titles:
             continue
         seen_titles.add(title_key)
