@@ -265,6 +265,14 @@ def test_build_plan_task_includes_findings_and_similar() -> None:
     assert "Similar products context" in task
 
 
+class TestCreateAgentSignature:
+    def test_accepts_model_kwarg(self) -> None:
+        """Guards against regressions where the --model kwarg gets dropped from create_agent."""
+        sig = inspect.signature(create_agent)
+        assert "model" in sig.parameters
+        assert sig.parameters["model"].default is None
+
+
 def test_build_refine_task_lists_improvements() -> None:
     config = ProjectConfig(name="demo", purpose="", users="", stage="active")
     task = foundry_agent.build_refine_task(
