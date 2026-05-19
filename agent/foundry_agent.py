@@ -16,6 +16,7 @@ import os
 import subprocess
 import time
 from pathlib import Path
+from typing import Any
 
 import httpx
 from azure.ai.agents import AgentsClient
@@ -326,7 +327,10 @@ MAX_RETRY_ATTEMPTS = 5
 
 def _is_retryable_foundry_error(exc: BaseException) -> bool:
     if isinstance(exc, HttpResponseError):
-        return getattr(exc, "status_code", None) in RETRYABLE_STATUS_CODES
+        status_code = getattr(exc, "status_code", None)
+        if status_code is None and getattr(exc, "response", None) is not None:
+            status_code = getattr(exc.response, "status_code", None)
+        return status_code in RETRYABLE_STATUS_CODES
 
     return isinstance(
         exc,
@@ -349,7 +353,7 @@ def _log_retry_before_sleep(retry_state: RetryCallState) -> None:
     )
 
 
-def _foundry_retry():
+def _foundry_retry() -> Any:
     return retry(
         reraise=True,
         stop=stop_after_attempt(MAX_RETRY_ATTEMPTS),
@@ -361,12 +365,17 @@ def _foundry_retry():
 
 
 @_foundry_retry()
-def _create_run(client: AgentsClient, thread_id: str, agent_id: str):
+def _create_run(client: AgentsClient, thread_id: str, agent_id: str) -> Any:
     return client.runs.create(thread_id=thread_id, agent_id=agent_id)
 
 
 @_foundry_retry()
-def _submit_tool_outputs(client: AgentsClient, thread_id: str, run_id: str, tool_outputs: list[ToolOutput]):
+def _submit_tool_outputs(
+    client: AgentsClient,
+    thread_id: str,
+    run_id: str,
+    tool_outputs: list[ToolOutput],
+) -> Any:
     return client.runs.submit_tool_outputs(
         thread_id=thread_id,
         run_id=run_id,
@@ -375,7 +384,7 @@ def _submit_tool_outputs(client: AgentsClient, thread_id: str, run_id: str, tool
 
 
 @_foundry_retry()
-def _get_run(client: AgentsClient, thread_id: str, run_id: str):
+def _get_run(client: AgentsClient, thread_id: str, run_id: str) -> Any:
     return client.runs.get(thread_id=thread_id, run_id=run_id)
 
 
