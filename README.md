@@ -91,7 +91,10 @@ autoRefine/
 
 autoRefine is a **Foundry hosted agent** with function-calling tools:
 
-- **Model**: `gpt-4o-mini` (upgrades to `gpt-4o` only for complex code analysis)
+- **Model**: `gpt-4o-mini` by default (cheap, runs across 11 repos). Bump to
+  `gpt-5` for one-off deep analysis via `python -m agent.main --model gpt-5`.
+  The closed-loop PR reviewer (deep-review) lives in `samoletovs/nauroLabs-github`
+  and uses Claude Opus 4 (via GitHub Models) — see that repo's AGENT_ROLES.md.
 - **Tools**: GitHub API, web search, file system, test runner, quality checkers
 - **Human-in-the-loop**: agent asks for confirmation on risky or uncertain changes
 - **Safety**: all changes are made on branches, tested, and submitted as PRs — never direct to main
@@ -100,7 +103,7 @@ autoRefine is a **Foundry hosted agent** with function-calling tools:
 
 - Python 3.11+
 - Microsoft Foundry (Azure AI Projects SDK)
-- Azure OpenAI (`gpt-4o-mini` default)
+- Azure OpenAI (`gpt-4o-mini` default, configurable via CLI / env)
 - GitHub API (`gh` CLI + REST)
 - PyYAML for `project.yaml` parsing
 
