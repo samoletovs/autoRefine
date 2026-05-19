@@ -1,0 +1,40 @@
+name: Assign Copilot to unassigned idea issues
+
+on:
+  schedule:
+    # Run daily at 07:15 UTC (after nauro-autopilot which runs at 07:00)
+    - cron: '15 7 * * *'
+  workflow_dispatch:
+
+jobs:
+  assign:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Assign Copilot to open idea issues with no Copilot assignee
+        env:
+          # GITHUB_TOKEN is the installation token for THIS repo.
+          # It is the only token that can add the Copilot bot via
+          # replaceActorsForAssignable — fine-grained PATs do not work.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ISSUES=$(gh issue list \
+            --repo "${{ github.repository }}" \
+            --label idea \
+            --state open \
+            --json number,assignees \
+            --jq '[.[] | select(([.assignees[].login] | index("Copilot")) == null) | .number] | .[]' 2>/dev/null || true)
+
+          if [ -z "$ISSUES" ]; then
+            echo "No unassigned idea issues found."
+            exit 0
+          fi
+
+          for NUM in $ISSUES; do
+            echo "Assigning Copilot to ${{ github.repository }}#$NUM"
+            gh issue edit "$NUM" \
+              --repo "${{ github.repository }}" \
+              --add-assignee "Copilot" \
+              || echo "::warning::Could not assign Copilot to #$NUM — Copilot Coding Agent may not be enabled for this repo"
+          done
