@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ import pytest
 
 from agent import foundry_agent
 from agent.config import ProjectConfig
+from agent.foundry_agent import create_agent
 
 
 class FakeFunctionTool:
@@ -254,6 +256,14 @@ def test_build_plan_task_includes_findings_and_similar() -> None:
     task = foundry_agent.build_plan_task([{"priority": "P0", "category": "tests", "description": "missing"}], config)
     assert "Quality check findings" in task
     assert "Similar products context" in task
+
+
+class TestCreateAgentSignature:
+    def test_accepts_model_kwarg(self) -> None:
+        """Guards against regressions where the --model kwarg gets dropped from create_agent."""
+        sig = inspect.signature(create_agent)
+        assert "model" in sig.parameters
+        assert sig.parameters["model"].default is None
 
 
 def test_build_refine_task_lists_improvements() -> None:
