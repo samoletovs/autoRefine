@@ -70,6 +70,19 @@ def evaluate_project(project_dir: Path, config: ProjectConfig) -> dict:
     return report
 
 
+def load_config(project_dir: Path) -> ProjectConfig | None:
+    """Load project.yaml configuration from a cloned project directory."""
+    return read_project_yaml(project_dir)
+
+
+def _is_valid_repo_slug(repo: str) -> bool:
+    """Validate GitHub repo slug format owner/name."""
+    if repo.count("/") != 1:
+        return False
+    owner, name = repo.split("/", 1)
+    return bool(owner.strip() and name.strip())
+
+
 def plan_project(
     project_dir: Path,
     config: ProjectConfig,
@@ -472,6 +485,8 @@ def main() -> None:
         help="Disable automatic Copilot assignment for health-scan-created issues",
     )
     args = parser.parse_args()
+    if args.repo is not None and not _is_valid_repo_slug(args.repo):
+        parser.error("--repo must be in the format owner/name")
 
     # Resolve repo list
     repos: list[str] = []
@@ -519,7 +534,7 @@ def main() -> None:
             continue
 
         # Load project.yaml
-        project_config = read_project_yaml(project_dir)
+        project_config = load_config(project_dir)
         if not project_config:
             log.warning("%s has no project.yaml — skipping", name)
             continue
