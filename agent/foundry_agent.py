@@ -14,8 +14,10 @@ import json
 import logging
 import os
 import subprocess
+import time
 from pathlib import Path
 
+import httpx
 from azure.ai.agents import AgentsClient
 from azure.ai.agents.models import (
     FunctionTool,
@@ -25,7 +27,8 @@ from azure.ai.agents.models import (
     SubmitToolOutputsAction,
     ToolOutput,
 )
-from azure.identity import DefaultAzureCredential
+from azure.core.exceptions import HttpResponseError
+from tenacity import RetryCallState, retry, retry_if_exception, stop_after_attempt, wait_exponential_jitter
 
 from agent.config import ProjectConfig
 
@@ -317,6 +320,70 @@ TOOL_HANDLERS = {
 
 # ── Agent orchestration ──────────────────────────────────────────────────────
 
+RETRYABLE_STATUS_CODES = {429, 502, 503, 504}
+MAX_RETRY_ATTEMPTS = 5
+
+
+def _is_retryable_foundry_error(exc: BaseException) -> bool:
+    if isinstance(exc, HttpResponseError):
+        return getattr(exc, "status_code", None) in RETRYABLE_STATUS_CODES
+
+    return isinstance(
+        exc,
+        (httpx.RemoteProtocolError, httpx.ConnectError, httpx.TimeoutException),
+    )
+
+
+def _sleep_for_retry(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _log_retry_before_sleep(retry_state: RetryCallState) -> None:
+    exc = retry_state.outcome.exception() if retry_state.outcome else None
+    log.warning(
+        "Retrying Foundry call %s (attempt %d/%d) after error: %s",
+        retry_state.fn.__name__,
+        retry_state.attempt_number,
+        MAX_RETRY_ATTEMPTS,
+        exc,
+    )
+
+
+def _foundry_retry():
+    return retry(
+        reraise=True,
+        stop=stop_after_attempt(MAX_RETRY_ATTEMPTS),
+        wait=wait_exponential_jitter(initial=1, max=60),
+        retry=retry_if_exception(_is_retryable_foundry_error),
+        before_sleep=_log_retry_before_sleep,
+        sleep=_sleep_for_retry,
+    )
+
+
+@_foundry_retry()
+def _create_run(client: AgentsClient, thread_id: str, agent_id: str):
+    return client.runs.create(thread_id=thread_id, agent_id=agent_id)
+
+
+@_foundry_retry()
+def _submit_tool_outputs(client: AgentsClient, thread_id: str, run_id: str, tool_outputs: list[ToolOutput]):
+    return client.runs.submit_tool_outputs(
+        thread_id=thread_id,
+        run_id=run_id,
+        tool_outputs=tool_outputs,
+    )
+
+
+@_foundry_retry()
+def _get_run(client: AgentsClient, thread_id: str, run_id: str):
+    return client.runs.get(thread_id=thread_id, run_id=run_id)
+
+
+@_foundry_retry()
+def _delete_thread(client: AgentsClient, thread_id: str) -> None:
+    client.threads.delete(thread_id)
+
+
 def create_agent(client: AgentsClient, mode: str = "plan") -> str:
     """Create the autoRefine Foundry agent. In refine mode, includes write tools."""
     tool_functions = {
@@ -371,7 +438,7 @@ def run_agent(
     )
 
     # Run the agent
-    run = client.runs.create(thread_id=thread.id, agent_id=agent_id)
+    run = _create_run(client, thread.id, agent_id)
     log.info("Run started: %s", run.id)
 
     # Poll for completion, handling tool calls
@@ -403,17 +470,12 @@ def run_agent(
                             output=output,
                         ))
 
-                run = client.runs.submit_tool_outputs(
-                    thread_id=thread.id,
-                    run_id=run.id,
-                    tool_outputs=tool_outputs,
-                )
+                run = _submit_tool_outputs(client, thread.id, run.id, tool_outputs)
             continue
 
         # Poll
-        import time
         time.sleep(1)
-        run = client.runs.get(thread_id=thread.id, run_id=run.id)
+        run = _get_run(client, thread.id, run.id)
 
     if run.status == "failed":
         log.error("Run failed: %s", run.last_error)
@@ -438,7 +500,7 @@ def run_agent(
                         log.info("Parsed plan from text response (submit_plan not called)")
 
     # Clean up
-    client.threads.delete(thread.id)
+    _delete_thread(client, thread.id)
 
     return plan_result
 
