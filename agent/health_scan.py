@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import subprocess
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -33,31 +34,71 @@ MAX_REPORTS = 10
 
 AZURE_BUDGET_MONTHLY = 150.0  # VS Enterprise monthly credit
 
-# Deployed app URLs for health checks.
-# TODO: read from workspace-manifest.json once it carries deployment URLs.
-APP_URLS: dict[str, str] = {
-    "amberRepublic": "https://amber.naurolabs.com",
-    "rosette": "https://rosette.naurolabs.com",
-    "golazo": "https://golazo.naurolabs.com",
-    "tPlan": "https://tplan.naurolabs.com",
-    "era": "https://era.naurolabs.com",
-    "portaBaltica": "https://portabaltica.naurolabs.com",
-    "atlas": "https://atlas.naurolabs.com",
-    "naurolabs": "https://naurolabs.com",
-}
+MANIFEST_URL = (
+    "https://raw.githubusercontent.com/samoletovs/nauroLabs-github/master"
+    "/config/workspace-manifest.json"
+)
+_MANIFEST_CACHE_PATH = Path("/tmp/workspace-manifest.json")
 
-# Map repos to their resource groups (for App Insights queries).
-REPO_RESOURCE_GROUPS: dict[str, str] = {
-    "agentMode": "rg-personal-agents",
-    "era": "rg-era",
-    "amberRepublic": "rg-amberrepublic",
-    "rosette": "rg-rosette",
-    "golazo": "rg-golazo",
-    "turgo": "rg-turgo",
-    "tPlan": "rg-tplan",
-    "atlas": "rg-atlas",
-    "portaBaltica": "rg-portabaltica",
-}
+
+# ── Workspace manifest helpers ─────────────────────────────────────────────
+def fetch_workspace_manifest(
+    url: str = MANIFEST_URL,
+    cache_path: Path = _MANIFEST_CACHE_PATH,
+) -> dict[str, Any]:
+    """Fetch workspace-manifest.json, caching it for this invocation.
+
+    Raises RuntimeError if the remote returns a non-200 status so that
+    health-scan fails loudly rather than silently scanning a stale list.
+    """
+    if cache_path.exists():
+        try:
+            with open(cache_path, encoding="utf-8") as fh:
+                return json.load(fh)  # type: ignore[no-any-return]
+        except (json.JSONDecodeError, OSError) as exc:
+            log.warning("Manifest cache at %s is unreadable (%s) — re-fetching", cache_path, exc)
+            cache_path.unlink(missing_ok=True)
+
+    resp = httpx.get(url, timeout=15, follow_redirects=True)
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"Failed to fetch workspace manifest from {url}: HTTP {resp.status_code}"
+        )
+
+    data: dict[str, Any] = resp.json()
+    cache_path.write_text(json.dumps(data), encoding="utf-8")
+    return data
+
+
+def _project_slug(project: dict[str, Any]) -> str:
+    """Return the short name for a project (slug field, else last path segment of repo)."""
+    return project.get("slug") or project.get("repo", "").split("/")[-1]
+
+
+def _build_app_urls(manifest: dict[str, Any]) -> dict[str, str]:
+    """Build {slug: url} from active projects in the manifest."""
+    result: dict[str, str] = {}
+    for project in manifest.get("projects", []):
+        if project.get("status") == "archived":
+            continue
+        slug = _project_slug(project)
+        url = project.get("url")
+        if slug and url:
+            result[slug] = url
+    return result
+
+
+def _build_repo_resource_groups(manifest: dict[str, Any]) -> dict[str, str]:
+    """Build {slug: resourceGroup} from active projects that declare an Azure RG."""
+    result: dict[str, str] = {}
+    for project in manifest.get("projects", []):
+        if project.get("status") == "archived":
+            continue
+        slug = _project_slug(project)
+        rg = (project.get("azure") or {}).get("resourceGroup")
+        if slug and rg:
+            result[slug] = rg
+    return result
 
 
 # ── GitHub Scanner ─────────────────────────────────────────────────────────
@@ -241,6 +282,9 @@ def scan_app_insights() -> dict[str, Any]:
         log.warning("Failed to list App Insights components: %s", e)
         return {"error": str(e)}
 
+    manifest = fetch_workspace_manifest()
+    repo_resource_groups = _build_repo_resource_groups(manifest)
+
     results: dict[str, Any] = {}
     with httpx.Client(timeout=30) as client:
         for comp in components:
@@ -253,7 +297,7 @@ def scan_app_insights() -> dict[str, Any]:
                 else ""
             )
             repo_name = next(
-                (repo for repo, rg_name in REPO_RESOURCE_GROUPS.items() if rg_name == rg),
+                (repo for repo, rg_name in repo_resource_groups.items() if rg_name == rg),
                 name,
             )
             if not app_id:
@@ -348,9 +392,11 @@ def scan_app_insights() -> dict[str, Any]:
 # ── URL Health Checker ─────────────────────────────────────────────────────
 def check_deployed_urls() -> dict[str, Any]:
     """HTTP GET each deployed URL and capture status + latency."""
+    manifest = fetch_workspace_manifest()
+    app_urls = _build_app_urls(manifest)
     results: dict[str, Any] = {}
     with httpx.Client(timeout=15, follow_redirects=True) as client:
-        for repo, url in APP_URLS.items():
+        for repo, url in app_urls.items():
             try:
                 resp = client.get(url)
                 results[repo] = {
