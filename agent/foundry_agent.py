@@ -59,8 +59,6 @@ def _is_retryable_foundry_exception(exception: BaseException) -> bool:
     """Return True only for transient Foundry/network errors worth retrying."""
     if isinstance(exception, HttpResponseError):
         status_code = getattr(exception, "status_code", None)
-        if status_code is None and getattr(exception, "response", None) is not None:
-            status_code = getattr(exception.response, "status_code", None)
         return status_code in RETRYABLE_FOUNDRY_STATUS_CODES
 
     return isinstance(

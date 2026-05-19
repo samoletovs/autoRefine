@@ -381,9 +381,11 @@ def _http_response_error(status_code: int) -> HttpResponseError:
     return HttpResponseError(message=f"HTTP {status_code}", response=response)
 
 
-def test_foundry_retry_retries_429_then_succeeds(caplog: pytest.LogCaptureFixture) -> None:
+def test_foundry_retry_retries_429_then_succeeds(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     calls = 0
-    original_sleep = _call_foundry_with_retry.retry.sleep
 
     def flaky_operation() -> str:
         nonlocal calls
@@ -392,12 +394,9 @@ def test_foundry_retry_retries_429_then_succeeds(caplog: pytest.LogCaptureFixtur
             raise _http_response_error(429)
         return "ok"
 
-    _call_foundry_with_retry.retry.sleep = lambda _seconds: None
-    try:
-        with caplog.at_level(logging.WARNING):
-            result = _call_foundry_with_retry("client.runs.create_and_process", flaky_operation)
-    finally:
-        _call_foundry_with_retry.retry.sleep = original_sleep
+    monkeypatch.setattr(_call_foundry_with_retry.retry, "sleep", lambda _seconds: None)
+    with caplog.at_level(logging.WARNING):
+        result = _call_foundry_with_retry("client.runs.create_and_process", flaky_operation)
 
     assert result == "ok"
     assert calls == 3
@@ -405,7 +404,8 @@ def test_foundry_retry_retries_429_then_succeeds(caplog: pytest.LogCaptureFixtur
         rec
         for rec in caplog.records
         if rec.levelno == logging.WARNING
-        and "Retrying client.runs.create_and_process after attempt" in rec.getMessage()
+        and rec.msg == "Retrying %s after attempt %d/%d due to %s: %s"
+        and rec.args[0] == "client.runs.create_and_process"
     ]
     assert len(retry_warnings) == 2
 
