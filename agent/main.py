@@ -58,7 +58,25 @@ def evaluate_project(project_dir: Path, config: ProjectConfig) -> dict:
     return report
 
 
-def plan_project(project_dir: Path, config: ProjectConfig, findings: list[dict]) -> dict | None:
+def load_config(project_dir: Path) -> ProjectConfig | None:
+    """Load project.yaml configuration from a cloned project directory."""
+    return read_project_yaml(project_dir)
+
+
+def _is_valid_repo_slug(repo: str) -> bool:
+    """Validate GitHub repo slug format owner/name."""
+    if repo.count("/") != 1:
+        return False
+    owner, name = repo.split("/", 1)
+    return bool(owner.strip() and name.strip())
+
+
+def plan_project(
+    project_dir: Path,
+    config: ProjectConfig,
+    findings: list[dict],
+    model: str = "gpt-4o-mini",
+) -> dict | None:
     """Use Foundry agent to create an improvement plan."""
     endpoint = os.environ.get("FOUNDRY_PROJECT_ENDPOINT", "")
     if not endpoint:
@@ -76,7 +94,7 @@ def plan_project(project_dir: Path, config: ProjectConfig, findings: list[dict])
         credential=DefaultAzureCredential(),
     )
 
-    agent_id = create_agent(client, mode="plan")
+    agent_id = create_agent(client, mode="plan", model=model)
 
     try:
         task = build_plan_task(findings, config)
@@ -99,6 +117,7 @@ def refine_project(
     config: ProjectConfig,
     plan: dict,
     repo: str,
+    model: str = "gpt-4o-mini",
     dry_run: bool = False,
 ) -> bool:
     """Use Foundry agent to execute improvements, then create a PR."""
@@ -136,7 +155,7 @@ def refine_project(
             log.error("Cannot create branch — skipping refine")
             return False
 
-    agent_id = create_agent(client, mode="refine")
+    agent_id = create_agent(client, mode="refine", model=model)
 
     try:
         task = build_refine_task(plan, config)
@@ -249,6 +268,8 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--workdir", default="/tmp/autorefine")
     args = parser.parse_args()
+    if args.repo is not None and not _is_valid_repo_slug(args.repo):
+        parser.error("--repo must be in the format owner/name")
 
     # Resolve repo list
     repos: list[str] = []
@@ -291,7 +312,7 @@ def main() -> None:
             continue
 
         # Load project.yaml
-        project_config = read_project_yaml(project_dir)
+        project_config = load_config(project_dir)
         if not project_config:
             log.warning("%s has no project.yaml — skipping", name)
             continue
@@ -304,14 +325,14 @@ def main() -> None:
 
         elif config.mode == "plan":
             print(json.dumps(report, indent=2))
-            plan = plan_project(project_dir, project_config, report["findings"])
+            plan = plan_project(project_dir, project_config, report["findings"], model=config.model)
             if plan:
                 print("\n--- IMPROVEMENT PLAN ---")
                 print(json.dumps(plan, indent=2))
 
         elif config.mode == "refine":
             # Plan first
-            plan = plan_project(project_dir, project_config, report["findings"])
+            plan = plan_project(project_dir, project_config, report["findings"], model=config.model)
             if not plan:
                 log.warning("No plan generated for %s — skipping refine", name)
                 continue
@@ -325,7 +346,12 @@ def main() -> None:
                 name,
             )
             success = refine_project(
-                project_dir, project_config, plan, repo, dry_run=config.dry_run,
+                project_dir,
+                project_config,
+                plan,
+                repo,
+                model=config.model,
+                dry_run=config.dry_run,
             )
             if success:
                 log.info("PR created for %s", name)

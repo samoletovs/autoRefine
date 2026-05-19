@@ -1,0 +1,359 @@
+"""Tests for issue #idea-add-unit-tests-for-agent-main-and-foundry-agent."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import httpx
+import pytest
+
+from agent import foundry_agent
+from agent.config import ProjectConfig
+
+
+def test_handle_write_project_file_writes_inside_project(tmp_path: Path) -> None:
+    result = foundry_agent._handle_write_project_file(
+        tmp_path, {"path": "src/utils.py", "content": "print('ok')"}
+    )
+    parsed = json.loads(result)
+
+    assert parsed["status"] == "written"
+    assert parsed["path"] == "src/utils.py"
+    assert (tmp_path / "src" / "utils.py").read_text(encoding="utf-8") == "print('ok')"
+
+
+def test_handle_write_project_file_blocks_path_traversal(tmp_path: Path) -> None:
+    result = foundry_agent._handle_write_project_file(
+        tmp_path, {"path": "../outside.txt", "content": "nope"}
+    )
+    assert json.loads(result)["error"] == "Path traversal blocked"
+
+
+@pytest.mark.parametrize(
+    "blocked_path",
+    [".git/config", ".env", "node_modules/pkg/index.js", ".github/workflows/ci.yml"],
+)
+def test_handle_write_project_file_blocks_protected_paths(
+    tmp_path: Path, blocked_path: str
+) -> None:
+    result = foundry_agent._handle_write_project_file(
+        tmp_path, {"path": blocked_path, "content": "blocked"}
+    )
+    assert "protected path" in json.loads(result)["error"]
+
+
+def test_handle_apply_improvement_acknowledges_payload(tmp_path: Path) -> None:
+    result = foundry_agent._handle_apply_improvement(
+        tmp_path,
+        {"title": "Add tests", "files_changed": ["tests/test_a.py"], "description": "desc"},
+    )
+    parsed = json.loads(result)
+    assert parsed["status"] == "improvement_applied"
+    assert parsed["title"] == "Add tests"
+    assert parsed["files_changed"] == ["tests/test_a.py"]
+
+
+def test_handle_run_tests_python_project_passes(tmp_path: Path) -> None:
+    (tmp_path / "requirements.txt").write_text("", encoding="utf-8")
+    fake_run = SimpleNamespace(returncode=0, stdout="33 passed\n", stderr="")
+
+    with patch("subprocess.run", return_value=fake_run) as mock_run:
+        result = json.loads(foundry_agent._handle_run_tests(tmp_path, {}))
+
+    assert result["passed"] is True
+    assert "33 passed" in result["output"]
+    assert mock_run.call_args.args[0] == ["python", "-m", "pytest", "tests/", "-x", "-q"]
+
+
+def test_handle_run_tests_python_project_failure(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
+    fake_run = SimpleNamespace(returncode=1, stdout="F", stderr="AssertionError")
+
+    with patch("subprocess.run", return_value=fake_run):
+        result = json.loads(foundry_agent._handle_run_tests(tmp_path, {}))
+
+    assert result["passed"] is False
+    assert "AssertionError" in result["output"]
+
+
+def test_handle_run_tests_node_project_uses_npm(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    fake_run = SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    with patch("subprocess.run", return_value=fake_run) as mock_run:
+        _ = foundry_agent._handle_run_tests(tmp_path, {})
+
+    assert mock_run.call_args.args[0] == ["npm", "test", "--", "--reporter=verbose"]
+
+
+def test_handle_run_tests_no_runner_detected(tmp_path: Path) -> None:
+    result = json.loads(foundry_agent._handle_run_tests(tmp_path, {}))
+    assert result["error"] == "No test runner detected"
+
+
+def test_handle_search_web_empty_query_returns_error(tmp_path: Path) -> None:
+    result = json.loads(foundry_agent._handle_search_web(tmp_path, {"query": ""}))
+    assert result["error"] == "Empty query"
+
+
+def test_handle_search_web_non_200_returns_error(tmp_path: Path) -> None:
+    response = httpx.Response(503, request=httpx.Request("GET", "https://html.duckduckgo.com/html/"))
+
+    with patch("httpx.get", return_value=response):
+        parsed = json.loads(foundry_agent._handle_search_web(tmp_path, {"query": "fitbod"}))
+
+    assert parsed["query"] == "fitbod"
+    assert "Search failed" in parsed["error"]
+
+
+def test_handle_search_web_timeout_returns_error(tmp_path: Path) -> None:
+    with patch("httpx.get", side_effect=httpx.TimeoutException("timeout")):
+        parsed = json.loads(foundry_agent._handle_search_web(tmp_path, {"query": "fitbod"}))
+
+    assert parsed["query"] == "fitbod"
+    assert "Search failed" in parsed["error"]
+
+
+def test_handle_search_web_no_results_note(tmp_path: Path) -> None:
+    response = SimpleNamespace(
+        text="<html><body>no-results</body></html>",
+        raise_for_status=lambda: None,
+    )
+
+    with patch("httpx.get", return_value=response):
+        parsed = json.loads(foundry_agent._handle_search_web(tmp_path, {"query": "fitbod"}))
+
+    assert parsed["results"] == []
+    assert "No results found" in parsed["note"]
+
+
+def test_handle_search_web_parses_top_results(tmp_path: Path) -> None:
+    html = """
+    <a class="result__a">Result One</a>
+    <a class="result__snippet">First snippet</a>
+    <a class="result__url" href="https://example.com/one"></a>
+    <a class="result__a">Result Two</a>
+    <a class="result__snippet">Second snippet</a>
+    <a class="result__url" href="https://example.com/two"></a>
+    """
+    response = SimpleNamespace(text=html, raise_for_status=lambda: None)
+
+    with patch("httpx.get", return_value=response):
+        parsed = json.loads(foundry_agent._handle_search_web(tmp_path, {"query": "fitbod"}))
+
+    assert len(parsed["results"]) == 2
+    assert parsed["results"][0]["title"] == "Result One"
+    assert parsed["results"][1]["url"] == "https://example.com/two"
+
+
+def test_create_agent_uses_passed_model() -> None:
+    fake_created = SimpleNamespace(id="agent-123")
+    fake_client = SimpleNamespace()
+
+    with patch("agent.foundry_agent.FunctionTool") as mock_tool, patch.object(
+        fake_client, "create_agent", return_value=fake_created, create=True
+    ) as mock_create_agent:
+        mock_tool.return_value.definitions = ["tool-a"]
+        agent_id = foundry_agent.create_agent(fake_client, mode="plan", model="gpt-4.1")
+
+    assert agent_id == "agent-123"
+    assert mock_create_agent.call_args.kwargs["model"] == "gpt-4.1"
+
+
+def test_tool_definition_stubs_return_empty_string() -> None:
+    assert foundry_agent.read_project_file("README.md") == ""
+    assert foundry_agent.list_directory(".") == ""
+    assert foundry_agent.search_web("query") == ""
+    assert foundry_agent.run_project_tests() == ""
+    assert foundry_agent.submit_plan(80, "summary", []) == ""
+    assert foundry_agent.write_project_file("x.txt", "body") == ""
+    assert foundry_agent.apply_improvement("t", "d", []) == ""
+
+
+def test_handle_read_project_file_success_and_truncation(tmp_path: Path) -> None:
+    target = tmp_path / "README.md"
+    target.write_text("a\nb\nc\n", encoding="utf-8")
+    parsed = json.loads(foundry_agent._handle_read_project_file(tmp_path, {"path": "README.md", "max_lines": 2}))
+    assert parsed["path"] == "README.md"
+    assert parsed["content"] == "a\nb"
+    assert parsed["truncated"] is True
+
+
+def test_handle_read_project_file_not_found(tmp_path: Path) -> None:
+    parsed = json.loads(foundry_agent._handle_read_project_file(tmp_path, {"path": "missing.md"}))
+    assert "File not found" in parsed["error"]
+
+
+def test_handle_read_project_file_not_a_file(tmp_path: Path) -> None:
+    (tmp_path / "docs").mkdir()
+    parsed = json.loads(foundry_agent._handle_read_project_file(tmp_path, {"path": "docs"}))
+    assert "Not a file" in parsed["error"]
+
+
+def test_handle_read_project_file_blocks_path_traversal(tmp_path: Path) -> None:
+    outside = tmp_path.parent / "outside.txt"
+    outside.write_text("secret", encoding="utf-8")
+    parsed = json.loads(foundry_agent._handle_read_project_file(tmp_path, {"path": f"../{outside.name}"}))
+    assert parsed["error"] == "Path traversal blocked"
+
+
+def test_handle_list_directory_success_skips_known_dirs(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "README.md").write_text("x", encoding="utf-8")
+
+    parsed = json.loads(foundry_agent._handle_list_directory(tmp_path, {"path": "."}))
+    names = {entry["name"] for entry in parsed["entries"]}
+    assert "src" in names
+    assert "README.md" in names
+    assert ".git" not in names
+    assert "node_modules" not in names
+
+
+def test_handle_list_directory_not_found(tmp_path: Path) -> None:
+    parsed = json.loads(foundry_agent._handle_list_directory(tmp_path, {"path": "missing"}))
+    assert "Directory not found" in parsed["error"]
+
+
+def test_handle_list_directory_blocks_traversal(tmp_path: Path) -> None:
+    outside_dir = tmp_path.parent / "outside-dir"
+    outside_dir.mkdir(exist_ok=True)
+    parsed = json.loads(foundry_agent._handle_list_directory(tmp_path, {"path": f"../{outside_dir.name}"}))
+    assert parsed["error"] == "Path traversal blocked"
+
+
+def test_handle_submit_plan_returns_ack(tmp_path: Path) -> None:
+    parsed = json.loads(
+        foundry_agent._handle_submit_plan(tmp_path, {"improvements": [{"title": "one"}, {"title": "two"}]})
+    )
+    assert parsed["status"] == "plan_received"
+    assert parsed["improvements_count"] == 2
+
+
+def test_parse_plan_from_text_parses_score_and_improvements() -> None:
+    text = (
+        "Findings\n"
+        "Score: 88/100\n"
+        "1. [P1] **Fix tests** — Improve unit test coverage\n"
+        "2. **Improve docs**: Add architecture section\n"
+    )
+    parsed = foundry_agent._parse_plan_from_text(text)
+    assert parsed is not None
+    assert parsed["score"] == 88
+    assert len(parsed["improvements"]) == 2
+    assert parsed["improvements"][0]["priority"] == "P1"
+
+
+def test_parse_plan_from_text_returns_none_without_improvements() -> None:
+    assert foundry_agent._parse_plan_from_text("Score: 50/100\nNo numbered list") is None
+
+
+def test_build_plan_task_includes_findings_and_similar() -> None:
+    config = ProjectConfig(
+        name="demo",
+        purpose="p",
+        users="u",
+        stage="active",
+        goals=[],
+        similar=["A", "B"],
+        quality=[],
+    )
+    task = foundry_agent.build_plan_task([{"priority": "P0", "category": "tests", "description": "missing"}], config)
+    assert "Quality check findings" in task
+    assert "Similar products to research" in task
+
+
+def test_build_refine_task_lists_improvements() -> None:
+    config = ProjectConfig(name="demo", purpose="", users="", stage="active")
+    task = foundry_agent.build_refine_task(
+        {"improvements": [{"priority": "P1", "title": "Add tests", "description": "write more tests"}]},
+        config,
+    )
+    assert "Improvements to apply" in task
+    assert "[P1] Add tests" in task
+
+
+def test_run_agent_handles_failed_status() -> None:
+    config = ProjectConfig(name="demo", purpose="", users="", stage="active")
+
+    thread_api = SimpleNamespace(
+        create=lambda: SimpleNamespace(id="thread-1"),
+        delete=lambda _thread_id: None,
+    )
+    messages_api = SimpleNamespace(create=lambda **_kwargs: None, list=lambda **_kwargs: [])
+    runs_api = SimpleNamespace(
+        create=lambda **_kwargs: SimpleNamespace(id="run-1", status="failed", last_error="boom"),
+    )
+    client = SimpleNamespace(threads=thread_api, messages=messages_api, runs=runs_api)
+
+    result = foundry_agent.run_agent(client, "agent-1", Path("."), config, "task")
+    assert result is None
+
+
+def test_run_agent_processes_tool_calls_and_returns_plan(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = ProjectConfig(name="demo", purpose="", users="", stage="active")
+
+    class DummyFunction:
+        def __init__(self, name: str, arguments: str) -> None:
+            self.name = name
+            self.arguments = arguments
+
+    class DummyToolCall:
+        def __init__(self, tool_call_id: str, name: str, arguments: str) -> None:
+            self.id = tool_call_id
+            self.function = DummyFunction(name, arguments)
+
+    class DummySubmitToolOutputsAction:
+        def __init__(self, tool_calls: list[DummyToolCall]) -> None:
+            self.submit_tool_outputs = SimpleNamespace(tool_calls=tool_calls)
+
+    class DummyToolOutput:
+        def __init__(self, tool_call_id: str, output: str) -> None:
+            self.tool_call_id = tool_call_id
+            self.output = output
+
+    monkeypatch.setattr(foundry_agent, "RequiredFunctionToolCall", DummyToolCall)
+    monkeypatch.setattr(foundry_agent, "SubmitToolOutputsAction", DummySubmitToolOutputsAction)
+    monkeypatch.setattr(foundry_agent, "ToolOutput", DummyToolOutput)
+
+    thread_api = SimpleNamespace(
+        create=lambda: SimpleNamespace(id="thread-1"),
+        delete=lambda _thread_id: None,
+    )
+
+    agent_message = SimpleNamespace(
+        role=foundry_agent.MessageRole.AGENT,
+        text_messages=[SimpleNamespace(text=SimpleNamespace(value="Score: 72/100\n1. **Fix tests** — add tests"))],
+    )
+    messages_api = SimpleNamespace(
+        create=lambda **_kwargs: None,
+        list=lambda **_kwargs: [agent_message],
+    )
+
+    requires_action_run = SimpleNamespace(
+        id="run-1",
+        status="requires_action",
+        required_action=DummySubmitToolOutputsAction(
+            [DummyToolCall("call-1", "submit_plan", '{"score": 72, "summary": "ok", "improvements": []}')]
+        ),
+    )
+    completed_run = SimpleNamespace(id="run-1", status="completed")
+
+    class RunsApi:
+        def create(self, **_kwargs: object) -> SimpleNamespace:
+            return requires_action_run
+
+        def submit_tool_outputs(self, **_kwargs: object) -> SimpleNamespace:
+            return completed_run
+
+        def get(self, **_kwargs: object) -> SimpleNamespace:
+            return completed_run
+
+    client = SimpleNamespace(threads=thread_api, messages=messages_api, runs=RunsApi())
+
+    result = foundry_agent.run_agent(client, "agent-1", Path("."), config, "task")
+    assert result == {"score": 72, "summary": "ok", "improvements": []}

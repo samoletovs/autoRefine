@@ -317,7 +317,7 @@ TOOL_HANDLERS = {
 
 # ── Agent orchestration ──────────────────────────────────────────────────────
 
-def create_agent(client: AgentsClient, mode: str = "plan") -> str:
+def create_agent(client: AgentsClient, mode: str = "plan", model: str = DEPLOYMENT) -> str:
     """Create the autoRefine Foundry agent. In refine mode, includes write tools."""
     tool_functions = {
         read_project_file,
@@ -334,7 +334,7 @@ def create_agent(client: AgentsClient, mode: str = "plan") -> str:
     tools = FunctionTool(functions=tool_functions)
 
     agent = client.create_agent(
-        model=DEPLOYMENT,
+        model=model,
         name="autorefine",
         instructions=SYSTEM_PROMPT,
         tools=tools.definitions,
