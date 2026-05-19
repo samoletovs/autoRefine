@@ -388,7 +388,34 @@ jobs:
                 commit_message: `Auto-merged by .github/workflows/auto-review.yml after passing all gates (§8.7).`
               });
             } catch (e) {
-              await escalate(`merge API call failed: ${e.message}`);
+              // Remove the optimistically-added label so the daily-cap counter
+              // stays accurate (this PR was NOT successfully merged).
+              try {
+                await github.rest.issues.removeLabel({
+                  owner, repo, issue_number: prNumber, name: 'auto-merged'
+                });
+              } catch (removeErr) {
+                core.warning(`remove auto-merged label failed: ${removeErr.message}`);
+              }
+
+              // Merge conflicts → ask Copilot to rebase; other failures → escalate.
+              const isConflict = /conflict|not mergeable/i.test(e.message);
+              if (isConflict) {
+                core.warning(`Merge conflicts on PR #${prNumber} — requesting Copilot rebase`);
+                try {
+                  await github.rest.issues.addLabels({
+                    owner, repo, issue_number: prNumber, labels: ['needs-rebase']
+                  });
+                } catch (le) { core.warning(`needs-rebase label failed: ${le.message}`); }
+                try {
+                  await github.rest.issues.createComment({
+                    owner, repo, issue_number: prNumber,
+                    body: `⚠️ All gates passed, but the branch has **merge conflicts** with \`master\`.\n\n@github-copilot Please rebase this branch on \`master\` to resolve the conflicts, then re-push. The auto-review pipeline will re-run automatically.`
+                  });
+                } catch (ce) { core.warning(`rebase comment failed: ${ce.message}`); }
+              } else {
+                await escalate(`merge API call failed: ${e.message}`);
+              }
               return;
             }
 
