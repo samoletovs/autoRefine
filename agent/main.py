@@ -38,6 +38,7 @@ BUGFIX_CATEGORIES = {
     "stability",
 }
 GOVERNANCE_REPO_URL = "https://github.com/samoletovs/nauroLabs-github.git"
+REPO_SLUG_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 def load_repos_from_manifest(manifest_path: Path) -> list[str]:
@@ -58,8 +59,12 @@ def _is_valid_repo_slug(repo: str) -> bool:
     if any(ch.isspace() for ch in repo):
         return False
     owner, name = repo.split("/", 1)
-    allowed = re.compile(r"^[A-Za-z0-9_.-]+$")
-    return bool(owner) and bool(name) and bool(allowed.fullmatch(owner)) and bool(allowed.fullmatch(name))
+    return (
+        bool(owner)
+        and bool(name)
+        and bool(REPO_SLUG_PATTERN.fullmatch(owner))
+        and bool(REPO_SLUG_PATTERN.fullmatch(name))
+    )
 
 
 def evaluate_project(project_dir: Path, config: ProjectConfig) -> dict:
