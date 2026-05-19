@@ -7,11 +7,48 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import httpx
 import pytest
 
 from agent import foundry_agent
 from agent.config import ProjectConfig
+
+
+class FakeFunctionTool:
+    def __init__(self, functions: set) -> None:
+        self.functions = functions
+        self.definitions = [{"name": fn.__name__} for fn in functions]
+
+
+class FakeClient:
+    def __init__(self) -> None:
+        self.kwargs = {}
+
+    def create_agent(self, **kwargs: object) -> SimpleNamespace:
+        self.kwargs = kwargs
+        return SimpleNamespace(id="agent-1")
+
+
+def test_create_agent_works_without_search_web_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(foundry_agent, "FunctionTool", FakeFunctionTool)
+    client = FakeClient()
+
+    agent_id = foundry_agent.create_agent(client, mode="plan")
+
+    assert agent_id == "agent-1"
+    tool_names = {tool["name"] for tool in client.kwargs["tools"]}
+    assert "search_web" not in tool_names
+    assert tool_names == {
+        "read_project_file",
+        "list_directory",
+        "run_project_tests",
+        "submit_plan",
+    }
+
+
+def test_tool_handlers_do_not_include_search_web() -> None:
+    assert "search_web" not in foundry_agent.TOOL_HANDLERS
 
 
 def test_handle_write_project_file_writes_inside_project(tmp_path: Path) -> None:
@@ -94,61 +131,6 @@ def test_handle_run_tests_no_runner_detected(tmp_path: Path) -> None:
     assert result["error"] == "No test runner detected"
 
 
-def test_handle_search_web_empty_query_returns_error(tmp_path: Path) -> None:
-    result = json.loads(foundry_agent._handle_search_web(tmp_path, {"query": ""}))
-    assert result["error"] == "Empty query"
-
-
-def test_handle_search_web_non_200_returns_error(tmp_path: Path) -> None:
-    response = httpx.Response(503, request=httpx.Request("GET", "https://html.duckduckgo.com/html/"))
-
-    with patch("httpx.get", return_value=response):
-        parsed = json.loads(foundry_agent._handle_search_web(tmp_path, {"query": "fitbod"}))
-
-    assert parsed["query"] == "fitbod"
-    assert "Search failed" in parsed["error"]
-
-
-def test_handle_search_web_timeout_returns_error(tmp_path: Path) -> None:
-    with patch("httpx.get", side_effect=httpx.TimeoutException("timeout")):
-        parsed = json.loads(foundry_agent._handle_search_web(tmp_path, {"query": "fitbod"}))
-
-    assert parsed["query"] == "fitbod"
-    assert "Search failed" in parsed["error"]
-
-
-def test_handle_search_web_no_results_note(tmp_path: Path) -> None:
-    response = SimpleNamespace(
-        text="<html><body>no-results</body></html>",
-        raise_for_status=lambda: None,
-    )
-
-    with patch("httpx.get", return_value=response):
-        parsed = json.loads(foundry_agent._handle_search_web(tmp_path, {"query": "fitbod"}))
-
-    assert parsed["results"] == []
-    assert "No results found" in parsed["note"]
-
-
-def test_handle_search_web_parses_top_results(tmp_path: Path) -> None:
-    html = """
-    <a class="result__a">Result One</a>
-    <a class="result__snippet">First snippet</a>
-    <a class="result__url" href="https://example.com/one"></a>
-    <a class="result__a">Result Two</a>
-    <a class="result__snippet">Second snippet</a>
-    <a class="result__url" href="https://example.com/two"></a>
-    """
-    response = SimpleNamespace(text=html, raise_for_status=lambda: None)
-
-    with patch("httpx.get", return_value=response):
-        parsed = json.loads(foundry_agent._handle_search_web(tmp_path, {"query": "fitbod"}))
-
-    assert len(parsed["results"]) == 2
-    assert parsed["results"][0]["title"] == "Result One"
-    assert parsed["results"][1]["url"] == "https://example.com/two"
-
-
 def test_create_agent_uses_passed_model() -> None:
     fake_created = SimpleNamespace(id="agent-123")
     fake_client = SimpleNamespace()
@@ -166,7 +148,6 @@ def test_create_agent_uses_passed_model() -> None:
 def test_tool_definition_stubs_return_empty_string() -> None:
     assert foundry_agent.read_project_file("README.md") == ""
     assert foundry_agent.list_directory(".") == ""
-    assert foundry_agent.search_web("query") == ""
     assert foundry_agent.run_project_tests() == ""
     assert foundry_agent.submit_plan(80, "summary", []) == ""
     assert foundry_agent.write_project_file("x.txt", "body") == ""
@@ -248,6 +229,14 @@ def test_parse_plan_from_text_parses_score_and_improvements() -> None:
     assert parsed["improvements"][0]["priority"] == "P1"
 
 
+def test_parse_plan_from_text_middle_dot_separator() -> None:
+    text = "Score: 65/100\n\n1. **Refactor config** · split module.\n"
+    parsed = foundry_agent._parse_plan_from_text(text)
+    assert parsed is not None
+    assert len(parsed["improvements"]) == 1
+    assert parsed["improvements"][0]["title"] == "Refactor config"
+
+
 def test_parse_plan_from_text_returns_none_without_improvements() -> None:
     assert foundry_agent._parse_plan_from_text("Score: 50/100\nNo numbered list") is None
 
@@ -264,7 +253,7 @@ def test_build_plan_task_includes_findings_and_similar() -> None:
     )
     task = foundry_agent.build_plan_task([{"priority": "P0", "category": "tests", "description": "missing"}], config)
     assert "Quality check findings" in task
-    assert "Similar products to research" in task
+    assert "Similar products context" in task
 
 
 def test_build_refine_task_lists_improvements() -> None:

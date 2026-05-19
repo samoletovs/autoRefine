@@ -1,8 +1,8 @@
 """Foundry agent — the AI brain of autoRefine.
 
 Uses Azure AI Agents SDK to create a Foundry-hosted agent with function-calling
-tools. The agent reasons about project findings, researches competitors, creates
-improvement plans, and can execute changes.
+tools. The agent reasons about project findings, compares against provided
+similar products, creates improvement plans, and can execute changes.
 
 Requires:
     FOUNDRY_PROJECT_ENDPOINT in .env
@@ -56,14 +56,6 @@ def list_directory(path: str = ".") -> str:
     """List files and subdirectories in a project directory.
 
     :param path: Relative path from project root. Use '.' for root.
-    """
-    return ""
-
-
-def search_web(query: str) -> str:
-    """Search the web for information about similar products, features, or best practices.
-
-    :param query: Search query, e.g. 'Fitbod app key features 2026'
     """
     return ""
 
@@ -168,70 +160,6 @@ def _handle_list_directory(project_dir: Path, args: dict) -> str:
     return json.dumps({"path": rel_path, "entries": entries})
 
 
-def _handle_search_web(_project_dir: Path, args: dict) -> str:
-    """Web search via DuckDuckGo HTML (no API key needed)."""
-    import re as _re
-
-    import httpx
-
-    query = args.get("query", "")
-    if not query:
-        return json.dumps({"error": "Empty query"})
-
-    log.info("Web search: %s", query)
-
-    try:
-        resp = httpx.get(
-            "https://html.duckduckgo.com/html/",
-            params={"q": query},
-            headers={"User-Agent": "autoRefine/1.0 (project improvement agent)"},
-            timeout=15,
-            follow_redirects=True,
-        )
-        resp.raise_for_status()
-
-        # Extract result snippets from DDG HTML
-        results = []
-        # DDG HTML results are in <a class="result__a"> and <a class="result__snippet">
-        title_pattern = _re.compile(
-            r'<a[^>]*class="result__a"[^>]*>(.*?)</a>', _re.DOTALL
-        )
-        snippet_pattern = _re.compile(
-            r'<a[^>]*class="result__snippet"[^>]*>(.*?)</a>', _re.DOTALL
-        )
-        url_pattern = _re.compile(
-            r'<a[^>]*class="result__url"[^>]*href="([^"]*)"', _re.DOTALL
-        )
-
-        titles = title_pattern.findall(resp.text)
-        snippets = snippet_pattern.findall(resp.text)
-        urls = url_pattern.findall(resp.text)
-
-        for i in range(min(5, len(titles))):
-            # Strip HTML tags from snippets
-            title = _re.sub(r"<[^>]+>", "", titles[i]).strip()
-            snippet = _re.sub(r"<[^>]+>", "", snippets[i]).strip() if i < len(snippets) else ""
-            url = urls[i] if i < len(urls) else ""
-            results.append({"title": title, "snippet": snippet, "url": url})
-
-        if not results:
-            return json.dumps({
-                "query": query,
-                "results": [],
-                "note": "No results found. Use your training knowledge instead.",
-            })
-
-        return json.dumps({"query": query, "results": results})
-
-    except (httpx.HTTPError, httpx.TimeoutException) as e:
-        log.warning("Web search failed: %s", e)
-        return json.dumps({
-            "query": query,
-            "error": f"Search failed: {e}",
-            "note": "Use your training knowledge about these products.",
-        })
-
-
 def _handle_run_tests(project_dir: Path, _args: dict) -> str:
     """Run the project's test suite."""
     pkg_json = project_dir / "package.json"
@@ -311,7 +239,6 @@ def _handle_apply_improvement(_project_dir: Path, args: dict) -> str:
 TOOL_HANDLERS = {
     "read_project_file": _handle_read_project_file,
     "list_directory": _handle_list_directory,
-    "search_web": _handle_search_web,
     "run_project_tests": _handle_run_tests,
     "submit_plan": _handle_submit_plan,
     "write_project_file": _handle_write_project_file,
@@ -337,7 +264,6 @@ def create_agent(
     tool_functions = {
         read_project_file,
         list_directory,
-        search_web,
         run_project_tests,
         submit_plan,
     }
@@ -527,7 +453,7 @@ def build_plan_task(findings: list[dict], config: ProjectConfig) -> str:
 
     similar_text = ""
     if config.similar:
-        similar_text = f"\n## Similar products to research\n{', '.join(config.similar)}\n"
+        similar_text = f"\n## Similar products context\n{', '.join(config.similar)}\n"
 
     return f"""Evaluate this project and create an improvement plan.
 

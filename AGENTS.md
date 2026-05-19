@@ -3,8 +3,9 @@
 ## What this repo is
 
 autoRefine is a Foundry-powered AI agent that evaluates and improves software projects.
-It reads `project.yaml` from each project, understands vision + tech stack, researches
-competitors, identifies gaps, creates improvement plans, and can file idea memos.
+It reads `project.yaml` from each project, understands vision + tech stack, compares
+against provided similar products, identifies gaps, creates improvement plans, executes
+with tests + PRs, and can file idea memos.
 
 ## Hard rules
 
