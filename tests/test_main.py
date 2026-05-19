@@ -110,6 +110,8 @@ def test_main_rejects_invalid_mode() -> None:
         ("", 1),
         ("owner /repo", 2),
         ("owner/re po", 2),
+        ("owner/repo!", 2),
+        ("own*er/repo", 2),
     ],
 )
 def test_main_rejects_malformed_repo(repo: str, expected_exit_code: int) -> None:

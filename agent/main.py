@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -57,7 +58,8 @@ def _is_valid_repo_slug(repo: str) -> bool:
     if any(ch.isspace() for ch in repo):
         return False
     owner, name = repo.split("/", 1)
-    return bool(owner) and bool(name)
+    allowed = re.compile(r"^[A-Za-z0-9_.-]+$")
+    return bool(owner) and bool(name) and bool(allowed.fullmatch(owner)) and bool(allowed.fullmatch(name))
 
 
 def evaluate_project(project_dir: Path, config: ProjectConfig) -> dict:
