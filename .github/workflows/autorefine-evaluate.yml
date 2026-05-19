@@ -86,30 +86,13 @@ jobs:
         run: |
           report_file="/tmp/autorefine-report.json"
 
-          # Extract only project evaluation JSON objects (has both "score" and "project").
-          # Python handles mixed output (plan mode emits "--- IMPROVEMENT PLAN ---" too).
-          REPORT_OBJECTS=$(python3 -c "
-import sys, json
-dec = json.JSONDecoder()
-with open(sys.argv[1]) as f:
-    content = f.read()
-idx = 0
-while idx < len(content):
-    try:
-        obj, size = dec.raw_decode(content, idx)
-        if isinstance(obj, dict) and 'score' in obj and 'project' in obj:
-            print(json.dumps(obj))
-        idx += size
-    except json.JSONDecodeError:
-        idx += 1
-" "$report_file")
+          REPORT_OBJECTS=$(python3 agent/parse_scores.py "$report_file")
 
           if [ -z "$REPORT_OBJECTS" ]; then
             echo "::error::No score found in $report_file"
             exit 1
           fi
 
-          # Use jq to format scores and compute average (handles float scores like 72.5)
           SCORES=$(echo "$REPORT_OBJECTS" | jq -r '"\(.project): \(.score)/100"' | head -20)
           TOTAL=$(echo "$SCORES" | wc -l)
           AVG=$(echo "$REPORT_OBJECTS" | jq -rs '[.[].score] | add / length | floor | tostring')
@@ -127,27 +110,10 @@ while idx < len(content):
           SCORES: ${{ steps.parse-scores.outputs.scores }}
           TOTAL: ${{ steps.parse-scores.outputs.total }}
           AVG: ${{ steps.parse-scores.outputs.avg }}
+          MODE: ${{ github.event.inputs.mode || 'file-ideas' }}
         run: |
           if [ -z "$NAURO_BOT_TOKEN" ] || [ -z "$NAURO_CHAT_ID" ]; then
             echo "NAURO_BOT_TOKEN or NAURO_CHAT_ID not set; skipping"
             exit 0
           fi
-
-          python3 - <<'PY' || echo "::warning::Telegram notification failed"
-          import os, sys
-          # Make agent.notify importable from the repo root
-          sys.path.insert(0, os.getcwd())
-          from agent.notify import send_telegram
-
-          scores = os.environ.get("SCORES", "No data")
-          total = os.environ.get("TOTAL", "?")
-          avg = os.environ.get("AVG", "?")
-          mode = "${{ github.event.inputs.mode || 'file-ideas' }}"
-
-          msg = f"🔧 <b>autoRefine</b> daily {mode}\n\n"
-          msg += f"📊 {total} projects, avg {avg}/100\n\n"
-          msg += scores
-
-          ok = send_telegram(msg, parse_mode="HTML")
-          print("Telegram notification sent" if ok else "Telegram notification skipped/failed")
-          PY
+          python3 agent/workflow_notify.py || echo "::warning::Telegram notification failed"
