@@ -199,6 +199,7 @@ def test_create_github_issues_assigns_copilot() -> None:
     ):
         client_instance = mock_client_cls.return_value.__enter__.return_value
         client_instance.post.return_value = mock_resp
+        mock_subprocess_run.return_value.returncode = 0
 
         created = health_scan.create_github_issues("tok", issues, allowed_repos=["era"])
 
@@ -215,6 +216,8 @@ def test_create_github_issues_assigns_copilot() -> None:
             "Copilot",
         ],
         check=False,
+        capture_output=True,
+        text=True,
     )
 
 

@@ -701,7 +701,7 @@ def create_github_issues(
                 log.info("Created issue: %s", url)
                 issue_num = issue_data.get("number")
                 if assign_copilot and issue_num:
-                    subprocess.run(
+                    assign_result = subprocess.run(
                         [
                             "gh",
                             "issue",
@@ -713,7 +713,16 @@ def create_github_issues(
                             "Copilot",
                         ],
                         check=False,
+                        capture_output=True,
+                        text=True,
                     )
+                    if assign_result.returncode != 0:
+                        log.warning(
+                            "Copilot assignment failed for %s#%s: %s",
+                            repo,
+                            issue_num,
+                            (assign_result.stderr or assign_result.stdout or "").strip(),
+                        )
             else:
                 log.warning(
                     "Failed to create issue in %s: %s", repo, resp.text[:200]
