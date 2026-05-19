@@ -355,8 +355,15 @@ jobs:
             const checkRuns = await github.paginate(github.rest.checks.listForRef, {
               owner, repo, ref: headSha, per_page: 100
             });
+            // Check run names are "<workflow>/<job>", so use startsWith to filter
+            // out ALL jobs from this workflow run, not just the workflow name itself.
             const ownWorkflowName = context.workflow;
-            const otherChecks = checkRuns.filter(c => c.name !== ownWorkflowName);
+            const currentRunId = String(context.runId);
+            const otherChecks = checkRuns.filter(c => {
+              if (c.name.startsWith(ownWorkflowName)) return false;
+              if (c.details_url && c.details_url.includes(`/runs/${currentRunId}`)) return false;
+              return true;
+            });
             const pending = otherChecks.filter(c => c.status !== 'completed');
             if (pending.length > 0) {
               core.info(`${pending.length} check runs still pending; waiting`); return;
