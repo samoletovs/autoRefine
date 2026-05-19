@@ -19,6 +19,8 @@ project.yaml → Discover → Research → Evaluate → Plan → [Ask?] → Exec
 7. **Test** — runs the project's test suite to validate changes
 8. **PR** — creates a pull request with the improvements
 
+> ⚠️ **Closed-loop warning:** `--mode refine` bypasses the evaluator→builder loop by opening PRs directly. Prefer `--mode file-ideas` so autoRefine files idea memos and lets the Builder implement them.
+
 ## Getting started
 
 ### 1. Add a `project.yaml` to your repo
@@ -54,11 +56,14 @@ cp .env.example .env
 # Evaluate a single project
 python -m agent.main --repo owner/repo --mode evaluate
 
-# Full cycle (evaluate + plan + execute)
+# Evaluate + plan + file idea memos (closed loop)
+python -m agent.main --repo owner/repo --mode file-ideas
+
+# Full cycle (evaluate + plan + execute) — local dev only, bypasses the loop
 python -m agent.main --repo owner/repo --mode refine
 
 # All projects in a manifest
-python -m agent.main --manifest config/workspace-manifest.json --mode refine
+python -m agent.main --manifest config/workspace-manifest.json --mode file-ideas
 ```
 
 ## Project structure

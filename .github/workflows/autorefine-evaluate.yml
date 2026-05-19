@@ -9,11 +9,12 @@ on:
       mode:
         description: 'Run mode'
         required: false
-        default: 'evaluate'
+        default: 'file-ideas'
         type: choice
         options:
-          - evaluate
+          - file-ideas
           - plan
+          - evaluate
       repo:
         description: 'Single repo to evaluate (leave empty for all)'
         required: false
@@ -63,7 +64,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
-          MODE="${{ github.event.inputs.mode || 'evaluate' }}"
+          MODE="${{ github.event.inputs.mode || 'file-ideas' }}"
           REPO_FLAG=""
           if [ -n "${{ github.event.inputs.repo }}" ]; then
             REPO_FLAG="--repo samoletovs/${{ github.event.inputs.repo }}"
@@ -101,7 +102,7 @@ jobs:
           scores = os.environ.get("SCORES", "No data")
           total = os.environ.get("TOTAL", "?")
           avg = os.environ.get("AVG", "?")
-          mode = "${{ github.event.inputs.mode || 'evaluate' }}"
+          mode = "${{ github.event.inputs.mode || 'file-ideas' }}"
 
           msg = f"🔧 <b>autoRefine</b> daily {mode}\n\n"
           msg += f"📊 {total} projects, avg {avg}/100\n\n"

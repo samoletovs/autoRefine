@@ -4,7 +4,7 @@
 
 autoRefine is a Foundry-powered AI agent that evaluates and improves software projects.
 It reads `project.yaml` from each project, understands vision + tech stack, researches
-competitors, identifies gaps, creates improvement plans, and executes with tests + PRs.
+competitors, identifies gaps, creates improvement plans, and can file idea memos.
 
 ## Hard rules
 
@@ -39,7 +39,13 @@ competitors, identifies gaps, creates improvement plans, and executes with tests
 ```bash
 pip install -r requirements.txt
 python -m agent.main --repo owner/repo --mode evaluate
+python -m agent.main --repo owner/repo --mode file-ideas
 ```
+
+`file-ideas` resolves `scripts/file-idea.py` in this order:
+1. `$NAURO_GOVERNANCE_PATH/scripts/file-idea.py`
+2. `./.github-gov/scripts/file-idea.py` (CI checkout path)
+3. `/tmp/nauroLabs-github/scripts/file-idea.py` (cloned on demand)
 
 ## Test
 
