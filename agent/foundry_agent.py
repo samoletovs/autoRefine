@@ -323,13 +323,15 @@ TOOL_HANDLERS = {
 
 RETRYABLE_STATUS_CODES = {429, 502, 503, 504}
 MAX_RETRY_ATTEMPTS = 5
+POLL_INTERVAL_SECONDS = 1
 
 
 def _is_retryable_foundry_error(exc: BaseException) -> bool:
     if isinstance(exc, HttpResponseError):
-        status_code = getattr(exc, "status_code", None)
-        if status_code is None and getattr(exc, "response", None) is not None:
-            status_code = getattr(exc.response, "status_code", None)
+        status_code = (
+            getattr(exc, "status_code", None)
+            or getattr(getattr(exc, "response", None), "status_code", None)
+        )
         return status_code in RETRYABLE_STATUS_CODES
 
     return isinstance(
@@ -353,7 +355,7 @@ def _log_retry_before_sleep(retry_state: RetryCallState) -> None:
     )
 
 
-def _foundry_retry() -> Any:
+def _foundry_retry_decorator() -> Any:
     return retry(
         reraise=True,
         stop=stop_after_attempt(MAX_RETRY_ATTEMPTS),
@@ -364,12 +366,12 @@ def _foundry_retry() -> Any:
     )
 
 
-@_foundry_retry()
+@_foundry_retry_decorator()
 def _create_run(client: AgentsClient, thread_id: str, agent_id: str) -> Any:
     return client.runs.create(thread_id=thread_id, agent_id=agent_id)
 
 
-@_foundry_retry()
+@_foundry_retry_decorator()
 def _submit_tool_outputs(
     client: AgentsClient,
     thread_id: str,
@@ -383,12 +385,12 @@ def _submit_tool_outputs(
     )
 
 
-@_foundry_retry()
+@_foundry_retry_decorator()
 def _get_run(client: AgentsClient, thread_id: str, run_id: str) -> Any:
     return client.runs.get(thread_id=thread_id, run_id=run_id)
 
 
-@_foundry_retry()
+@_foundry_retry_decorator()
 def _delete_thread(client: AgentsClient, thread_id: str) -> None:
     client.threads.delete(thread_id)
 
@@ -483,7 +485,7 @@ def run_agent(
             continue
 
         # Poll
-        time.sleep(1)
+        time.sleep(POLL_INTERVAL_SECONDS)
         run = _get_run(client, thread.id, run.id)
 
     if run.status == "failed":
