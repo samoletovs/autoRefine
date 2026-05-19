@@ -17,6 +17,7 @@ import datetime
 import json
 import logging
 import os
+import subprocess
 from typing import Any
 
 import httpx
@@ -665,16 +666,12 @@ def enforce_report_retention(token: str) -> None:
 
 
 def create_github_issues(
-    token: str, issues: list[dict[str, Any]], allowed_repos: list[str]
+    token: str,
+    issues: list[dict[str, Any]],
+    allowed_repos: list[str],
+    assign_copilot: bool = True,
 ) -> list[str]:
-    """Create GitHub issues for critical findings.
-
-    Note: we deliberately do NOT set ``assignees``. The Copilot coding agent
-    bot ("copilot-swe-agent") is only assignable on Copilot Pro+/Business
-    plans and must be enabled per-repo, neither of which currently apply to
-    this workspace. Issues are filtered by label instead (e.g. ``autorefine``,
-    ``tech-debt``).
-    """
+    """Create GitHub issues for critical findings."""
     headers = {
         "Authorization": f"token {token}",
         "Accept": "application/vnd.github+json",
@@ -698,9 +695,25 @@ def create_github_issues(
                 json=body,
             )
             if resp.status_code == 201:
-                url = resp.json().get("html_url", "")
+                issue_data = resp.json()
+                url = issue_data.get("html_url", "")
                 created.append(url)
                 log.info("Created issue: %s", url)
+                issue_num = issue_data.get("number")
+                if assign_copilot and issue_num:
+                    subprocess.run(
+                        [
+                            "gh",
+                            "issue",
+                            "edit",
+                            str(issue_num),
+                            "--repo",
+                            f"{GITHUB_OWNER}/{repo}",
+                            "--add-assignee",
+                            "Copilot",
+                        ],
+                        check=False,
+                    )
             else:
                 log.warning(
                     "Failed to create issue in %s: %s", repo, resp.text[:200]
@@ -734,7 +747,7 @@ def build_telegram_summary(
 
 
 # ── Entry point ────────────────────────────────────────────────────────────
-def run_health_scan(repos: list[str]) -> dict[str, Any]:
+def run_health_scan(repos: list[str], assign_copilot: bool = True) -> dict[str, Any]:
     """Execute the full health scan pipeline.
 
     Returns a summary dict with report_path, created_issues, scan stats.
@@ -777,7 +790,10 @@ def run_health_scan(repos: list[str]) -> dict[str, Any]:
         log.warning("Report retention skipped: %s", exc)
 
     created_issues = create_github_issues(
-        github_token, analysis.get("issues_to_create", []), repos
+        github_token,
+        analysis.get("issues_to_create", []),
+        repos,
+        assign_copilot=assign_copilot,
     )
 
     summary = build_telegram_summary(report, report_path, created_issues)
