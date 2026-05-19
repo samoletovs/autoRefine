@@ -324,7 +324,11 @@ def test_run_agent_processes_tool_calls_and_returns_plan(
     )
     agent_message = SimpleNamespace(
         role=foundry_agent.MessageRole.AGENT,
-        text_messages=[SimpleNamespace(text=SimpleNamespace(value="Finished plan"))],
+        text_messages=[
+            SimpleNamespace(
+                text=SimpleNamespace(value="Score: 72/100\n1. **Add tests** — keep coverage high")
+            )
+        ],
     )
     messages_api = SimpleNamespace(
         create=lambda **_kwargs: None,
