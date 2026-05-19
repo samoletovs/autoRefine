@@ -229,7 +229,7 @@ def refine_project(
         log.info("Agent cleaned up.")
 
 
-def run_health_scan_mode(repos: list[str]) -> None:
+def run_health_scan_mode(repos: list[str], assign_copilot: bool = True) -> None:
     """Run the NauroLabs health scan (GitHub + Azure cost + App Insights + URLs).
 
     Sends a Telegram summary via agent.notify and commits a markdown
@@ -238,7 +238,7 @@ def run_health_scan_mode(repos: list[str]) -> None:
     from agent.health_scan import run_health_scan
 
     short_repos = [r.split("/")[-1] for r in repos]
-    summary = run_health_scan(short_repos)
+    summary = run_health_scan(short_repos, assign_copilot=assign_copilot)
     print(json.dumps(summary, indent=2))
 
 
@@ -262,6 +262,11 @@ def main() -> None:
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--workdir", default="/tmp/autorefine")
+    parser.add_argument(
+        "--no-copilot-assign",
+        action="store_true",
+        help="Disable automatic Copilot assignment for health-scan-created issues",
+    )
     args = parser.parse_args()
 
     # Resolve repo list
@@ -280,7 +285,7 @@ def main() -> None:
     # health-scan mode short-circuits the per-project clone+evaluate loop.
     if args.mode == "health-scan":
         log.info("autoRefine starting — mode=health-scan, %d repos", len(repos))
-        run_health_scan_mode(repos)
+        run_health_scan_mode(repos, assign_copilot=not args.no_copilot_assign)
         log.info("autoRefine complete.")
         return
 
