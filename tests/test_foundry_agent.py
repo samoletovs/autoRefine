@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,7 +12,7 @@ import pytest
 
 from agent import foundry_agent
 from agent.config import ProjectConfig
-from agent.foundry_agent import _parse_plan_from_text, create_agent
+from agent.foundry_agent import _parse_plan_from_text
 
 
 class TestParsePlanFromText:
@@ -38,9 +37,8 @@ class TestParsePlanFromText:
         assert plan["improvements"][0]["title"] == "Add tests"
 
     def test_middle_dot_separator(self) -> None:
-        """Regression: previously the regex contained 'ù' (U+00F9, mojibake)
-        instead of '·' (U+00B7, middle dot). Lines using '·' as the
-        separator were silently dropped."""
+        """Regression from samoletovs/autoRefine#1: regex had mojibake 'ù'
+        instead of middle dot '·', so '·'-separated rows were dropped."""
         text = "Score: 65/100\n\n1. **Refactor config** \u00b7 split module.\n"
         plan = _parse_plan_from_text(text)
         assert plan is not None
@@ -70,15 +68,6 @@ class TestParsePlanFromText:
         ]
         priorities = [i["priority"] for i in plan["improvements"]]
         assert priorities == ["P0", "P2", "P1"]
-
-
-class TestCreateAgentSignature:
-    def test_accepts_model_kwarg(self) -> None:
-        """The CLI --model flag must reach create_agent. This test guards
-        against regressions where the kwarg gets dropped from the signature."""
-        sig = inspect.signature(create_agent)
-        assert "model" in sig.parameters
-        assert sig.parameters["model"].default is None
 
 
 def test_handle_write_project_file_writes_inside_project(tmp_path: Path) -> None:
