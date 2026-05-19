@@ -6,6 +6,8 @@ filtering) rather than live API calls. External services are mocked.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -242,3 +244,120 @@ def test_create_github_issues_can_skip_copilot_assignment() -> None:
 
     assert created == ["https://github.com/samoletovs/era/issues/12"]
     mock_subprocess_run.assert_not_called()
+
+
+# ── workspace manifest helpers ─────────────────────────────────────────────
+
+_SAMPLE_MANIFEST: dict[str, Any] = {
+    "projects": [
+        {
+            "slug": "era",
+            "repo": "samoletovs/era",
+            "url": "https://era.naurolabs.com",
+            "status": "active",
+            "azure": {"resourceGroup": "rg-era"},
+        },
+        {
+            "slug": "golazo",
+            "repo": "samoletovs/golazo",
+            "url": "https://golazo.naurolabs.com",
+            "status": "active",
+            "azure": {"resourceGroup": "rg-golazo"},
+        },
+        {
+            "slug": "playground",
+            "repo": "samoletovs/playground",
+            "url": "https://playground.naurolabs.com",
+            "status": "active",
+        },
+        {
+            "slug": "oldProject",
+            "repo": "samoletovs/oldProject",
+            "url": "https://old.naurolabs.com",
+            "status": "archived",
+            "azure": {"resourceGroup": "rg-old"},
+        },
+    ]
+}
+
+
+def test_build_app_urls_from_manifest() -> None:
+    urls = health_scan._build_app_urls(_SAMPLE_MANIFEST)
+    assert urls == {
+        "era": "https://era.naurolabs.com",
+        "golazo": "https://golazo.naurolabs.com",
+        "playground": "https://playground.naurolabs.com",
+    }
+    assert "oldProject" not in urls  # archived projects excluded
+
+
+def test_build_repo_resource_groups_from_manifest() -> None:
+    rgs = health_scan._build_repo_resource_groups(_SAMPLE_MANIFEST)
+    assert rgs == {
+        "era": "rg-era",
+        "golazo": "rg-golazo",
+    }
+    assert "playground" not in rgs  # no azure.resourceGroup
+    assert "oldProject" not in rgs  # archived
+
+
+def test_build_app_urls_slug_fallback() -> None:
+    """Projects without a slug field fall back to the repo basename."""
+    manifest = {
+        "projects": [
+            {
+                "repo": "samoletovs/rosette",
+                "url": "https://rosette.naurolabs.com",
+                "status": "active",
+            }
+        ]
+    }
+    urls = health_scan._build_app_urls(manifest)
+    assert urls == {"rosette": "https://rosette.naurolabs.com"}
+
+
+def test_fetch_workspace_manifest_uses_cache(tmp_path: Path) -> None:
+    """When the cache file exists the HTTP endpoint is not contacted."""
+    cache_file = tmp_path / "manifest.json"
+    cache_file.write_text(json.dumps(_SAMPLE_MANIFEST), encoding="utf-8")
+
+    with patch("agent.health_scan.httpx.get") as mock_get:
+        result = health_scan.fetch_workspace_manifest(cache_path=cache_file)
+
+    mock_get.assert_not_called()
+    assert result == _SAMPLE_MANIFEST
+
+
+def test_fetch_workspace_manifest_fetches_and_caches(tmp_path: Path) -> None:
+    """On a cache miss the manifest is downloaded and written to disk."""
+    cache_file = tmp_path / "manifest.json"
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = _SAMPLE_MANIFEST
+
+    with patch("agent.health_scan.httpx.get", return_value=mock_resp) as mock_get:
+        result = health_scan.fetch_workspace_manifest(
+            url="https://example.com/manifest.json", cache_path=cache_file
+        )
+
+    mock_get.assert_called_once_with(
+        "https://example.com/manifest.json", timeout=15, follow_redirects=True
+    )
+    assert result == _SAMPLE_MANIFEST
+    assert cache_file.exists()
+    assert json.loads(cache_file.read_text()) == _SAMPLE_MANIFEST
+
+
+def test_fetch_workspace_manifest_raises_on_non_200(tmp_path: Path) -> None:
+    """A non-200 response raises RuntimeError so health-scan fails loudly."""
+    cache_file = tmp_path / "manifest.json"
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 403
+
+    with patch("agent.health_scan.httpx.get", return_value=mock_resp):
+        with pytest.raises(RuntimeError, match="HTTP 403"):
+            health_scan.fetch_workspace_manifest(
+                url="https://example.com/manifest.json", cache_path=cache_file
+            )
