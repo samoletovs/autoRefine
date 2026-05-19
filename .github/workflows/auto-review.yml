@@ -177,15 +177,14 @@ jobs:
           python-version: '3.12'
       - id: review
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Use GITHUB_TOKEN (read-only, scoped to this workflow) instead of a
-          # broad PAT. GITHUB_TOKEN is sufficient for GitHub Models API calls.
-          GITHUB_MODELS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          # GitHub Models requires a user PAT (GITHUB_TOKEN lacks the
+          # implicit "models" scope). Use GH_PAT when available; fall back
+          # to GITHUB_TOKEN so the step doesn't silently skip in forks.
+          GITHUB_MODELS_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
           # Primary deep-review model. Override via repo variable
-          # DEEP_REVIEW_MODEL (e.g. set to "claude-opus-4.7" once it ships
-          # on GitHub Models, with no code change required). Default is the
-          # current best available Claude model.
-          DEEP_REVIEW_MODEL: ${{ vars.DEEP_REVIEW_MODEL || 'claude-opus-4' }}
+          # DEEP_REVIEW_MODEL. Falls back through claude-sonnet-4 → gpt-4o.
+          DEEP_REVIEW_MODEL: ${{ vars.DEEP_REVIEW_MODEL || 'claude-opus-4.7' }}
           PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
         run: |
           python scripts/claude-deep-review.py \
@@ -307,10 +306,15 @@ jobs:
                 return;
               }
               if (deepReviewDegraded) {
-                await escalate('deep-review degraded (Claude unavailable or API error)');
-                return;
-              }
-              if (deepReviewVerdict !== 'APPROVE') {
+                if (!lowRiskOnly) {
+                  // High-risk files AND deep-review unavailable → escalate.
+                  await escalate('deep-review degraded on high-risk PR (Claude unavailable)');
+                  return;
+                }
+                // Low-risk files, deep-review degraded → CI is still required,
+                // but we don't block a safe PR when the LLM is temporarily down.
+                core.warning('deep-review degraded but LOW_RISK_ONLY=true — proceeding to CI gate');
+              } else if (deepReviewVerdict !== 'APPROVE') {
                 await escalate(`deep-review verdict=${deepReviewVerdict}`);
                 return;
               }
