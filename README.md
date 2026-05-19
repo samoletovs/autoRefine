@@ -2,7 +2,7 @@
 
 > Projects that improve themselves.
 
-An AI agent powered by [Microsoft Foundry](https://learn.microsoft.com/en-us/azure/ai-foundry/) that continuously evaluates and improves software projects. Goes beyond linting and dependency updates — autoRefine understands your project's vision, researches what similar products do, identifies gaps, creates improvement plans, and executes changes with tests.
+An AI agent powered by [Microsoft Foundry](https://learn.microsoft.com/en-us/azure/ai-foundry/) that continuously evaluates and improves software projects. Goes beyond linting and dependency updates — autoRefine understands your project's vision, compares with similar products listed in project context, identifies gaps, creates improvement plans, and executes changes with tests.
 
 ## How it works
 
@@ -11,7 +11,7 @@ project.yaml → Discover → Research → Evaluate → Plan → [Ask?] → Exec
 ```
 
 1. **Discover** — reads `project.yaml` + code structure to understand what the project is
-2. **Research** — web searches for similar products, compares features
+2. **Research** — compares with similar products listed in project context
 3. **Evaluate** — technical quality checks + functional gap analysis
 4. **Plan** — creates a prioritized improvement plan
 5. **Ask** — when confidence is low, asks the user before proceeding
@@ -100,7 +100,7 @@ autoRefine is a **Foundry hosted agent** with function-calling tools:
   `gpt-5` for one-off deep analysis via `python -m agent.main --model gpt-5`.
   The closed-loop PR reviewer (deep-review) lives in `samoletovs/nauroLabs-github`
   and uses Claude Opus 4 (via GitHub Models) — see that repo's AGENT_ROLES.md.
-- **Tools**: GitHub API, web search, file system, test runner, quality checkers
+- **Tools**: GitHub API, file system, test runner, quality checkers
 - **Human-in-the-loop**: agent asks for confirmation on risky or uncertain changes
 - **Safety**: all changes are made on branches, tested, and submitted as PRs — never direct to main
 

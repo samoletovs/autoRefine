@@ -53,7 +53,7 @@ Bump rules:
 ## Code conventions
 
 - Python 3.11+ with type hints on all functions
-- Async for I/O (GitHub API, Foundry calls, web requests)
+- Async for I/O (GitHub API, Foundry calls)
 - `logging` module — never `print()` in production
 - `pytest` + `pytest-asyncio` for tests
 - `ruff` for linting
