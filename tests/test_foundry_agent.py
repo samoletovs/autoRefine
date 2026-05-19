@@ -1,16 +1,24 @@
-"""Tests for issue #idea-add-unit-tests-for-agent-main-and-foundry-agent."""
+"""Tests for foundry_agent module — units covering tool handlers, plan parsing, retry logic."""
 
 from __future__ import annotations
 
+import inspect
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
+from azure.core.exceptions import HttpResponseError
 
 from agent import foundry_agent
 from agent.config import ProjectConfig
+from agent.foundry_agent import (
+    _call_foundry_with_retry,
+    _parse_plan_from_text,
+    create_agent,
+)
 
 
 class FakeFunctionTool:
@@ -19,6 +27,7 @@ class FakeFunctionTool:
         self.definitions = [{"name": fn.__name__} for fn in functions]
 
 
+<<<<<<< HEAD
 class FakeClient:
     def __init__(self) -> None:
         self.kwargs = {}
@@ -346,3 +355,70 @@ def test_run_agent_processes_tool_calls_and_returns_plan(monkeypatch: pytest.Mon
 
     result = foundry_agent.run_agent(client, "agent-1", Path("."), config, "task")
     assert result == {"score": 72, "summary": "ok", "improvements": []}
+
+
+# ── PR #23 additions: TestCreateAgentSignature + retry behaviour ──────────────
+
+
+class TestCreateAgentSignature:
+    def test_accepts_model_kwarg(self) -> None:
+        """The CLI --model flag must reach create_agent. This test guards
+        against regressions where the kwarg gets dropped from the signature."""
+        sig = inspect.signature(create_agent)
+        assert "model" in sig.parameters
+        assert sig.parameters["model"].default is None
+
+
+def _http_response_error(status_code: int) -> HttpResponseError:
+    response = Mock()
+    response.status_code = status_code
+    response.reason = "mock-reason"
+    response.headers = {}
+    response.text = "mock-body"
+    response.request = Mock()
+    response.request.method = "POST"
+    response.request.url = "https://example.test/foundry"
+    return HttpResponseError(message=f"HTTP {status_code}", response=response)
+
+
+def test_foundry_retry_retries_429_then_succeeds(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def flaky_operation() -> str:
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            raise _http_response_error(429)
+        return "ok"
+
+    monkeypatch.setattr(_call_foundry_with_retry.retry, "sleep", lambda _seconds: None)
+    with caplog.at_level(logging.WARNING):
+        result = _call_foundry_with_retry("client.runs.create_and_process", flaky_operation)
+
+    assert result == "ok"
+    assert calls == 3
+    retry_warnings = [
+        rec
+        for rec in caplog.records
+        if rec.levelno == logging.WARNING
+        and rec.msg == "Retrying %s after attempt %d/%d due to %s: %s"
+        and rec.args[0] == "client.runs.create_and_process"
+    ]
+    assert len(retry_warnings) == 2
+
+
+def test_foundry_retry_does_not_retry_http_400() -> None:
+    calls = 0
+
+    def bad_request_operation() -> None:
+        nonlocal calls
+        calls += 1
+        raise _http_response_error(400)
+
+    with pytest.raises(HttpResponseError):
+        _call_foundry_with_retry("client.runs.create_and_process", bad_request_operation)
+
+    assert calls == 1
