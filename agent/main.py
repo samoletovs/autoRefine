@@ -46,6 +46,20 @@ def load_repos_from_manifest(manifest_path: Path) -> list[str]:
     return [p["repo"] for p in data.get("projects", []) if p.get("status") != "archived"]
 
 
+def load_config(project_dir: Path) -> ProjectConfig | None:
+    """Load project.yaml config from a cloned repository."""
+    return read_project_yaml(project_dir)
+
+
+def _is_valid_repo_slug(repo: str) -> bool:
+    if repo.count("/") != 1:
+        return False
+    if any(ch.isspace() for ch in repo):
+        return False
+    owner, name = repo.split("/", 1)
+    return bool(owner) and bool(name)
+
+
 def evaluate_project(project_dir: Path, config: ProjectConfig) -> dict:
     """Run evaluation on a single project. Returns structured findings."""
     log.info("Evaluating: %s (%s)", config.name, config.stage)
@@ -486,6 +500,10 @@ def main() -> None:
             log.error("No --repo or --manifest specified and no default manifest found.")
             sys.exit(1)
 
+    for repo in repos:
+        if not _is_valid_repo_slug(repo):
+            parser.error(f"Invalid repo value '{repo}'. Expected OWNER/NAME.")
+
     # health-scan mode short-circuits the per-project clone+evaluate loop.
     if args.mode == "health-scan":
         log.info("autoRefine starting — mode=health-scan, %d repos", len(repos))
@@ -519,7 +537,7 @@ def main() -> None:
             continue
 
         # Load project.yaml
-        project_config = read_project_yaml(project_dir)
+        project_config = load_config(project_dir)
         if not project_config:
             log.warning("%s has no project.yaml — skipping", name)
             continue
