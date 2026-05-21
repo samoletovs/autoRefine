@@ -585,6 +585,7 @@ def main() -> None:
                 log.info("No PR created for %s (no changes or dry run)", name)
 
         elif config.mode == "file-ideas":
+            print(json.dumps(report, indent=2))
             plan = plan_project(project_dir, project_config, report["findings"])
             if not plan:
                 log.warning("No plan generated for %s — skipping idea filing", name)
