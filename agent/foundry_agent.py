@@ -248,9 +248,71 @@ def _handle_run_tests(project_dir: Path, _args: dict) -> str:
     })
 
 
+def _coerce_int(value: Any, default: int = 0) -> int:
+    """Coerce a value (possibly a stringified number) into an int."""
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return default
+        try:
+            return int(stripped)
+        except ValueError:
+            try:
+                return int(float(stripped))
+            except ValueError:
+                return default
+    return default
+
+
+def _coerce_list(value: Any) -> list:
+    """Coerce a value (possibly a JSON-encoded string) into a list."""
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        try:
+            parsed = json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            return []
+        if isinstance(parsed, list):
+            return parsed
+        if isinstance(parsed, dict):
+            return [parsed]
+        return []
+    return []
+
+
+def _normalize_plan_args(args: dict) -> dict:
+    """Normalize submit_plan tool arguments: LLMs sometimes serialize ints as strings
+    and lists as JSON-encoded strings."""
+    normalized: dict[str, Any] = dict(args)
+    normalized["score"] = _coerce_int(args.get("score"), default=0)
+    normalized["summary"] = str(args.get("summary", "") or "")
+    normalized["improvements"] = [
+        item for item in _coerce_list(args.get("improvements")) if isinstance(item, dict)
+    ]
+    research_insights = args.get("research_insights")
+    if isinstance(research_insights, str):
+        normalized["research_insights"] = research_insights
+    elif isinstance(research_insights, list):
+        normalized["research_insights"] = research_insights
+    else:
+        normalized["research_insights"] = []
+    return normalized
+
+
 def _handle_submit_plan(_project_dir: Path, args: dict) -> str:
     """Receive the structured plan from the agent. Just acknowledge — main.py processes it."""
-    return json.dumps({"status": "plan_received", "improvements_count": len(args.get("improvements", []))})
+    improvements = _coerce_list(args.get("improvements"))
+    return json.dumps({"status": "plan_received", "improvements_count": len(improvements)})
 
 
 def _handle_write_project_file(project_dir: Path, args: dict) -> str:
@@ -397,7 +459,7 @@ def run_agent(
 
                             # Capture plan if this is submit_plan
                             if fn_name == "submit_plan":
-                                plan_result = fn_args
+                                plan_result = _normalize_plan_args(fn_args)
                         else:
                             output = json.dumps({"error": f"Unknown tool: {fn_name}"})
 
