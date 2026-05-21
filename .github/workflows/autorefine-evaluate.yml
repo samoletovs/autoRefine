@@ -22,6 +22,7 @@ on:
 
 permissions:
   contents: read
+  issues: write
 
 jobs:
   evaluate:
@@ -83,13 +84,15 @@ jobs:
 
       - name: Parse scores
         id: parse-scores
+        continue-on-error: true
         run: |
           report_file="/tmp/autorefine-report.json"
 
           REPORT_OBJECTS=$(python3 agent/parse_scores.py "$report_file")
 
           if [ -z "$REPORT_OBJECTS" ]; then
-            echo "::error::No score found in $report_file"
+            echo "::warning::No score found in $report_file"
+            echo "status=failure" >> "$GITHUB_OUTPUT"
             exit 1
           fi
 
@@ -102,7 +105,82 @@ jobs:
             printf 'total=%s\n' "$TOTAL"
             printf 'avg=%s\n' "$AVG"
             printf 'score=%s\n' "$AVG"
+            printf 'status=success\n'
           } >> "$GITHUB_OUTPUT"
+
+      - name: Create or update failure issue
+        id: failure-issue
+        if: steps.parse-scores.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MODE: ${{ github.event.inputs.mode || 'file-ideas' }}
+        run: |
+          set -e
+          TITLE="[autopilot] autoRefine evaluate workflow failing (${MODE})"
+
+          # Read last 60 lines of logs/report for context, redact obvious noise.
+          LOGS_TAIL=$(tail -n 60 /tmp/autorefine-logs.txt 2>/dev/null || echo "(no logs)")
+          REPORT_HEAD=$(head -c 4000 /tmp/autorefine-report.json 2>/dev/null || echo "(no report)")
+
+          BODY=$(cat <<EOF
+          The scheduled \`autoRefine — Evaluate All Projects\` workflow failed: no score
+          objects were parsed from the report.
+
+          - Mode: \`${MODE}\`
+          - Run: ${RUN_URL}
+          - Trigger: \`${{ github.event_name }}\`
+
+          ### Last 60 log lines
+          \`\`\`
+          ${LOGS_TAIL}
+          \`\`\`
+
+          ### Report (first 4 KB)
+          \`\`\`json
+          ${REPORT_HEAD}
+          \`\`\`
+
+          ### What to investigate
+          1. Why does \`agent/parse_scores.py\` find no objects with both \`project\` and \`score\`?
+          2. Does the current \`${MODE}\` mode actually emit \`score\` fields? If not, either
+             update the mode to emit them, or change the workflow's "Notify Telegram" / issue
+             logic so this mode isn't expected to produce scores.
+          3. Add a test under \`tests/\` that locks the contract.
+
+          _Auto-filed by the workflow itself. Closing duplicates is fine — a new one will
+          be opened on the next failure if the underlying issue isn't fixed._
+          EOF
+          )
+
+          EXISTING=$(gh issue list \
+            --repo "${{ github.repository }}" \
+            --state open \
+            --search "in:title \"autoRefine evaluate workflow failing\"" \
+            --json number \
+            --jq '.[0].number // empty')
+
+          if [ -n "$EXISTING" ]; then
+            echo "Updating existing issue #$EXISTING"
+            gh issue comment "$EXISTING" \
+              --repo "${{ github.repository }}" \
+              --body "🔁 Failed again — see ${RUN_URL}"
+            URL=$(gh issue view "$EXISTING" --repo "${{ github.repository }}" --json url --jq .url)
+          else
+            echo "Creating new failure issue"
+            URL=$(gh issue create \
+              --repo "${{ github.repository }}" \
+              --title "$TITLE" \
+              --label "autopilot,bug" \
+              --body "$BODY")
+            NUM=$(echo "$URL" | awk -F/ '{print $NF}')
+            gh issue edit "$NUM" \
+              --repo "${{ github.repository }}" \
+              --add-assignee "Copilot" \
+              || echo "::warning::Could not assign Copilot to #$NUM — Copilot Coding Agent may not be enabled"
+          fi
+
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
 
       - name: Notify Telegram
         if: always()
@@ -111,9 +189,18 @@ jobs:
           TOTAL: ${{ steps.parse-scores.outputs.total }}
           AVG: ${{ steps.parse-scores.outputs.avg }}
           MODE: ${{ github.event.inputs.mode || 'file-ideas' }}
+          STATUS: ${{ steps.parse-scores.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ISSUE_URL: ${{ steps.failure-issue.outputs.url }}
         run: |
           if [ -z "$NAURO_BOT_TOKEN" ] || [ -z "$NAURO_CHAT_ID" ]; then
             echo "NAURO_BOT_TOKEN or NAURO_CHAT_ID not set; skipping"
             exit 0
           fi
           python3 agent/workflow_notify.py || echo "::warning::Telegram notification failed"
+
+      - name: Fail job if parsing failed
+        if: steps.parse-scores.outcome == 'failure'
+        run: |
+          echo "::error::Parse scores step failed — see issue ${{ steps.failure-issue.outputs.url }}"
+          exit 1
