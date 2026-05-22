@@ -120,6 +120,48 @@ class TestCheckProjectYaml:
         assert any("purpose" in f.description for f in findings)
 
 
+class TestCheckI18n:
+    def _config_with_i18n(self) -> ProjectConfig:
+        return ProjectConfig(
+            name="test", purpose="p", users="u", stage="active",
+            quality=["i18n"],
+        )
+
+    def test_no_i18n_declared_skips_check(self, tmp_path: Path) -> None:
+        config = ProjectConfig(name="t", purpose="p", users="u", stage="active", quality=[])
+        assert check_i18n(tmp_path, config) == []
+
+    def test_missing_i18n_flags_finding(self, tmp_path: Path) -> None:
+        findings = check_i18n(tmp_path, self._config_with_i18n())
+        assert len(findings) == 1
+        assert findings[0].category == "i18n"
+
+    def test_locales_dir_satisfies(self, tmp_path: Path) -> None:
+        (tmp_path / "src" / "locales").mkdir(parents=True)
+        assert check_i18n(tmp_path, self._config_with_i18n()) == []
+
+    def test_package_json_i18n_dep_satisfies(self, tmp_path: Path) -> None:
+        (tmp_path / "package.json").write_text('{"dependencies": {"react-i18next": "^13"}}')
+        assert check_i18n(tmp_path, self._config_with_i18n()) == []
+
+    def test_html_data_attr_switcher_satisfies(self, tmp_path: Path) -> None:
+        # playground-style: data-en/data-ru/data-lv attributes
+        (tmp_path / "index.html").write_text(
+            '<h2 data-en="Snake" data-ru="Snake-RU" data-lv="Snake-LV">Snake</h2>',
+            encoding="utf-8",
+        )
+        assert check_i18n(tmp_path, self._config_with_i18n()) == []
+
+    def test_python_language_field_satisfies(self, tmp_path: Path) -> None:
+        # agentMode-style: Python app with language= signal
+        (tmp_path / "app.py").write_text('def reply(language="lv"): pass\n')
+        assert check_i18n(tmp_path, self._config_with_i18n()) == []
+
+    def test_python_locale_string_satisfies(self, tmp_path: Path) -> None:
+        (tmp_path / "browser.py").write_text('context = browser.new_context(locale="lv-LV")\n')
+        assert check_i18n(tmp_path, self._config_with_i18n()) == []
+
+
 class TestRunQualityChecks:
     def test_returns_sorted_findings(
         self, project_dir: Path, sample_config: ProjectConfig
