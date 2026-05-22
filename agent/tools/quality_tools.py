@@ -201,22 +201,53 @@ def check_i18n(project_dir: Path, config: ProjectConfig) -> list[QualityFinding]
     if "i18n" not in config.quality:
         return findings
 
-    # Look for i18n config files
+    # Look for i18n config files / directories (standard layouts)
     i18n_indicators = [
         project_dir / "src" / "i18n",
         project_dir / "src" / "locales",
         project_dir / "public" / "locales",
+        project_dir / "locales",
+        project_dir / "i18n",
     ]
 
     has_i18n = any(d.exists() for d in i18n_indicators)
 
+    # Check package.json for i18n deps
     if not has_i18n:
-        # Check package.json for i18n deps
         pkg = project_dir / "package.json"
         if pkg.exists():
             content = pkg.read_text(encoding="utf-8", errors="ignore")
             if "i18n" in content or "intl" in content:
                 has_i18n = True
+
+    # NauroLabs-style i18n: data-en/data-ru/data-lv attributes on HTML elements
+    # (used by playground for in-place language switching without a framework)
+    if not has_i18n:
+        for html_file in project_dir.glob("*.html"):
+            try:
+                content = html_file.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            if "data-en=" in content or "data-ru=" in content or "data-lv=" in content:
+                has_i18n = True
+                break
+
+    # NauroLabs-style i18n: Python apps that branch behavior on a `language`
+    # field (e.g. agentMode user profiles + LLM prompt switching)
+    if not has_i18n:
+        python_signals = ("language=", "locale=\"lv", "locale=\"ru", "lv-LV", "ru-RU")
+        for py_file in list(project_dir.rglob("*.py"))[:200]:
+            # Skip vendor/venv dirs
+            parts = set(py_file.parts)
+            if ".venv" in parts or "node_modules" in parts or "site-packages" in parts:
+                continue
+            try:
+                content = py_file.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            if any(sig in content for sig in python_signals):
+                has_i18n = True
+                break
 
     if not has_i18n:
         findings.append(QualityFinding(
