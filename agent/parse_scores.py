@@ -19,7 +19,7 @@ def extract_score_objects(path: str) -> list[dict]:
             obj, size = dec.raw_decode(content, idx)
             if isinstance(obj, dict) and "score" in obj and "project" in obj:
                 objects.append(obj)
-            idx += size
+            idx = size
         except json.JSONDecodeError:
             idx += 1
     return objects
