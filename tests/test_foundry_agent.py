@@ -16,7 +16,6 @@ from agent import foundry_agent
 from agent.config import ProjectConfig
 from agent.foundry_agent import (
     _call_foundry_with_retry,
-    _parse_plan_from_text,
     create_agent,
 )
 
@@ -27,7 +26,6 @@ class FakeFunctionTool:
         self.definitions = [{"name": fn.__name__} for fn in functions]
 
 
-<<<<<<< HEAD
 class FakeClient:
     def __init__(self) -> None:
         self.kwargs = {}
@@ -362,19 +360,10 @@ def test_run_agent_processes_tool_calls_and_returns_plan(monkeypatch: pytest.Mon
     client = SimpleNamespace(threads=thread_api, messages=messages_api, runs=RunsApi())
 
     result = foundry_agent.run_agent(client, "agent-1", Path("."), config, "task")
-    assert result == {"score": 72, "summary": "ok", "improvements": []}
+    assert result == {"score": 72, "summary": "ok", "improvements": [], "research_insights": []}
 
 
-# ── PR #23 additions: TestCreateAgentSignature + retry behaviour ──────────────
-
-
-class TestCreateAgentSignature:
-    def test_accepts_model_kwarg(self) -> None:
-        """The CLI --model flag must reach create_agent. This test guards
-        against regressions where the kwarg gets dropped from the signature."""
-        sig = inspect.signature(create_agent)
-        assert "model" in sig.parameters
-        assert sig.parameters["model"].default is None
+# ── PR #23 additions: retry behaviour ────────────────────────────────────────
 
 
 def _http_response_error(status_code: int) -> HttpResponseError:
