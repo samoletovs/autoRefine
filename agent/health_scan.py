@@ -33,6 +33,7 @@ REPORT_BRANCH = "master"
 MAX_REPORTS = 10
 
 AZURE_BUDGET_MONTHLY = 150.0  # VS Enterprise monthly credit
+BUDGET_WARNING_THRESHOLD_PCT = 70  # yellow 🟡 when spend reaches this % of budget
 
 MANIFEST_URL = (
     "https://raw.githubusercontent.com/samoletovs/nauroLabs-github/master"
@@ -786,8 +787,14 @@ def build_telegram_summary(
     report: str,
     report_path: str | None,
     created_issues: list[str],
+    cost_data: dict[str, Any] | None = None,
 ) -> str:
-    """Compose a short Telegram message from the full report."""
+    """Compose a short Telegram message from the full report.
+
+    When *cost_data* is provided (and not an error), a one-line Azure
+    cost/budget summary is included so the Telegram recipient can see
+    spending without opening the full report.
+    """
     lines = report.split("\n")
     alerts = [line for line in lines if line.startswith("- ") and "🚨" not in line][:3]
     focus_line = next((line for line in lines if line.startswith("## 🎯")), "")
@@ -795,6 +802,23 @@ def build_telegram_summary(
     parts: list[str] = ["🤖 <b>NauroLabs Health Report</b>"]
     if focus_line:
         parts.append(focus_line.replace("## ", "").replace("🎯 ", "🎯 "))
+
+    if cost_data and cost_data.get("total", -1) >= 0:
+        total = cost_data["total"]
+        budget = cost_data.get("budget", AZURE_BUDGET_MONTHLY)
+        projected = cost_data.get("projected")
+        remaining = cost_data.get("remaining")
+        budget_pct = round(total / budget * 100) if budget > 0 else 0
+        over_budget = projected is not None and projected > budget
+        cost_icon = "🔴" if over_budget else ("🟡" if budget_pct >= BUDGET_WARNING_THRESHOLD_PCT else "💰")
+        cost_line = f"{cost_icon} Azure: ${total} used"
+        if projected is not None:
+            cost_line += f" (projected ${projected})"
+        cost_line += f" / ${budget} budget"
+        if over_budget or (remaining is not None and remaining < 0):
+            cost_line += " — <b>⚠️ OVER BUDGET</b>"
+        parts.append(cost_line)
+
     if alerts:
         parts.extend(alerts[:3])
     if created_issues:
@@ -856,7 +880,7 @@ def run_health_scan(repos: list[str], assign_copilot: bool = True) -> dict[str, 
         assign_copilot=assign_copilot,
     )
 
-    summary = build_telegram_summary(report, report_path, created_issues)
+    summary = build_telegram_summary(report, report_path, created_issues, cost_data=cost_data)
     send_telegram(summary, parse_mode="HTML")
 
     log.info(
