@@ -49,6 +49,70 @@ def test_build_summary_no_issues_no_focus() -> None:
     assert "Full report" not in msg
 
 
+def test_build_summary_includes_azure_cost() -> None:
+    report = "# NauroLabs Health Report\n"
+    cost_data: dict[str, Any] = {
+        "total": 42.5,
+        "projected": 80.0,
+        "budget": 150.0,
+        "remaining": 107.5,
+    }
+    msg = health_scan.build_telegram_summary(report, None, [], cost_data=cost_data)
+    assert "Azure" in msg
+    assert "$42.5" in msg
+    assert "projected $80.0" in msg
+    assert "$150.0 budget" in msg
+    assert "OVER BUDGET" not in msg
+    assert "💰" in msg  # below 70 % threshold
+
+
+def test_build_summary_azure_cost_yellow_warning() -> None:
+    cost_data: dict[str, Any] = {
+        "total": 110.0,
+        "projected": 140.0,
+        "budget": 150.0,
+        "remaining": 40.0,
+    }
+    msg = health_scan.build_telegram_summary("# Report\n", None, [], cost_data=cost_data)
+    assert "🟡" in msg  # 73 % used → yellow
+
+
+def test_build_summary_azure_cost_over_budget() -> None:
+    cost_data: dict[str, Any] = {
+        "total": 130.0,
+        "projected": 160.0,
+        "budget": 150.0,
+        "remaining": 20.0,
+    }
+    msg = health_scan.build_telegram_summary("# Report\n", None, [], cost_data=cost_data)
+    assert "🔴" in msg  # projected > budget
+    assert "OVER BUDGET" in msg
+
+
+def test_build_summary_azure_cost_negative_remaining() -> None:
+    cost_data: dict[str, Any] = {
+        "total": 160.0,
+        "projected": 190.0,
+        "budget": 150.0,
+        "remaining": -10.0,
+    }
+    msg = health_scan.build_telegram_summary("# Report\n", None, [], cost_data=cost_data)
+    assert "OVER BUDGET" in msg
+
+
+def test_build_summary_azure_cost_error_skipped() -> None:
+    """When cost_data signals an error (total=-1), no cost line is added."""
+    cost_data: dict[str, Any] = {"error": "no creds", "total": -1}
+    msg = health_scan.build_telegram_summary("# Report\n", None, [], cost_data=cost_data)
+    assert "Azure" not in msg
+
+
+def test_build_summary_cost_data_none_skipped() -> None:
+    """When cost_data is None (default), no cost line is added."""
+    msg = health_scan.build_telegram_summary("# Report\n", None, [])
+    assert "Azure" not in msg
+
+
 # ── generate_report ────────────────────────────────────────────────────────
 def test_generate_report_includes_project_table() -> None:
     github_data: dict[str, Any] = {
