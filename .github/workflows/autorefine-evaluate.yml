@@ -27,10 +27,13 @@ permissions:
 jobs:
   evaluate:
     runs-on: ubuntu-latest
+    # Skip scheduled runs when budget tier is "critical" (manual still works).
+    if: vars.AUTOREFINE_TIER != 'critical' || github.event_name == 'workflow_dispatch'
     env:
       FOUNDRY_PROJECT_ENDPOINT: ${{ secrets.FOUNDRY_PROJECT_ENDPOINT }}
       NAURO_BOT_TOKEN: ${{ secrets.NAURO_BOT_TOKEN }}
       NAURO_CHAT_ID: ${{ secrets.NAURO_CHAT_ID }}
+      AUTOREFINE_TIER: ${{ vars.AUTOREFINE_TIER || 'normal' }}
     steps:
       - name: Checkout autoRefine
         uses: actions/checkout@v4
