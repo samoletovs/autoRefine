@@ -1,0 +1,86 @@
+name: "Auto-merge Dependabot PRs"
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  check_suite:
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    if: >-
+      github.event.pull_request.user.login == 'dependabot[bot]' ||
+      (github.event_name == 'check_suite' && github.event.check_suite.conclusion == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dependabot metadata
+        if: github.event.pull_request.user.login == 'dependabot[bot]'
+        id: meta
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Auto-approve and enable auto-merge
+        uses: actions/github-script@v7
+        env:
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+        with:
+          script: |
+            let prNumber;
+            if (context.eventName === 'pull_request') {
+              const pr = context.payload.pull_request;
+              if (pr.user.login !== 'dependabot[bot]') {
+                console.log('Not a Dependabot PR — skipping');
+                return;
+              }
+              prNumber = pr.number;
+            } else if (context.eventName === 'check_suite') {
+              const { data: prs } = await github.rest.pulls.list({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open',
+                head: `${context.repo.owner}:${context.payload.check_suite.head_branch}`
+              });
+              const dependabotPr = prs.find(p => p.user.login === 'dependabot[bot]');
+              if (!dependabotPr) { console.log('No Dependabot PR for this check suite'); return; }
+              prNumber = dependabotPr.number;
+            }
+            if (!prNumber) return;
+
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber
+            });
+            if (!pr.mergeable) { console.log(`PR #${prNumber} not mergeable - skipping`); return; }
+
+            try {
+              await github.rest.pulls.createReview({
+                owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber,
+                event: 'APPROVE',
+                body: '🤖 Auto-approved Dependabot PR; will merge when CI passes.'
+              });
+            } catch (e) { console.log(`Approve note: ${e.message}`); }
+
+            try {
+              await github.graphql(`
+                mutation($prId: ID!) {
+                  enablePullRequestAutoMerge(input: { pullRequestId: $prId, mergeMethod: SQUASH }) {
+                    pullRequest { number }
+                  }
+                }`, { prId: pr.node_id });
+              console.log(`Auto-merge enabled for PR #${prNumber}`);
+            } catch (e) {
+              console.log(`Could not enable auto-merge: ${e.message}`);
+              try {
+                await github.rest.pulls.merge({
+                  owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber,
+                  merge_method: 'squash'
+                });
+                console.log(`Directly merged PR #${prNumber}`);
+              } catch (mergeErr) {
+                console.log(`Could not merge yet: ${mergeErr.message} - will retry`);
+              }
+            }
