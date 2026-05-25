@@ -12,14 +12,25 @@ permissions:
 jobs:
   health-scan:
     runs-on: ubuntu-latest
+    # Honor budget tier (set by .github/azure-budget-tier.yml):
+    #   - "critical" → skip scheduled runs (workflow_dispatch still works)
+    #   - cadence_per_day=1 → skip the 18:00 UTC slot, keep 06:00 only
+    if: |
+      (vars.AUTOREFINE_TIER != 'critical' || github.event_name == 'workflow_dispatch')
+      && (github.event_name == 'workflow_dispatch'
+          || vars.AUTOREFINE_CADENCE == '2'
+          || (vars.AUTOREFINE_CADENCE != '2' && startsWith(github.event.schedule, '0 6'))
+          || vars.AUTOREFINE_CADENCE == '' )
     env:
       AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
       AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
       NAURO_BOT_TOKEN: ${{ secrets.NAURO_BOT_TOKEN }}
       NAURO_CHAT_ID: ${{ secrets.NAURO_CHAT_ID }}
-      # Cheap tier — runs twice daily across 11 repos. Bump via repo variable
-      # ``HEALTH_SCAN_MODEL`` if you want a deep-analysis run. See AGENTS.md.
+      # Model is governed by the daily Azure Budget Tier workflow.
+      # Override by setting the ``HEALTH_SCAN_MODEL`` repo variable directly,
+      # or by changing the tier thresholds in ``scripts/azure-budget-tier.py``.
       HEALTH_SCAN_MODEL: ${{ vars.HEALTH_SCAN_MODEL || 'gpt-4o-mini' }}
+      AUTOREFINE_TIER: ${{ vars.AUTOREFINE_TIER || 'normal' }}
     steps:
       - name: Checkout autoRefine
         uses: actions/checkout@v4
