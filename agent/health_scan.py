@@ -763,7 +763,7 @@ def create_github_issues(
                             "--repo",
                             f"{GITHUB_OWNER}/{repo}",
                             "--add-assignee",
-                            "Copilot",
+                            "copilot",
                         ],
                         check=False,
                         capture_output=True,
