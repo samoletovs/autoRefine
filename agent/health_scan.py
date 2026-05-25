@@ -77,15 +77,16 @@ def _project_slug(project: dict[str, Any]) -> str:
 
 
 def _build_app_urls(manifest: dict[str, Any]) -> dict[str, str]:
-    """Build {slug: url} from active projects in the manifest."""
+    """Build {slug: url} from active projects using domain+health_path."""
     result: dict[str, str] = {}
     for project in manifest.get("projects", []):
         if project.get("status") == "archived":
             continue
         slug = _project_slug(project)
-        url = project.get("url")
-        if slug and url:
-            result[slug] = url
+        domain = project.get("domain")
+        health_path = project.get("health_path", "/")
+        if slug and domain:
+            result[slug] = f"https://{domain}{health_path}"
     return result
 
 
@@ -396,7 +397,7 @@ def check_deployed_urls() -> dict[str, Any]:
     manifest = fetch_workspace_manifest()
     app_urls = _build_app_urls(manifest)
     results: dict[str, Any] = {}
-    with httpx.Client(timeout=15, follow_redirects=True) as client:
+    with httpx.Client(timeout=30, follow_redirects=True) as client:
         for repo, url in app_urls.items():
             try:
                 resp = client.get(url)
