@@ -279,7 +279,7 @@ def test_create_github_issues_assigns_copilot() -> None:
             "--repo",
             "samoletovs/era",
             "--add-assignee",
-            "Copilot",
+            "copilot",
         ],
         check=False,
         capture_output=True,
@@ -317,27 +317,28 @@ _SAMPLE_MANIFEST: dict[str, Any] = {
         {
             "slug": "era",
             "repo": "samoletovs/era",
-            "url": "https://era.naurolabs.com",
+            "domain": "era.naurolabs.com",
+            "health_path": "/health",
             "status": "active",
             "azure": {"resourceGroup": "rg-era"},
         },
         {
             "slug": "golazo",
             "repo": "samoletovs/golazo",
-            "url": "https://golazo.naurolabs.com",
+            "domain": "golazo.naurolabs.com",
             "status": "active",
             "azure": {"resourceGroup": "rg-golazo"},
         },
         {
             "slug": "playground",
             "repo": "samoletovs/playground",
-            "url": "https://playground.naurolabs.com",
+            "domain": "playground.naurolabs.com",
             "status": "active",
         },
         {
             "slug": "oldProject",
             "repo": "samoletovs/oldProject",
-            "url": "https://old.naurolabs.com",
+            "domain": "old.naurolabs.com",
             "status": "archived",
             "azure": {"resourceGroup": "rg-old"},
         },
@@ -348,9 +349,9 @@ _SAMPLE_MANIFEST: dict[str, Any] = {
 def test_build_app_urls_from_manifest() -> None:
     urls = health_scan._build_app_urls(_SAMPLE_MANIFEST)
     assert urls == {
-        "era": "https://era.naurolabs.com",
-        "golazo": "https://golazo.naurolabs.com",
-        "playground": "https://playground.naurolabs.com",
+        "era": "https://era.naurolabs.com/health",
+        "golazo": "https://golazo.naurolabs.com/",
+        "playground": "https://playground.naurolabs.com/",
     }
     assert "oldProject" not in urls  # archived projects excluded
 
@@ -371,13 +372,13 @@ def test_build_app_urls_slug_fallback() -> None:
         "projects": [
             {
                 "repo": "samoletovs/rosette",
-                "url": "https://rosette.naurolabs.com",
+                "domain": "rosette.naurolabs.com",
                 "status": "active",
             }
         ]
     }
     urls = health_scan._build_app_urls(manifest)
-    assert urls == {"rosette": "https://rosette.naurolabs.com"}
+    assert urls == {"rosette": "https://rosette.naurolabs.com/"}
 
 
 def test_fetch_workspace_manifest_uses_cache(tmp_path: Path) -> None:
