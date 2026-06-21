@@ -36,12 +36,12 @@ jobs:
       AUTOREFINE_TIER: ${{ vars.AUTOREFINE_TIER || 'normal' }}
     steps:
       - name: Checkout autoRefine
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         env:
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
       - name: Checkout governance (for manifest)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: samoletovs/nauroLabs-github
           path: .github-gov
@@ -50,7 +50,7 @@ jobs:
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
         env:
