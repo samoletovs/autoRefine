@@ -10,8 +10,13 @@ permissions:
   contents: write
   pull-requests: write
 
+concurrency:
+  group: dependabot-auto-merge-${{ github.event.pull_request.number || github.event.check_suite.head_branch }}
+  cancel-in-progress: false
+
 jobs:
   auto-merge:
+    name: Dependabot auto-merge
     if: >-
       github.event.pull_request.user.login == 'dependabot[bot]' ||
       (github.event_name == 'check_suite' && github.event.check_suite.conclusion == 'success')
@@ -24,46 +29,87 @@ jobs:
         with:
           github-token: "${{ secrets.GITHUB_TOKEN }}"
 
-      - name: Auto-approve and enable auto-merge
+      - name: Auto-approve and merge when CI is green
         uses: actions/github-script@v7
         env:
           UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
         with:
           script: |
+            const { owner, repo } = context.repo;
+            const SELF_CHECK_NAME = 'Dependabot auto-merge';
+
+            // 1. Resolve the Dependabot PR from either trigger.
             let prNumber;
             if (context.eventName === 'pull_request') {
-              const pr = context.payload.pull_request;
-              if (pr.user.login !== 'dependabot[bot]') {
-                console.log('Not a Dependabot PR — skipping');
-                return;
-              }
-              prNumber = pr.number;
+              const p = context.payload.pull_request;
+              if (p.user.login !== 'dependabot[bot]') { console.log('Not a Dependabot PR - skipping'); return; }
+              prNumber = p.number;
             } else if (context.eventName === 'check_suite') {
               const { data: prs } = await github.rest.pulls.list({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                state: 'open',
-                head: `${context.repo.owner}:${context.payload.check_suite.head_branch}`
+                owner, repo, state: 'open',
+                head: `${owner}:${context.payload.check_suite.head_branch}`
               });
-              const dependabotPr = prs.find(p => p.user.login === 'dependabot[bot]');
-              if (!dependabotPr) { console.log('No Dependabot PR for this check suite'); return; }
-              prNumber = dependabotPr.number;
+              const dep = prs.find(p => p.user.login === 'dependabot[bot]');
+              if (!dep) { console.log('No Dependabot PR for this check suite'); return; }
+              prNumber = dep.number;
             }
             if (!prNumber) return;
 
-            const { data: pr } = await github.rest.pulls.get({
-              owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber
-            });
-            if (!pr.mergeable) { console.log(`PR #${prNumber} not mergeable - skipping`); return; }
+            // 2. Poll mergeability. GitHub computes it asynchronously and it is
+            //    frequently `null` on the `opened` event - the original early
+            //    `return` here is exactly why clean PRs were never merged.
+            let pr;
+            for (let i = 0; i < 8; i++) {
+              ({ data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber }));
+              if (pr.merged || pr.state !== 'open') { console.log(`PR #${prNumber} already ${pr.merged ? 'merged' : pr.state}`); return; }
+              if (pr.mergeable !== null) break;
+              await new Promise(r => setTimeout(r, 5000));
+            }
+            if (pr.mergeable === false) { console.log(`PR #${prNumber} has conflicts - skipping`); return; }
 
+            // 3. Never auto-merge a major version bump - leave it for a human.
+            const bump = /from\s+(\d+)\.\S*\s+to\s+(\d+)\./i.exec(pr.title || '');
+            if (bump && bump[1] !== bump[2]) {
+              console.log(`PR #${prNumber} is a major bump (${bump[1]} -> ${bump[2]}) - leaving for human review`);
+              return;
+            }
+
+            // 4. With no branch protection there is no required-check gate, so
+            //    enforce one here: only merge once every *other* check run on the
+            //    head commit has finished successfully (exclude our own run).
+            //
+            //    GitHub does NOT re-trigger this workflow from the `check_suite`
+            //    completion of Actions-created suites (a recursion guard), so the
+            //    old "return and retry on completion" path never fired and clean
+            //    PRs sat open forever. Instead we poll here until every other
+            //    check finishes, so a single run converges on its own.
+            const OK = new Set(['success', 'neutral', 'skipped']);
+            let ready = false;
+            for (let i = 0; i < 24; i++) {          // up to ~12 min
+              const { data: checks } = await github.rest.checks.listForRef({
+                owner, repo, ref: pr.head.sha, per_page: 100
+              });
+              const others = checks.check_runs.filter(c => c.name !== SELF_CHECK_NAME);
+              if (others.some(c => c.status === 'completed' && !OK.has(c.conclusion))) {
+                console.log(`PR #${prNumber} has a failing check - skipping`); return;
+              }
+              if (others.length > 0 && others.every(c => c.status === 'completed')) { ready = true; break; }
+              const pending = others.filter(c => c.status !== 'completed').length || '(no checks yet)';
+              console.log(`PR #${prNumber} waiting on ${pending} check(s)...`);
+              await new Promise(r => setTimeout(r, 30000));
+            }
+            if (!ready) { console.log(`PR #${prNumber} checks did not finish in time - leaving for the daily janitor`); return; }
+
+            // 5. Best-effort approval (non-fatal if Actions approvals are disabled).
             try {
               await github.rest.pulls.createReview({
-                owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber,
-                event: 'APPROVE',
-                body: '🤖 Auto-approved Dependabot PR; will merge when CI passes.'
+                owner, repo, pull_number: prNumber, event: 'APPROVE',
+                body: 'Auto-approved Dependabot PR (CI green).'
               });
             } catch (e) { console.log(`Approve note: ${e.message}`); }
 
+            // 6. Prefer native auto-merge; fall back to a direct squash merge when
+            //    the repo has no branch protection ("clean status" error).
             try {
               await github.graphql(`
                 mutation($prId: ID!) {
@@ -73,14 +119,7 @@ jobs:
                 }`, { prId: pr.node_id });
               console.log(`Auto-merge enabled for PR #${prNumber}`);
             } catch (e) {
-              console.log(`Could not enable auto-merge: ${e.message}`);
-              try {
-                await github.rest.pulls.merge({
-                  owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber,
-                  merge_method: 'squash'
-                });
-                console.log(`Directly merged PR #${prNumber}`);
-              } catch (mergeErr) {
-                console.log(`Could not merge yet: ${mergeErr.message} - will retry`);
-              }
+              console.log(`Native auto-merge unavailable (${e.message}); merging directly.`);
+              await github.rest.pulls.merge({ owner, repo, pull_number: prNumber, merge_method: 'squash' });
+              console.log(`Squash-merged PR #${prNumber}`);
             }
