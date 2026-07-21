@@ -80,3 +80,66 @@ def send_telegram(
     except httpx.HTTPError as e:
         log.warning("Telegram send error: %s", e)
         return False
+
+
+def send_idea_card(
+    repo: str,
+    issue_number: int,
+    title: str,
+    *,
+    priority: str = "P2",
+    description: str = "",
+    bot_token: str | None = None,
+    chat_id: str | None = None,
+) -> bool:
+    """Send an idea approval card with 👍 Build / 👎 Not now buttons.
+
+    The buttons carry ``arf:<repo>:<num>:y|n`` and the text echoes ``arf:<repo>:<num>`` so a
+    text reply to the card can be attributed back to the issue by nauroBot. ``repo`` may be
+    ``OWNER/NAME`` or a bare name — only the bare name is encoded (nauroBot prepends the
+    owner). Returns True if delivered, False if skipped or failed. Never raises.
+    """
+    token = bot_token or os.environ.get("NAURO_BOT_TOKEN", "")
+    chat = chat_id or os.environ.get("NAURO_CHAT_ID", "")
+
+    if not token or not chat:
+        log.warning("NAURO_BOT_TOKEN or NAURO_CHAT_ID missing — skipping idea card")
+        return False
+
+    name = repo.split("/")[-1]
+    lines = [f"💡 [{priority}] {name} — {title}"]
+    if description:
+        lines.append(description)
+    lines.append("Proposed by autoRefine · reply with a reason if you decline")
+    lines.append(f"arf:{name}:{issue_number}")
+
+    payload = {
+        "chat_id": chat,
+        "text": _truncate("\n".join(lines)),
+        "disable_web_page_preview": True,
+        "reply_markup": {
+            "inline_keyboard": [[
+                {"text": "👍 Build", "callback_data": f"arf:{name}:{issue_number}:y"},
+                {"text": "👎 Not now", "callback_data": f"arf:{name}:{issue_number}:n"},
+            ]],
+        },
+    }
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+
+    try:
+        with httpx.Client(timeout=15) as client:
+            resp = client.post(url, json=payload)
+            if resp.status_code == 200:
+                return True
+            if 500 <= resp.status_code < 600:
+                resp = client.post(url, json=payload)
+                if resp.status_code == 200:
+                    return True
+            log.warning(
+                "Idea card send failed: HTTP %d %s", resp.status_code, resp.text[:200]
+            )
+            return False
+    except httpx.HTTPError as e:
+        log.warning("Idea card send error: %s", e)
+        return False

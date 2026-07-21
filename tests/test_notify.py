@@ -116,3 +116,49 @@ def test_network_error_returns_false(monkeypatch: pytest.MonkeyPatch) -> None:
         client_instance.post.side_effect = _httpx.ConnectError("dns")
 
         assert notify.send_telegram("hi") is False
+
+
+# --- send_idea_card ---------------------------------------------------------
+
+
+def test_idea_card_skipped_without_creds() -> None:
+    assert notify.send_idea_card("samoletovs/era", 12, "Add CSV export") is False
+
+
+def test_idea_card_encodes_buttons_and_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("NAURO_BOT_TOKEN", "tok")
+    monkeypatch.setenv("NAURO_CHAT_ID", "999")
+
+    with patch("agent.notify.httpx.Client") as mock_client_cls:
+        client_instance = mock_client_cls.return_value.__enter__.return_value
+        client_instance.post.return_value = MagicMock(status_code=200)
+
+        result = notify.send_idea_card(
+            "samoletovs/era", 12, "Add CSV export", priority="P1", description="Nice to have"
+        )
+
+    assert result is True
+    _, kwargs = client_instance.post.call_args
+    payload = kwargs["json"]
+    # Bare repo name is encoded (nauroBot prepends the owner).
+    buttons = payload["reply_markup"]["inline_keyboard"][0]
+    assert buttons[0]["callback_data"] == "arf:era:12:y"
+    assert buttons[1]["callback_data"] == "arf:era:12:n"
+    # The card text carries the arf token so a reply can be attributed to the issue.
+    assert "arf:era:12" in payload["text"]
+    assert "Add CSV export" in payload["text"]
+
+
+def test_idea_card_callback_data_within_telegram_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("NAURO_BOT_TOKEN", "tok")
+    monkeypatch.setenv("NAURO_CHAT_ID", "999")
+
+    with patch("agent.notify.httpx.Client") as mock_client_cls:
+        client_instance = mock_client_cls.return_value.__enter__.return_value
+        client_instance.post.return_value = MagicMock(status_code=200)
+
+        notify.send_idea_card("samoletovs/portaBaltica", 99999, "x" * 200)
+
+    _, kwargs = client_instance.post.call_args
+    for button in kwargs["json"]["reply_markup"]["inline_keyboard"][0]:
+        assert len(button["callback_data"].encode("utf-8")) <= 64

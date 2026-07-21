@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -234,6 +235,7 @@ def _build_file_idea_command(
     improvement: dict,
     references: str,
     dry_run: bool,
+    needs_approval: bool = False,
 ) -> list[str]:
     options = _discover_file_idea_options(script_path)
     title = improvement.get("title", "Untitled improvement").strip()
@@ -259,6 +261,9 @@ def _build_file_idea_command(
         if memo_option in options:
             _add_option(memo_option, memo_body)
             break
+
+    if needs_approval and "--needs-approval" in options:
+        cmd.append("--needs-approval")
 
     if "--dry-run" in options and dry_run:
         cmd.append("--dry-run")
@@ -352,20 +357,27 @@ def file_ideas_for_plan(
 #
 # Gated by AUTOREFINE_FUNCTIONAL_MODE (off | propose | file), default "off":
 #   - propose: log the proposed ideas + a Telegram summary, file NOTHING (observe-first).
-#   - file:    file them as `idea` + `feature` memos (capped), feeding the build loop.
+#   - file:    file them as `idea` + `feature` memos (capped) and auto-feed the build loop.
+#   - cards:   file them as `needs-approval` idea memos AND send a Telegram approval card;
+#              Copilot is assigned only on a 👍 tap (nauroBot handles it). This is the
+#              human-in-the-loop build trigger + the source of decline reasons fed back here.
 # The workflow defaults to "propose" so a human reviews the first batches before anything
 # auto-builds (EVOLUTION.md §6 guardrails / DGM anti-reward-hacking).
 
 
 def _functional_mode() -> str:
-    """Read the observe-first gate: off | propose | file (default off; unknown → off)."""
+    """Read the observe-first gate: off | propose | file | cards (default off; unknown → off)."""
     mode = os.environ.get("AUTOREFINE_FUNCTIONAL_MODE", "off").strip().lower()
-    return mode if mode in {"off", "propose", "file"} else "off"
+    return mode if mode in {"off", "propose", "file", "cards"} else "off"
 
 
-def _functional_task(cap: int = FUNCTIONAL_IDEA_CAP) -> str:
-    """Foundry task that asks for vision-aligned feature ideas, not technical fixes."""
-    return (
+def _functional_task(cap: int = FUNCTIONAL_IDEA_CAP, avoid_context: str = "") -> str:
+    """Foundry task that asks for vision-aligned feature ideas, not technical fixes.
+
+    ``avoid_context`` carries recently declined ideas (+ their Telegram reasons) so the
+    agent proposes something *different* — closing the loop from a 👎 back into ideation.
+    """
+    task = (
         "Propose FUNCTIONAL improvements that advance this project's VISION — concrete, buildable "
         "user-facing capabilities that move it toward its stated purpose and goals (and toward "
         "parity with any listed similar products). Every active experiment has meaningful next "
@@ -377,14 +389,21 @@ def _functional_task(cap: int = FUNCTIONAL_IDEA_CAP) -> str:
         "title, a 1-2 sentence description, a realistic priority (P0-P2 — most will be P1 or P2) "
         f"and effort (S/M/L). Submit your best {cap + 3} ideas via the submit_plan tool, strongest first."
     )
+    if avoid_context:
+        task += "\n\n" + avoid_context
+    return task
 
 
 def plan_functional(
     project_dir: Path,
     config: ProjectConfig,
     model: str | None = None,
+    avoid_context: str = "",
 ) -> dict | None:
-    """Run the Foundry plan agent with a functional/vision focus. Returns a plan or None."""
+    """Run the Foundry plan agent with a functional/vision focus. Returns a plan or None.
+
+    ``avoid_context`` (recently declined ideas + reasons) is threaded into the task prompt.
+    """
     endpoint = os.environ.get("FOUNDRY_PROJECT_ENDPOINT", "")
     if not endpoint:
         log.error("FOUNDRY_PROJECT_ENDPOINT not set — cannot run functional ideation.")
@@ -398,7 +417,9 @@ def plan_functional(
     client = AgentsClient(endpoint=endpoint, credential=DefaultAzureCredential())
     agent_id = create_agent(client, mode="plan", model=model)
     try:
-        return run_agent(client, agent_id, project_dir, config, _functional_task())
+        return run_agent(
+            client, agent_id, project_dir, config, _functional_task(avoid_context=avoid_context)
+        )
     finally:
         client.delete_agent(agent_id)
         log.info("Functional agent cleaned up.")
@@ -446,6 +467,158 @@ def _notify_functional(summary: str) -> None:
         log.info("Telegram notify unavailable; functional summary logged only.")
 
 
+def _notify_idea_card(repo: str, issue_number: int, improvement: dict) -> bool:
+    """Send a Telegram approval card for a filed idea (best-effort)."""
+    try:
+        from agent.notify import send_idea_card
+
+        return send_idea_card(
+            repo,
+            issue_number,
+            str(improvement.get("title", "Untitled")).strip(),
+            priority=str(improvement.get("priority", "P2")).upper(),
+            description=str(improvement.get("description", "")).strip(),
+        )
+    except Exception:  # pragma: no cover — notify is best-effort
+        log.info("Idea card unavailable; idea filed without a Telegram card.")
+        return False
+
+
+_ISSUE_URL_RE = re.compile(r"github\.com/[^/]+/[^/]+/issues/(\d+)")
+
+
+def _parse_issue_number(url: str) -> int | None:
+    """Extract the issue number from a `github.com/OWNER/REPO/issues/N` URL."""
+    match = _ISSUE_URL_RE.search(url or "")
+    return int(match.group(1)) if match else None
+
+
+def _file_one_idea(
+    script_path: Path,
+    repo: str,
+    improvement: dict,
+    references: str,
+    dry_run: bool,
+) -> str | None:
+    """File a single idea labelled `needs-approval`. Returns the issue URL (or None)."""
+    cmd = _build_file_idea_command(
+        script_path, repo, improvement, references, dry_run=dry_run, needs_approval=True
+    )
+    run = subprocess.run(cmd, capture_output=True, text=True)
+    if run.returncode != 0:
+        log.warning(
+            "Failed to file idea for %s: %s\nstderr=%s",
+            repo, improvement.get("title", ""), run.stderr.strip(),
+        )
+        return None
+    return run.stdout.strip()
+
+
+def file_and_card_functional_ideas(
+    repo: str,
+    improvements: list[dict],
+    dry_run: bool = False,
+    *,
+    filer=None,
+    carder=None,
+) -> int:
+    """File each idea as `needs-approval` and send a Telegram approval card.
+
+    The human-in-the-loop build trigger: nothing is assigned to Copilot until a 👍 tap
+    (nauroBot handles it). ``filer`` / ``carder`` are injectable for tests. Returns the
+    number of ideas that got a card.
+    """
+    script_path = _resolve_file_idea_script()
+    if script_path is None:
+        return 0
+    references = _build_run_references()
+    _file = filer or (lambda imp: _file_one_idea(script_path, repo, imp, references, dry_run))
+    _card = carder or _notify_idea_card
+    carded = 0
+    seen: set[str] = set()
+    for improvement in improvements:
+        title = str(improvement.get("title", "")).strip()
+        key = title.lower()
+        if not title or key in seen:
+            continue
+        seen.add(key)
+        url = _file(improvement)
+        if not url:
+            continue
+        if dry_run:
+            log.info("[dry-run] would card %s: %s", repo, title)
+            carded += 1
+            continue
+        number = _parse_issue_number(url)
+        if number is None:
+            log.warning("Filed %s but could not parse an issue number from %r", title, url)
+            continue
+        if _card(repo, number, improvement):
+            carded += 1
+    return carded
+
+
+def _declined_reason(repo: str, number) -> str:
+    """The Telegram decline reason logged on an issue, if any. Best-effort."""
+    if number is None:
+        return ""
+    try:
+        view = subprocess.run(
+            ["gh", "issue", "view", str(number), "--repo", repo, "--json", "comments"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if view.returncode != 0:
+            return ""
+        comments = json.loads(view.stdout or "{}").get("comments", [])
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return ""
+    for comment in comments:
+        body = str(comment.get("body", "")).strip()
+        if body.startswith("Feedback from Telegram:"):
+            return body.split(":", 1)[1].strip()
+    return ""
+
+
+def _recent_declined_reasons(repo: str, limit: int = 6) -> list[str]:
+    """Recently declined idea titles (+ any Telegram reason) for a repo. Best-effort.
+
+    Reads closed `declined` idea issues via `gh`; extracts the reason nauroBot logs as a
+    `Feedback from Telegram:` comment. Returns [] on any failure (missing gh, no auth, …).
+    """
+    try:
+        listing = subprocess.run(
+            ["gh", "issue", "list", "--repo", repo, "--label", "declined",
+             "--state", "closed", "--limit", str(limit), "--json", "number,title"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if listing.returncode != 0:
+            return []
+        issues = json.loads(listing.stdout or "[]")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+
+    reasons: list[str] = []
+    for issue in issues:
+        title = str(issue.get("title", "")).replace("[idea]", "").strip()
+        if not title:
+            continue
+        reason = _declined_reason(repo, issue.get("number"))
+        reasons.append(f"{title} — {reason}" if reason else title)
+    return reasons
+
+
+def _format_avoid_context(declined: list[str]) -> str:
+    """Render declined ideas as an 'avoid these' block for the generator prompt."""
+    if not declined:
+        return ""
+    lines = [
+        "Previously proposed ideas that were DECLINED — do NOT re-propose these; the text "
+        "after the dash is the reason, so propose something meaningfully different:"
+    ]
+    lines.extend(f"- {item}" for item in declined)
+    return "\n".join(lines)
+
+
 def handle_functional_ideas(
     repo: str,
     plan: dict,
@@ -454,11 +627,13 @@ def handle_functional_ideas(
     *,
     notifier=None,
     filer=None,
+    carder=None,
 ) -> list[dict]:
     """Route selected functional ideas per the observe-first gate. Returns the selection.
 
-    ``propose`` logs + notifies and files nothing; ``file`` files capped `feature` memos.
-    ``notifier`` / ``filer`` are injectable for tests.
+    ``propose`` logs + notifies and files nothing; ``file`` files capped `feature` memos;
+    ``cards`` files them as `needs-approval` + sends Telegram approval cards.
+    ``notifier`` / ``filer`` / ``carder`` are injectable for tests.
     """
     selected = _select_functional_improvements(plan)
     if not selected:
@@ -479,6 +654,11 @@ def handle_functional_ideas(
             allowed_priorities=FUNCTIONAL_PRIORITIES,
         )
         log.info("Filed %d functional idea(s) for %s", len(selected), repo)
+        return selected
+
+    if mode == "cards":
+        carded = (carder or file_and_card_functional_ideas)(repo, selected, dry_run=dry_run)
+        log.info("Sent %d idea approval card(s) for %s", carded, repo)
         return selected
 
     return []
@@ -763,7 +943,16 @@ def main() -> None:
             fmode = _functional_mode()
             if fmode != "off" and project_config.stage in FUNCTIONAL_STAGES:
                 log.info("Functional ideation (%s) for %s...", fmode, name)
-                fplan = plan_functional(project_dir, project_config, model=config.model)
+                # In cards mode, feed recently declined ideas (+ reasons) back to the
+                # generator so a 👎 in Telegram reshapes the next proposals.
+                avoid = (
+                    _format_avoid_context(_recent_declined_reasons(repo))
+                    if fmode == "cards"
+                    else ""
+                )
+                fplan = plan_functional(
+                    project_dir, project_config, model=config.model, avoid_context=avoid
+                )
                 if fplan:
                     handle_functional_ideas(repo, fplan, mode=fmode, dry_run=config.dry_run)
                 else:

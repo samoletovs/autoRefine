@@ -137,3 +137,92 @@ def test_handle_empty_selection_is_a_noop():
         filer=lambda *a, **k: calls.append(a),
     )
     assert result == [] and not calls
+
+
+# --- cards mode + reason-fed generation -------------------------------------
+
+
+def test_functional_mode_accepts_cards(monkeypatch):
+    monkeypatch.setenv("AUTOREFINE_FUNCTIONAL_MODE", "cards")
+    assert m._functional_mode() == "cards"
+
+
+def test_parse_issue_number_extracts_from_url():
+    assert m._parse_issue_number("https://github.com/samoletovs/era/issues/42") == 42
+    assert m._parse_issue_number("not a url") is None
+    assert m._parse_issue_number("") is None
+
+
+def test_format_avoid_context_empty_is_blank():
+    assert m._format_avoid_context([]) == ""
+
+
+def test_format_avoid_context_lists_declined():
+    block = m._format_avoid_context(["CSV export — too niche", "Dark mode"])
+    assert "DECLINED" in block
+    assert "- CSV export — too niche" in block
+    assert "- Dark mode" in block
+
+
+def test_functional_task_appends_avoid_context():
+    base = m._functional_task()
+    with_ctx = m._functional_task(avoid_context="AVOID: foo")
+    assert "AVOID: foo" in with_ctx
+    assert "AVOID: foo" not in base
+
+
+def test_file_and_card_files_and_cards_each(monkeypatch):
+    # Avoid touching the filesystem / governance script.
+    monkeypatch.setattr(m, "_resolve_file_idea_script", lambda: m.Path("file-idea.py"))
+    monkeypatch.setattr(m, "_build_run_references", lambda: "refs")
+    filed: list[str] = []
+    carded: list[tuple] = []
+
+    def fake_filer(imp):
+        filed.append(imp["title"])
+        return f"https://github.com/samoletovs/era/issues/{len(filed)}"
+
+    def fake_carder(repo, number, imp):
+        carded.append((repo, number, imp["title"]))
+        return True
+
+    plan = [
+        {"title": "A", "priority": "P1", "category": "feature"},
+        {"title": "A", "priority": "P1", "category": "feature"},  # duplicate
+        {"title": "B", "priority": "P2", "category": "feature"},
+    ]
+    count = m.file_and_card_functional_ideas(
+        "samoletovs/era", plan, filer=fake_filer, carder=fake_carder
+    )
+    assert count == 2  # A and B; duplicate skipped
+    assert filed == ["A", "B"]
+    assert [c[1] for c in carded] == [1, 2]
+
+
+def test_file_and_card_skips_when_filing_fails(monkeypatch):
+    monkeypatch.setattr(m, "_resolve_file_idea_script", lambda: m.Path("file-idea.py"))
+    monkeypatch.setattr(m, "_build_run_references", lambda: "refs")
+    carded: list = []
+    count = m.file_and_card_functional_ideas(
+        "samoletovs/era",
+        [{"title": "A", "priority": "P1", "category": "feature"}],
+        filer=lambda imp: None,  # filing failed → no card
+        carder=lambda *a: carded.append(a) or True,
+    )
+    assert count == 0 and not carded
+
+
+def test_handle_cards_routes_to_carder():
+    plan = _plan(("A", "P1"), ("B", "P2"))
+    calls: dict = {}
+
+    def fake_carder(repo, selected, dry_run=False):
+        calls["repo"] = repo
+        calls["titles"] = [i["title"] for i in selected]
+        return len(selected)
+
+    result = m.handle_functional_ideas(
+        "samoletovs/era", plan, mode="cards", carder=fake_carder, notifier=lambda s: None
+    )
+    assert calls["titles"] == ["A", "B"]
+    assert len(result) == 2
