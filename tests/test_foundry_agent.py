@@ -248,6 +248,50 @@ def test_parse_plan_from_text_returns_none_without_improvements() -> None:
     assert foundry_agent._parse_plan_from_text("Score: 50/100\nNo numbered list") is None
 
 
+# --- stringified improvements recovery (gpt-4o-mini serializes a numbered string) ---
+
+# Verbatim shape observed live: submit_plan's improvements passed as prose, not JSON.
+_STRINGIFIED_IMPROVEMENTS = (
+    "1. Multi-Country Dashboard \u2014 Implement a dashboard that displays key financial "
+    "metrics for multiple countries. \u2014 priority: P1, effort: M, category: feature\n"
+    "2. Invoice Recognition Enhancement \u2014 Integrate advanced OCR to extract invoice "
+    "data automatically. \u2014 priority: P1, effort: M, category: feature\n"
+    "3. User Onboarding Flow \u2014 Develop a guided onboarding flow for new companies. "
+    "\u2014 priority: P2, effort: L, category: onboarding"
+)
+
+
+def test_parse_improvements_list_recovers_structured_items() -> None:
+    items = foundry_agent._parse_improvements_list(_STRINGIFIED_IMPROVEMENTS)
+    assert len(items) == 3
+    assert items[0]["title"] == "Multi-Country Dashboard"
+    assert items[0]["description"].startswith("Implement a dashboard")
+    assert items[0]["priority"] == "P1"
+    assert items[0]["effort"] == "M"
+    assert items[0]["category"] == "feature"
+    assert items[2]["priority"] == "P2"
+    assert items[2]["effort"] == "L"
+    assert items[2]["category"] == "onboarding"
+
+
+def test_normalize_plan_args_recovers_stringified_improvements() -> None:
+    plan = foundry_agent._normalize_plan_args(
+        {"score": "85", "summary": "s", "improvements": _STRINGIFIED_IMPROVEMENTS}
+    )
+    assert plan["score"] == 85
+    assert len(plan["improvements"]) == 3
+    assert all(isinstance(imp, dict) for imp in plan["improvements"])
+    assert plan["improvements"][0]["title"] == "Multi-Country Dashboard"
+
+
+def test_normalize_plan_args_prefers_valid_json_list() -> None:
+    plan = foundry_agent._normalize_plan_args(
+        {"improvements": '[{"title": "Real JSON", "priority": "P1"}]'}
+    )
+    assert len(plan["improvements"]) == 1
+    assert plan["improvements"][0]["title"] == "Real JSON"
+
+
 def test_build_plan_task_includes_findings_and_similar() -> None:
     config = ProjectConfig(
         name="demo",

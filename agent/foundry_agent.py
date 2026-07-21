@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
@@ -290,15 +291,62 @@ def _coerce_list(value: Any) -> list:
     return []
 
 
+def _parse_improvements_list(text: str) -> list[dict]:
+    """Recover a structured improvements list from a numbered free-text block.
+
+    gpt-4o-mini sometimes serializes submit_plan's ``improvements`` as a numbered
+    string instead of a JSON array, e.g.::
+
+        1. Title \u2014 description \u2014 priority: P1, effort: M, category: feature
+        2. Title \u2014 description \u2014 priority: P2, effort: L, category: onboarding
+
+    Without this fallback ``_coerce_list`` returns [] and every idea is silently
+    dropped. Splits on the leading item number, pulls the ``priority``/``effort``/
+    ``category`` metadata wherever it appears, then separates title from description.
+    """
+    items: list[dict] = []
+    for block in re.split(r"(?m)^\s*\d+[.)]\s+", text):
+        block = block.strip()
+        if not block:
+            continue
+        priority = re.search(r"priority\s*[:=]\s*P\s*(\d)", block, re.IGNORECASE)
+        effort = re.search(r"effort\s*[:=]\s*([SML])\b", block, re.IGNORECASE)
+        category = re.search(r"category\s*[:=]\s*([A-Za-z][\w-]*)", block, re.IGNORECASE)
+        # Drop the trailing "[\u2014] priority: \u2026, effort: \u2026, category: \u2026" metadata clause.
+        core = re.split(
+            r"[\u2013\u2014\u00b7\-]?\s*priority\s*[:=]", block, maxsplit=1, flags=re.IGNORECASE
+        )[0]
+        core = core.strip().strip("*").strip(" \u2013\u2014\u00b7-:").strip()
+        # Title is the text before the first separator; the remainder is the description.
+        parts = re.split(r"\s+[\u2013\u2014\u00b7]\s+|\s+-\s+|:\s+", core, maxsplit=1)
+        title = parts[0].strip().strip("*").strip()
+        description = parts[1].strip() if len(parts) > 1 else ""
+        if not title:
+            continue
+        item: dict = {"title": title, "description": description, "effort": "M", "category": "quality"}
+        if priority:
+            item["priority"] = f"P{priority.group(1)}"
+        if effort:
+            item["effort"] = effort.group(1).upper()
+        if category:
+            item["category"] = category.group(1).lower()
+        items.append(item)
+    return items
+
+
 def _normalize_plan_args(args: dict) -> dict:
     """Normalize submit_plan tool arguments: LLMs sometimes serialize ints as strings
     and lists as JSON-encoded strings."""
     normalized: dict[str, Any] = dict(args)
     normalized["score"] = _coerce_int(args.get("score"), default=0)
     normalized["summary"] = str(args.get("summary", "") or "")
-    normalized["improvements"] = [
-        item for item in _coerce_list(args.get("improvements")) if isinstance(item, dict)
-    ]
+    raw_improvements = args.get("improvements")
+    improvements = [item for item in _coerce_list(raw_improvements) if isinstance(item, dict)]
+    # gpt-4o-mini sometimes passes improvements as a numbered free-text string that
+    # isn't valid JSON; recover the structured items so ideas aren't dropped.
+    if not improvements and isinstance(raw_improvements, str) and raw_improvements.strip():
+        improvements = _parse_improvements_list(raw_improvements)
+    normalized["improvements"] = improvements
     research_insights = args.get("research_insights")
     if isinstance(research_insights, str):
         normalized["research_insights"] = research_insights
