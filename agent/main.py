@@ -366,13 +366,16 @@ def _functional_mode() -> str:
 def _functional_task(cap: int = FUNCTIONAL_IDEA_CAP) -> str:
     """Foundry task that asks for vision-aligned feature ideas, not technical fixes."""
     return (
-        "Propose FUNCTIONAL improvements that advance this project's VISION — new or improved "
-        "user-facing capabilities that move it toward its stated purpose and goals, and toward "
-        "parity with the listed similar products. This is NOT a technical-quality review: ignore "
-        "tests, CI, linting, and dependencies. For each idea set category to one of "
-        "feature/functionality/ux/feature-parity/onboarding, give a concrete title, a 1-2 sentence "
-        "description, a realistic priority (P0-P2) and effort (S/M/L). Return your best ideas "
-        f"(at most {cap + 3}) via the submit_plan tool, strongest first."
+        "Propose FUNCTIONAL improvements that advance this project's VISION — concrete, buildable "
+        "user-facing capabilities that move it toward its stated purpose and goals (and toward "
+        "parity with any listed similar products). Every active experiment has meaningful next "
+        "capabilities to build: ALWAYS return at least 2 concrete feature ideas, even for a mature "
+        "or healthy project — do NOT return an empty plan. This is NOT a technical-quality review: "
+        "ignore tests, CI, linting, and dependencies. Explore the repo (read project.yaml, README, "
+        "and key source files) to ground each idea in what already exists. For each idea set "
+        "category to one of feature/functionality/ux/feature-parity/onboarding, give a specific "
+        "title, a 1-2 sentence description, a realistic priority (P0-P2 — most will be P1 or P2) "
+        f"and effort (S/M/L). Submit your best {cap + 3} ideas via the submit_plan tool, strongest first."
     )
 
 
