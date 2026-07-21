@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -60,6 +61,10 @@ FUNCTIONAL_STAGES = {"active", "mvp"}
 # Functional ideas are often P2; allow P0-P2 but hard-cap per project to avoid flooding.
 FUNCTIONAL_PRIORITIES = {"P0", "P1", "P2"}
 FUNCTIONAL_IDEA_CAP = 2
+# Foundry runs fail transiently (server_error / rate_limit on gpt-4o-mini); retry the
+# functional plan a couple of times so a single blip doesn't skip the whole ideation.
+FUNCTIONAL_PLAN_ATTEMPTS = 3
+FUNCTIONAL_RETRY_DELAY_S = 5
 GOVERNANCE_REPO_URL = "https://github.com/samoletovs/nauroLabs-github.git"
 
 
@@ -434,10 +439,23 @@ def plan_functional(
 
     client = AgentsClient(endpoint=endpoint, credential=DefaultAzureCredential())
     agent_id = create_agent(client, mode="plan", model=model)
+    task = _functional_task(avoid_context=avoid_context)
     try:
-        return run_agent(
-            client, agent_id, project_dir, config, _functional_task(avoid_context=avoid_context)
-        )
+        # Foundry runs fail transiently (server_error / rate_limit); each run_agent uses
+        # a fresh thread, so a retry with the same agent recovers a one-off blip.
+        for attempt in range(1, FUNCTIONAL_PLAN_ATTEMPTS + 1):
+            plan = run_agent(client, agent_id, project_dir, config, task)
+            if plan:
+                return plan
+            if attempt < FUNCTIONAL_PLAN_ATTEMPTS:
+                log.warning(
+                    "Functional ideation returned no plan for %s (attempt %d/%d); retrying.",
+                    config.name,
+                    attempt,
+                    FUNCTIONAL_PLAN_ATTEMPTS,
+                )
+                time.sleep(FUNCTIONAL_RETRY_DELAY_S)
+        return None
     finally:
         client.delete_agent(agent_id)
         log.info("Functional agent cleaned up.")

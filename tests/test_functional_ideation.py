@@ -233,3 +233,58 @@ def test_handle_cards_routes_to_carder():
     )
     assert calls["titles"] == ["A", "B"]
     assert len(result) == 2
+
+
+# --- plan_functional transient-failure retry --------------------------------
+
+
+def _patch_functional_agent(monkeypatch, run_agent_impl):
+    """Wire plan_functional's Foundry dependencies to fakes (no real API calls)."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    fake_client = SimpleNamespace(delete_agent=MagicMock())
+    monkeypatch.setenv("FOUNDRY_PROJECT_ENDPOINT", "https://example.test")
+    monkeypatch.setattr(m.time, "sleep", lambda *_a, **_k: None)
+    monkeypatch.setattr("azure.ai.agents.AgentsClient", lambda **_k: fake_client)
+    monkeypatch.setattr("azure.identity.DefaultAzureCredential", lambda *_a, **_k: None)
+    monkeypatch.setattr("agent.foundry_agent.create_agent", lambda *_a, **_k: "agent-1")
+    monkeypatch.setattr("agent.foundry_agent.run_agent", run_agent_impl)
+    return fake_client
+
+
+def test_plan_functional_retries_on_transient_none(monkeypatch, tmp_path):
+    """A transient Foundry failure (run_agent -> None) is retried before giving up."""
+    from types import SimpleNamespace
+
+    calls = {"n": 0}
+    plan = {"improvements": [{"title": "X", "priority": "P1"}]}
+
+    def flaky(*_a, **_k):
+        calls["n"] += 1
+        return None if calls["n"] == 1 else plan  # fail once, then succeed
+
+    fake_client = _patch_functional_agent(monkeypatch, flaky)
+    result = m.plan_functional(tmp_path, SimpleNamespace(name="era"))
+
+    assert calls["n"] == 2  # retried once after the transient None
+    assert result == plan
+    fake_client.delete_agent.assert_called_once_with("agent-1")
+
+
+def test_plan_functional_gives_up_after_all_attempts(monkeypatch, tmp_path):
+    """When every attempt fails, plan_functional returns None and still cleans up."""
+    from types import SimpleNamespace
+
+    calls = {"n": 0}
+
+    def always_none(*_a, **_k):
+        calls["n"] += 1
+        return None
+
+    fake_client = _patch_functional_agent(monkeypatch, always_none)
+    result = m.plan_functional(tmp_path, SimpleNamespace(name="era"))
+
+    assert result is None
+    assert calls["n"] == m.FUNCTIONAL_PLAN_ATTEMPTS  # exhausted all attempts
+    fake_client.delete_agent.assert_called_once_with("agent-1")
