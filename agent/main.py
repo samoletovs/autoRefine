@@ -443,20 +443,32 @@ def plan_functional(
         log.info("Functional agent cleaned up.")
 
 
+def _normalize_priority(raw: object) -> str:
+    """Extract Pn from a messy priority string (e.g. '[P0 — Critical]' → 'P0'; default P2).
+
+    The Foundry agent sometimes returns free-text priorities; an exact 'P0'/'P1'/'P2'
+    match would drop every idea. A clean out-of-range value (e.g. 'P3') is preserved so
+    it still filters out; only an unrecognisable value defaults to P2.
+    """
+    match = re.search(r"P\s*(\d)", str(raw).upper())
+    return f"P{match.group(1)}" if match else "P2"
+
+
 def _select_functional_improvements(plan: dict) -> list[dict]:
-    """Pick the fileable functional ideas: allowed priority, deduped, hard-capped."""
+    """Pick the fileable functional ideas: normalized priority, deduped, hard-capped."""
     selected: list[dict] = []
     seen: set[str] = set()
     for improvement in plan.get("improvements", []):
         if not isinstance(improvement, dict):
             continue
-        priority = str(improvement.get("priority", "P2")).upper()
+        priority = _normalize_priority(improvement.get("priority"))
         if priority not in FUNCTIONAL_PRIORITIES:
             continue
         title = str(improvement.get("title", "")).strip()
         key = title.lower()
         if not title or key in seen:
             continue
+        improvement["priority"] = priority  # clean value for the card + memo
         seen.add(key)
         selected.append(improvement)
         if len(selected) >= FUNCTIONAL_IDEA_CAP:

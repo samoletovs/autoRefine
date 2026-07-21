@@ -75,6 +75,13 @@ def test_select_functional_excludes_out_of_range_priority():
     assert [i["title"] for i in selected] == ["ok"]
 
 
+def test_select_functional_normalizes_messy_priority():
+    plan = {"improvements": [{"title": "Dashboard", "priority": "[P0 — Critical]", "category": "feature"}]}
+    selected = m._select_functional_improvements(plan)
+    assert [i["title"] for i in selected] == ["Dashboard"]
+    assert selected[0]["priority"] == "P0"  # normalized for the card + memo
+
+
 # --- _format_functional_summary ---------------------------------------------
 
 
