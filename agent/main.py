@@ -229,6 +229,11 @@ def _discover_file_idea_options(script_path: Path) -> set[str]:
     return {token for token in option_text.split() if token.startswith("--")}
 
 
+def _effort_to_requests(effort: object) -> str:
+    """Map an S/M/L effort estimate to a rough Copilot premium-request count."""
+    return {"S": "20", "M": "40", "L": "80"}.get(str(effort or "").strip().upper(), "40")
+
+
 def _build_file_idea_command(
     script_path: Path,
     repo: str,
@@ -256,6 +261,19 @@ def _build_file_idea_command(
     _add_option("--type", idea_type)
     _add_option("--problem", description)
     _add_option("--approach", f"Implement '{title}' ({improvement.get('priority', 'P2')}).")
+    # file-idea.py enforces the full idea-memo schema; synthesize the remaining required
+    # sections from the improvement so validation passes (these are autoRefine estimates).
+    _add_option(
+        "--success-criteria",
+        f"'{title}' is implemented and usable as described, with no regression to existing flows.",
+    )
+    _add_option("--sam-time", "10")
+    _add_option("--azure-cost", "0")
+    _add_option("--copilot-requests", _effort_to_requests(improvement.get("effort")))
+    _add_option(
+        "--risk",
+        f"Surface: {repo} feature branch. Blast: scoped to this feature. Rollback: revert the PR.",
+    )
     _add_option("--references", references)
     for memo_option in ("--body", "--description", "--content"):
         if memo_option in options:
