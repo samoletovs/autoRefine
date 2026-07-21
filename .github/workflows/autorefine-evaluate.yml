@@ -67,6 +67,9 @@ jobs:
       - name: Run autoRefine
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
+          # Observe-first: propose functional ideas (log + Telegram, file NOTHING) until a
+          # human sets repo variable AUTOREFINE_FUNCTIONAL_MODE=file. See EVOLUTION.md §6.
+          AUTOREFINE_FUNCTIONAL_MODE: ${{ vars.AUTOREFINE_FUNCTIONAL_MODE || 'propose' }}
         run: |
           MODE="${{ github.event.inputs.mode || 'file-ideas' }}"
           REPO_FLAG=""

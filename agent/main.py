@@ -36,6 +36,29 @@ BUGFIX_CATEGORIES = {
     "reliability",
     "stability",
 }
+# Functional categories map to the `feature` idea type (vision / UX / capability gaps,
+# not defects). Used by _map_improvement_type for the observe-first functional pass.
+FEATURE_CATEGORIES = {
+    "feature",
+    "features",
+    "functionality",
+    "capability",
+    "ux",
+    "ui",
+    "user-experience",
+    "onboarding",
+    "feature-parity",
+    "parity",
+    "i18n",
+    "internationalization",
+    "a11y",
+    "accessibility",
+}
+# Observe-first functional ideation only runs for these project stages (active work).
+FUNCTIONAL_STAGES = {"active", "mvp"}
+# Functional ideas are often P2; allow P0-P2 but hard-cap per project to avoid flooding.
+FUNCTIONAL_PRIORITIES = {"P0", "P1", "P2"}
+FUNCTIONAL_IDEA_CAP = 2
 GOVERNANCE_REPO_URL = "https://github.com/samoletovs/nauroLabs-github.git"
 
 
@@ -131,7 +154,11 @@ def _priority_in_scope(priority: str, allowed: set[str] | None = None) -> bool:
 
 def _map_improvement_type(category: str) -> str:
     normalized = category.strip().lower()
-    return "bugfix" if normalized in BUGFIX_CATEGORIES else "refactor"
+    if normalized in BUGFIX_CATEGORIES:
+        return "bugfix"
+    if normalized in FEATURE_CATEGORIES:
+        return "feature"
+    return "refactor"
 
 
 def _build_run_references() -> str:
@@ -316,6 +343,142 @@ def file_ideas_for_plan(
             )
 
     return filed
+
+
+# ── Functional (vision-aligned) ideation — observe-first ───────────────────
+# The technical pass above optimizes code quality. This pass optimizes each project's
+# north-star (EVOLUTION.md §4): it asks the Foundry agent for *feature* gaps vs the
+# project's purpose/goals and its listed similar products.
+#
+# Gated by AUTOREFINE_FUNCTIONAL_MODE (off | propose | file), default "off":
+#   - propose: log the proposed ideas + a Telegram summary, file NOTHING (observe-first).
+#   - file:    file them as `idea` + `feature` memos (capped), feeding the build loop.
+# The workflow defaults to "propose" so a human reviews the first batches before anything
+# auto-builds (EVOLUTION.md §6 guardrails / DGM anti-reward-hacking).
+
+
+def _functional_mode() -> str:
+    """Read the observe-first gate: off | propose | file (default off; unknown → off)."""
+    mode = os.environ.get("AUTOREFINE_FUNCTIONAL_MODE", "off").strip().lower()
+    return mode if mode in {"off", "propose", "file"} else "off"
+
+
+def _functional_task(cap: int = FUNCTIONAL_IDEA_CAP) -> str:
+    """Foundry task that asks for vision-aligned feature ideas, not technical fixes."""
+    return (
+        "Propose FUNCTIONAL improvements that advance this project's VISION — new or improved "
+        "user-facing capabilities that move it toward its stated purpose and goals, and toward "
+        "parity with the listed similar products. This is NOT a technical-quality review: ignore "
+        "tests, CI, linting, and dependencies. For each idea set category to one of "
+        "feature/functionality/ux/feature-parity/onboarding, give a concrete title, a 1-2 sentence "
+        "description, a realistic priority (P0-P2) and effort (S/M/L). Return your best ideas "
+        f"(at most {cap + 3}) via the submit_plan tool, strongest first."
+    )
+
+
+def plan_functional(
+    project_dir: Path,
+    config: ProjectConfig,
+    model: str | None = None,
+) -> dict | None:
+    """Run the Foundry plan agent with a functional/vision focus. Returns a plan or None."""
+    endpoint = os.environ.get("FOUNDRY_PROJECT_ENDPOINT", "")
+    if not endpoint:
+        log.error("FOUNDRY_PROJECT_ENDPOINT not set — cannot run functional ideation.")
+        return None
+
+    from azure.ai.agents import AgentsClient
+    from azure.identity import DefaultAzureCredential
+
+    from agent.foundry_agent import create_agent, run_agent
+
+    client = AgentsClient(endpoint=endpoint, credential=DefaultAzureCredential())
+    agent_id = create_agent(client, mode="plan", model=model)
+    try:
+        return run_agent(client, agent_id, project_dir, config, _functional_task())
+    finally:
+        client.delete_agent(agent_id)
+        log.info("Functional agent cleaned up.")
+
+
+def _select_functional_improvements(plan: dict) -> list[dict]:
+    """Pick the fileable functional ideas: allowed priority, deduped, hard-capped."""
+    selected: list[dict] = []
+    seen: set[str] = set()
+    for improvement in plan.get("improvements", []):
+        if not isinstance(improvement, dict):
+            continue
+        priority = str(improvement.get("priority", "P2")).upper()
+        if priority not in FUNCTIONAL_PRIORITIES:
+            continue
+        title = str(improvement.get("title", "")).strip()
+        key = title.lower()
+        if not title or key in seen:
+            continue
+        seen.add(key)
+        selected.append(improvement)
+        if len(selected) >= FUNCTIONAL_IDEA_CAP:
+            break
+    return selected
+
+
+def _format_functional_summary(repo: str, improvements: list[dict]) -> str:
+    """Human-readable summary of proposed functional ideas (for logs + Telegram)."""
+    lines = [f"🌱 autoRefine functional ideas (PROPOSE-only) — {repo}"]
+    for improvement in improvements:
+        priority = str(improvement.get("priority", "P2")).upper()
+        title = str(improvement.get("title", "Untitled")).strip()
+        lines.append(f"• [{priority}] {title}")
+    lines.append("Set repo variable AUTOREFINE_FUNCTIONAL_MODE=file to start filing these as idea memos.")
+    return "\n".join(lines)
+
+
+def _notify_functional(summary: str) -> None:
+    """Best-effort Telegram notification (no-op if creds / module absent)."""
+    try:
+        from agent.notify import send_telegram
+
+        send_telegram(summary)
+    except Exception:  # pragma: no cover — notify is best-effort
+        log.info("Telegram notify unavailable; functional summary logged only.")
+
+
+def handle_functional_ideas(
+    repo: str,
+    plan: dict,
+    mode: str,
+    dry_run: bool = False,
+    *,
+    notifier=None,
+    filer=None,
+) -> list[dict]:
+    """Route selected functional ideas per the observe-first gate. Returns the selection.
+
+    ``propose`` logs + notifies and files nothing; ``file`` files capped `feature` memos.
+    ``notifier`` / ``filer`` are injectable for tests.
+    """
+    selected = _select_functional_improvements(plan)
+    if not selected:
+        log.info("No functional ideas selected for %s", repo)
+        return []
+
+    if mode == "propose":
+        summary = _format_functional_summary(repo, selected)
+        log.info("Functional ideas (PROPOSE — not filed) for %s:\n%s", repo, summary)
+        (notifier or _notify_functional)(summary)
+        return selected
+
+    if mode == "file":
+        (filer or file_ideas_for_plan)(
+            repo,
+            {"improvements": selected},
+            dry_run=dry_run,
+            allowed_priorities=FUNCTIONAL_PRIORITIES,
+        )
+        log.info("Filed %d functional idea(s) for %s", len(selected), repo)
+        return selected
+
+    return []
 
 
 def refine_project(
@@ -587,12 +750,21 @@ def main() -> None:
         elif config.mode == "file-ideas":
             print(json.dumps(report, indent=2))
             plan = plan_project(project_dir, project_config, report["findings"])
-            if not plan:
-                log.warning("No plan generated for %s — skipping idea filing", name)
-                continue
+            if plan:
+                filed_count = file_ideas_for_plan(repo, plan, dry_run=config.dry_run)
+                log.info("Filed %d technical ideas for %s", filed_count, name)
+            else:
+                log.warning("No technical plan generated for %s", name)
 
-            filed_count = file_ideas_for_plan(repo, plan, dry_run=config.dry_run)
-            log.info("Filed %d ideas for %s", filed_count, name)
+            # Observe-first functional ideation (default off; workflow sets 'propose').
+            fmode = _functional_mode()
+            if fmode != "off" and project_config.stage in FUNCTIONAL_STAGES:
+                log.info("Functional ideation (%s) for %s...", fmode, name)
+                fplan = plan_functional(project_dir, project_config, model=config.model)
+                if fplan:
+                    handle_functional_ideas(repo, fplan, mode=fmode, dry_run=config.dry_run)
+                else:
+                    log.warning("No functional plan generated for %s", name)
 
     log.info("autoRefine complete.")
 
