@@ -1,0 +1,76 @@
+name: "autoRefine — PR approval cards"
+
+# Sweeps open Copilot PRs across all projects and, once a PR is ready (not a draft) and
+# its CI is green, sends a Telegram card with [✅ Approve & merge] [❌ Close]. nauroBot turns
+# a 👍 tap into an approve + squash-merge and a 👎 into a close. This is the PR half of the
+# idea → build → merge loop; the idea half lives in autorefine-evaluate.yml.
+#
+# Near-read-only: the only write is a `pr-card-sent` label so a PR is carded once. The
+# approve/merge happens in nauroBot on the tap, so this needs only a PAT + the bot secrets.
+#
+# Required secrets: GH_PAT (cross-repo PR read + label write), NAURO_BOT_TOKEN, NAURO_CHAT_ID.
+
+on:
+  schedule:
+    # Hourly during waking hours (UTC). Most runs are no-ops; a card is only sent when a
+    # ready, green Copilot PR appears — so the cost is a cheap gh query + pip cache hit.
+    - cron: '0 6-22 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pr-cards:
+    runs-on: ubuntu-latest
+    # Skip scheduled runs when the budget tier is "critical" (manual dispatch still works).
+    if: vars.AUTOREFINE_TIER != 'critical' || github.event_name == 'workflow_dispatch'
+    env:
+      NAURO_BOT_TOKEN: ${{ secrets.NAURO_BOT_TOKEN }}
+      NAURO_CHAT_ID: ${{ secrets.NAURO_CHAT_ID }}
+    steps:
+      - name: Checkout autoRefine
+        uses: actions/checkout@v5
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+      - name: Checkout governance (for manifest)
+        uses: actions/checkout@v5
+        with:
+          repository: samoletovs/nauroLabs-github
+          path: .github-gov
+          token: ${{ secrets.GH_PAT }}
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: "pip"
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Sweep and card ready Copilot PRs
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          python -m agent.main \
+            --manifest .github-gov/config/workspace-manifest.json \
+            --mode pr-cards
+
+      - name: Failure notification
+        if: failure()
+        run: |
+          if [ -z "$NAURO_BOT_TOKEN" ] || [ -z "$NAURO_CHAT_ID" ]; then
+            echo "NAURO_BOT_TOKEN or NAURO_CHAT_ID not set; skipping"
+            exit 0
+          fi
+          curl -sf -X POST "https://api.telegram.org/bot${NAURO_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${NAURO_CHAT_ID}" \
+            --data-urlencode "parse_mode=HTML" \
+            --data-urlencode "text=❌ <b>autoRefine pr-cards</b> failed — see the Actions log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            || echo "::warning::Telegram failure notification did not send"

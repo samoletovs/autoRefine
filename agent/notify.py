@@ -143,3 +143,67 @@ def send_idea_card(
     except httpx.HTTPError as e:
         log.warning("Idea card send error: %s", e)
         return False
+
+
+def send_pr_card(
+    repo: str,
+    pr_number: int,
+    title: str,
+    *,
+    pr_url: str = "",
+    bot_token: str | None = None,
+    chat_id: str | None = None,
+) -> bool:
+    """Send a PR-approval card with ✅ Approve & merge / ❌ Close buttons.
+
+    Sent by the pr-cards sweep once a Copilot PR is ready and its CI is green. The buttons
+    carry ``arfpr:<repo>:<num>:y|n`` and the text echoes ``arfpr:<repo>:<num>`` — a distinct
+    namespace from the idea card's ``arf:`` — so nauroBot attributes a tap to the PR and
+    never confuses it with an idea. ``repo`` may be ``OWNER/NAME`` or a bare name; only the
+    bare name is encoded (nauroBot prepends the owner). Returns True if delivered, False if
+    skipped or failed. Never raises.
+    """
+    token = bot_token or os.environ.get("NAURO_BOT_TOKEN", "")
+    chat = chat_id or os.environ.get("NAURO_CHAT_ID", "")
+
+    if not token or not chat:
+        log.warning("NAURO_BOT_TOKEN or NAURO_CHAT_ID missing — skipping PR card")
+        return False
+
+    name = repo.split("/")[-1]
+    lines = [f"✅ PR ready — {name} #{pr_number}", title]
+    if pr_url:
+        lines.append(pr_url)
+    lines.append("CI is green · 👍 approves + squash-merges, 👎 closes")
+    lines.append(f"arfpr:{name}:{pr_number}")
+
+    payload = {
+        "chat_id": chat,
+        "text": _truncate("\n".join(lines)),
+        "disable_web_page_preview": True,
+        "reply_markup": {
+            "inline_keyboard": [[
+                {"text": "✅ Approve & merge", "callback_data": f"arfpr:{name}:{pr_number}:y"},
+                {"text": "❌ Close", "callback_data": f"arfpr:{name}:{pr_number}:n"},
+            ]],
+        },
+    }
+
+    send_url = f"https://api.telegram.org/bot{token}/sendMessage"
+
+    try:
+        with httpx.Client(timeout=15) as client:
+            resp = client.post(send_url, json=payload)
+            if resp.status_code == 200:
+                return True
+            if 500 <= resp.status_code < 600:
+                resp = client.post(send_url, json=payload)
+                if resp.status_code == 200:
+                    return True
+            log.warning(
+                "PR card send failed: HTTP %d %s", resp.status_code, resp.text[:200]
+            )
+            return False
+    except httpx.HTTPError as e:
+        log.warning("PR card send error: %s", e)
+        return False

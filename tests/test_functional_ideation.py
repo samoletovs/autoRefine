@@ -64,8 +64,8 @@ def test_select_functional_caps_and_dedupes():
     plan = _plan(("A", "P1"), ("A", "P1"), ("B", "P2"), ("C", "P1"))
     # Act
     selected = m._select_functional_improvements(plan)
-    # Assert — 'A' deduped, capped at FUNCTIONAL_IDEA_CAP (2)
-    assert [i["title"] for i in selected] == ["A", "B"]
+    # Assert — 'A' deduped, capped at FUNCTIONAL_IDEA_CAP (1 idea per project per day)
+    assert [i["title"] for i in selected] == ["A"]
     assert len(selected) == m.FUNCTIONAL_IDEA_CAP
 
 
@@ -128,10 +128,10 @@ def test_handle_file_files_capped_selection_with_priorities():
     result = m.handle_functional_ideas(
         "samoletovs/era", plan, mode="file", filer=fake_filer, notifier=lambda s: None
     )
-    # Assert — filed the capped selection with the functional priority set
-    assert captured["titles"] == ["A", "B"]
+    # Assert — filed the capped selection (1 idea/project/day) with the functional priorities
+    assert captured["titles"] == ["A"]
     assert captured["priorities"] == m.FUNCTIONAL_PRIORITIES
-    assert len(result) == 2
+    assert len(result) == 1
 
 
 def test_handle_empty_selection_is_a_noop():
@@ -231,8 +231,8 @@ def test_handle_cards_routes_to_carder():
     result = m.handle_functional_ideas(
         "samoletovs/era", plan, mode="cards", carder=fake_carder, notifier=lambda s: None
     )
-    assert calls["titles"] == ["A", "B"]
-    assert len(result) == 2
+    assert calls["titles"] == ["A"]
+    assert len(result) == 1
 
 
 # --- plan_functional transient-failure retry --------------------------------

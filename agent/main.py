@@ -58,9 +58,10 @@ FEATURE_CATEGORIES = {
 }
 # Observe-first functional ideation only runs for these project stages (active work).
 FUNCTIONAL_STAGES = {"active", "mvp"}
-# Functional ideas are often P2; allow P0-P2 but hard-cap per project to avoid flooding.
+# Functional ideas are often P2; allow P0-P2 but hard-cap to 1 per project per daily run
+# (the evaluate workflow runs once/day), so each project surfaces at most one idea card/day.
 FUNCTIONAL_PRIORITIES = {"P0", "P1", "P2"}
-FUNCTIONAL_IDEA_CAP = 2
+FUNCTIONAL_IDEA_CAP = 1
 # Foundry runs fail transiently (server_error / rate_limit on gpt-4o-mini); retry the
 # functional plan a couple of times so a single blip doesn't skip the whole ideation.
 FUNCTIONAL_PLAN_ATTEMPTS = 3
@@ -859,7 +860,7 @@ def main() -> None:
     parser.add_argument("--manifest", type=str, help="Path to workspace-manifest.json")
     parser.add_argument(
         "--mode",
-        choices=["evaluate", "plan", "file-ideas", "refine", "health-scan"],
+        choices=["evaluate", "plan", "file-ideas", "refine", "health-scan", "pr-cards"],
         default="evaluate",
     )
     parser.add_argument(
@@ -900,6 +901,15 @@ def main() -> None:
         log.info("autoRefine starting — mode=health-scan, %d repos", len(repos))
         run_health_scan_mode(repos, assign_copilot=not args.no_copilot_assign)
         log.info("autoRefine complete.")
+        return
+    # pr-cards mode also short-circuits the clone loop: it only talks to GitHub + Telegram,
+    # carding ready + CI-green Copilot PRs for one-tap approval (nauroBot does the merge).
+    if args.mode == "pr-cards":
+        from agent.pr_cards import sweep_pr_cards
+
+        log.info("autoRefine starting — mode=pr-cards, %d repos", len(repos))
+        carded = sweep_pr_cards(repos, dry_run=args.dry_run)
+        log.info("autoRefine complete — carded %d PR(s).", carded)
         return
     if args.mode == "refine":
         log.warning(

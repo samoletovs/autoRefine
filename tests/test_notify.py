@@ -162,3 +162,50 @@ def test_idea_card_callback_data_within_telegram_limit(monkeypatch: pytest.Monke
     _, kwargs = client_instance.post.call_args
     for button in kwargs["json"]["reply_markup"]["inline_keyboard"][0]:
         assert len(button["callback_data"].encode("utf-8")) <= 64
+
+
+# --- send_pr_card -----------------------------------------------------------
+
+
+def test_pr_card_skipped_without_creds() -> None:
+    assert notify.send_pr_card("samoletovs/era", 42, "Add CSV export") is False
+
+
+def test_pr_card_encodes_arfpr_buttons_and_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("NAURO_BOT_TOKEN", "tok")
+    monkeypatch.setenv("NAURO_CHAT_ID", "999")
+
+    with patch("agent.notify.httpx.Client") as mock_client_cls:
+        client_instance = mock_client_cls.return_value.__enter__.return_value
+        client_instance.post.return_value = MagicMock(status_code=200)
+
+        result = notify.send_pr_card(
+            "samoletovs/era", 42, "Add CSV export",
+            pr_url="https://github.com/samoletovs/era/pull/42",
+        )
+
+    assert result is True
+    _, kwargs = client_instance.post.call_args
+    payload = kwargs["json"]
+    buttons = payload["reply_markup"]["inline_keyboard"][0]
+    # A distinct arfpr: namespace so nauroBot never confuses a PR tap with an idea tap.
+    assert buttons[0]["callback_data"] == "arfpr:era:42:y"
+    assert buttons[1]["callback_data"] == "arfpr:era:42:n"
+    assert "arfpr:era:42" in payload["text"]
+    assert "Add CSV export" in payload["text"]
+    assert "https://github.com/samoletovs/era/pull/42" in payload["text"]
+
+
+def test_pr_card_callback_data_within_telegram_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("NAURO_BOT_TOKEN", "tok")
+    monkeypatch.setenv("NAURO_CHAT_ID", "999")
+
+    with patch("agent.notify.httpx.Client") as mock_client_cls:
+        client_instance = mock_client_cls.return_value.__enter__.return_value
+        client_instance.post.return_value = MagicMock(status_code=200)
+
+        notify.send_pr_card("samoletovs/portaBaltica", 99999, "x" * 200)
+
+    _, kwargs = client_instance.post.call_args
+    for button in kwargs["json"]["reply_markup"]["inline_keyboard"][0]:
+        assert len(button["callback_data"].encode("utf-8")) <= 64
