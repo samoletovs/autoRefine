@@ -563,6 +563,27 @@ def _file_one_idea(
     return run.stdout.strip()
 
 
+def _has_open_idea_card(repo: str) -> bool:
+    """True if ``repo`` already has an un-acted idea card (open issue + ``needs-approval``).
+
+    Keeps the cards flow to one pending card per project: a manual evaluate run plus the
+    daily cron — which GitHub often delays by hours — won't stack a second un-acted card,
+    and fresh ideas resume once you 👍/👎 the last one (which clears ``needs-approval``).
+    Best-effort: any gh failure returns False so ideation is never blocked by a hiccup.
+    """
+    try:
+        out = subprocess.run(
+            ["gh", "issue", "list", "--repo", repo, "--label", "needs-approval",
+             "--state", "open", "--json", "number", "--limit", "5"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if out.returncode != 0:
+            return False
+        return len(json.loads(out.stdout or "[]")) > 0
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+
 def file_and_card_functional_ideas(
     repo: str,
     improvements: list[dict],
@@ -706,6 +727,13 @@ def handle_functional_ideas(
         return selected
 
     if mode == "cards":
+        if not dry_run and _has_open_idea_card(repo):
+            log.info(
+                "%s already has an open idea card awaiting 👍/👎 — skipping to keep one "
+                "pending card per project (a manual run + the delayed daily cron won't double).",
+                repo,
+            )
+            return selected
         carded = (carder or file_and_card_functional_ideas)(repo, selected, dry_run=dry_run)
         log.info("Sent %d idea approval card(s) for %s", carded, repo)
         return selected

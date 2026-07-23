@@ -219,7 +219,8 @@ def test_file_and_card_skips_when_filing_fails(monkeypatch):
     assert count == 0 and not carded
 
 
-def test_handle_cards_routes_to_carder():
+def test_handle_cards_routes_to_carder(monkeypatch):
+    monkeypatch.setattr(m, "_has_open_idea_card", lambda repo: False)
     plan = _plan(("A", "P1"), ("B", "P2"))
     calls: dict = {}
 
@@ -233,6 +234,23 @@ def test_handle_cards_routes_to_carder():
     )
     assert calls["titles"] == ["A"]
     assert len(result) == 1
+
+
+def test_handle_cards_skips_when_open_card_exists(monkeypatch):
+    # An un-acted card already exists → don't stack a second one (guards a manual run +
+    # the delayed daily cron from double-filing).
+    monkeypatch.setattr(m, "_has_open_idea_card", lambda repo: True)
+    plan = _plan(("A", "P1"))
+    called = {"n": 0}
+
+    def fake_carder(repo, selected, dry_run=False):
+        called["n"] += 1
+        return len(selected)
+
+    m.handle_functional_ideas(
+        "samoletovs/era", plan, mode="cards", carder=fake_carder, notifier=lambda s: None
+    )
+    assert called["n"] == 0
 
 
 # --- plan_functional transient-failure retry --------------------------------
