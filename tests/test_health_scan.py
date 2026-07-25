@@ -16,6 +16,72 @@ import pytest
 from agent import health_scan
 
 
+# ── improvement tracking dashboard ──────────────────────────────────────────
+def test_build_improvement_items_tracks_status_and_actions() -> None:
+    items = health_scan._build_improvement_items(
+        [
+            {
+                "title": "[idea] Add dashboard",
+                "body": "### Source\n\nautorefine",
+                "state": "open",
+                "labels": [{"name": "idea"}, {"name": "approved"}],
+                "assignees": [{"login": "Copilot"}],
+                "comments": 1,
+                "html_url": "https://github.com/samoletovs/era/issues/1",
+            },
+            {
+                "title": "[idea] Old decline",
+                "body": "### Source\n\nautorefine",
+                "state": "closed",
+                "labels": [{"name": "idea"}, {"name": "declined"}],
+                "assignees": [],
+                "comments": 0,
+                "html_url": "https://github.com/samoletovs/era/issues/2",
+            },
+        ]
+    )
+
+    assert items == [
+        {
+            "title": "Add dashboard",
+            "status": "in progress",
+            "actions": "approved, assigned to Copilot, 1 comment",
+            "url": "https://github.com/samoletovs/era/issues/1",
+        },
+        {
+            "title": "Old decline",
+            "status": "declined",
+            "actions": "declined",
+            "url": "https://github.com/samoletovs/era/issues/2",
+        },
+    ]
+
+
+def test_build_improvement_items_ignores_non_autorefine_ideas() -> None:
+    items = health_scan._build_improvement_items(
+        [
+            {
+                "title": "Plain issue",
+                "body": "not an idea memo",
+                "state": "open",
+                "labels": [{"name": "bug"}],
+                "assignees": [],
+                "comments": 0,
+            },
+            {
+                "title": "[idea] Manual idea",
+                "body": "source: human",
+                "state": "open",
+                "labels": [{"name": "idea"}],
+                "assignees": [],
+                "comments": 0,
+            },
+        ]
+    )
+
+    assert items == []
+
+
 # ── build_telegram_summary ────────────────────────────────────────────────
 def test_build_summary_minimal() -> None:
     report = "# NauroLabs Health Report\n\n## Project Health\n"
@@ -122,6 +188,7 @@ def test_generate_report_includes_project_table() -> None:
             "open_prs": 0,
             "commits_7d": 5,
             "ci_status": "success",
+            "recent_ideas": [],
         }
     }
     cost_data: dict[str, Any] = {
@@ -143,6 +210,35 @@ def test_generate_report_includes_project_table() -> None:
     assert "$12.5" in report
     assert "rg-era" in report
     assert "test rec" in report
+
+
+def test_generate_report_includes_improvement_tracking_table() -> None:
+    report = health_scan.generate_report(
+        github_data={
+            "era": {
+                "open_issues": 1,
+                "bug_count": 0,
+                "open_prs": 1,
+                "commits_7d": 2,
+                "ci_status": "success",
+                "recent_ideas": [
+                    {
+                        "title": "Add dashboard",
+                        "status": "in progress",
+                        "actions": "approved, assigned to Copilot",
+                        "url": "https://github.com/samoletovs/era/issues/1",
+                    }
+                ],
+            }
+        },
+        cost_data={"total": 5, "projected": 10, "budget": 150, "remaining": 145, "by_resource_group": {}},
+        analysis={"health_scores": {"era": {"R": 4, "L": 4, "M": 4, "health": 12}}},
+    )
+
+    assert "## Improvement Tracking" in report
+    assert "[Add dashboard](https://github.com/samoletovs/era/issues/1)" in report
+    assert "| era |" in report
+    assert "approved, assigned to Copilot" in report
 
 
 def test_generate_report_handles_missing_cost() -> None:

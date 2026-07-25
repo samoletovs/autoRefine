@@ -104,6 +104,94 @@ def _build_repo_resource_groups(manifest: dict[str, Any]) -> dict[str, str]:
 
 
 # ── GitHub Scanner ─────────────────────────────────────────────────────────
+def _label_names(issue: dict[str, Any]) -> set[str]:
+    return {
+        str(label.get("name", "")).strip().lower()
+        for label in issue.get("labels", [])
+        if isinstance(label, dict)
+    }
+
+
+def _assignee_logins(issue: dict[str, Any]) -> set[str]:
+    return {
+        str(assignee.get("login", "")).strip().lower()
+        for assignee in issue.get("assignees", [])
+        if isinstance(assignee, dict)
+    }
+
+
+def _is_autorefine_idea(issue: dict[str, Any]) -> bool:
+    """True when the issue is an autoRefine-generated idea memo."""
+    if "pull_request" in issue:
+        return False
+
+    labels = _label_names(issue)
+    if "idea" not in labels:
+        return False
+
+    body = str(issue.get("body", "")).strip().lower()
+    return "autopilot" in labels or ("source" in body and "autorefine" in body)
+
+
+def _improvement_status(issue: dict[str, Any]) -> str:
+    """Map a tracked idea issue to a concise dashboard status."""
+    labels = _label_names(issue)
+    assignees = _assignee_logins(issue)
+    state = str(issue.get("state", "")).lower()
+
+    if state == "closed":
+        return "declined" if "declined" in labels else "completed"
+    if "needs-approval" in labels:
+        return "awaiting approval"
+    if "approved" in labels or any("copilot" in login for login in assignees):
+        return "in progress"
+    return "proposed"
+
+
+def _improvement_actions(issue: dict[str, Any]) -> str:
+    """Summarize the visible actions taken on an idea issue."""
+    labels = _label_names(issue)
+    assignees = _assignee_logins(issue)
+    state = str(issue.get("state", "")).lower()
+    actions: list[str] = []
+
+    if "approved" in labels:
+        actions.append("approved")
+    if any("copilot" in login for login in assignees):
+        actions.append("assigned to Copilot")
+    if "needs-approval" in labels:
+        actions.append("awaiting Telegram decision")
+    if "declined" in labels:
+        actions.append("declined")
+    elif state == "closed":
+        actions.append("closed")
+
+    comments = int(issue.get("comments") or 0)
+    if comments > 0:
+        actions.append(f"{comments} comment{'s' if comments != 1 else ''}")
+
+    return ", ".join(actions) if actions else "—"
+
+
+def _build_improvement_items(issues: list[dict[str, Any]], limit: int = 5) -> list[dict[str, str]]:
+    """Normalize recent autoRefine ideas for dashboard rendering."""
+    items: list[dict[str, str]] = []
+    for issue in issues:
+        if not _is_autorefine_idea(issue):
+            continue
+        items.append(
+            {
+                "title": str(issue.get("title", "")).replace("[idea]", "").strip(),
+                "status": _improvement_status(issue),
+                "actions": _improvement_actions(issue),
+                "url": str(issue.get("html_url", "")).strip(),
+            }
+        )
+        if len(items) >= limit:
+            break
+    return items
+
+
 def scan_github(token: str, repos: list[str]) -> dict[str, Any]:
     """Scan each repo for issues, PRs, recent commits and CI status."""
     headers = {
@@ -141,6 +229,17 @@ def scan_github(token: str, repos: list[str]) -> dict[str, Any]:
             except httpx.HTTPError as e:
                 log.warning("Failed to fetch issues for %s: %s", repo, e)
                 repo_data["open_issues"] = -1
+
+            try:
+                resp = client.get(
+                    f"https://api.github.com/repos/{full_name}/issues",
+                    params={"state": "all", "labels": "idea", "sort": "updated", "direction": "desc", "per_page": 10},
+                )
+                resp.raise_for_status()
+                repo_data["recent_ideas"] = _build_improvement_items(resp.json())
+            except httpx.HTTPError as e:
+                log.warning("Failed to fetch tracked ideas for %s: %s", repo, e)
+                repo_data["recent_ideas"] = []
 
             try:
                 resp = client.get(
@@ -573,6 +672,21 @@ def generate_report(
             f"| {s.get('health', '?')} |"
         )
     report.append("")
+
+    if any(data.get("recent_ideas") for data in github_data.values()):
+        report.append("## Improvement Tracking\n")
+        report.append("| Project | Suggestion | Status | Actions |")
+        report.append("|---------|------------|--------|---------|")
+        for repo, data in github_data.items():
+            for item in data.get("recent_ideas", []):
+                title = item.get("title", "Untitled improvement")
+                url = item.get("url", "")
+                suggestion = f"[{title}]({url})" if url else title
+                report.append(
+                    f"| {repo} | {suggestion} | {item.get('status', 'proposed')} "
+                    f"| {item.get('actions', '—')} |"
+                )
+        report.append("")
 
     report.append("## Azure Costs\n")
     if cost_data.get("total", -1) >= 0:
