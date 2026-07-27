@@ -68,7 +68,7 @@ def test_load_config_reads_project_yaml(tmp_path: Path) -> None:
     assert loaded.quality == ["tests"]
 
 
-@pytest.mark.parametrize("mode", ["evaluate", "plan", "refine", "health-scan"])
+@pytest.mark.parametrize("mode", ["evaluate", "plan", "refine", "health-scan", "dashboard"])
 def test_main_accepts_valid_modes(
     tmp_path: Path, project_config: ProjectConfig, mode: str
 ) -> None:
@@ -89,6 +89,7 @@ def test_main_accepts_valid_modes(
         patch("agent.main.plan_project", return_value={"improvements": [], "score": 100}),
         patch("agent.main.refine_project", return_value=False),
         patch("agent.main.run_health_scan_mode"),
+        patch("agent.main.run_dashboard_mode"),
         patch("builtins.print"),
     ):
         main()

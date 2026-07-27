@@ -924,13 +924,56 @@ def run_health_scan_mode(repos: list[str], assign_copilot: bool = True) -> None:
     print(json.dumps(summary, indent=2))
 
 
+def run_dashboard_mode(repos: list[str], output: str = "dashboard.html") -> None:
+    """Run the health-scan pipeline and write an HTML dashboard to *output*.
+
+    The dashboard renders the same data as the Markdown health report but as a
+    browser-ready HTML file with colour-coded health scores and cost indicators.
+    """
+    from agent.dashboard import render_html_dashboard
+    from agent.health_scan import (
+        analyze_with_ai,
+        check_deployed_urls,
+        generate_report,
+        scan_app_insights,
+        scan_azure_costs,
+        scan_github,
+    )
+
+    github_token = os.environ.get("GH_TOKEN", "") or os.environ.get("GITHUB_TOKEN", "")
+    if not github_token:
+        log.error("GH_TOKEN environment variable not set — cannot run dashboard mode.")
+        sys.exit(1)
+
+    short_repos = [r.split("/")[-1] for r in repos]
+
+    log.info("Dashboard: scanning %d repos", len(short_repos))
+    github_data = scan_github(github_token, short_repos)
+    cost_data = scan_azure_costs()
+    app_insights_data = scan_app_insights()
+    url_health_data = check_deployed_urls()
+    analysis = analyze_with_ai(github_data, cost_data, app_insights_data, url_health_data)
+
+    html = render_html_dashboard(
+        github_data, cost_data, analysis, app_insights_data, url_health_data
+    )
+    out_path = Path(output)
+    out_path.write_text(html, encoding="utf-8")
+    log.info("Dashboard written to %s (%d bytes)", out_path, len(html))
+    print(f"Dashboard saved: {out_path}")
+
+    # Also print the Markdown report summary to stdout for CI logs.
+    report = generate_report(github_data, cost_data, analysis, app_insights_data, url_health_data)
+    print(report)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="autoRefine — project improvement agent")
     parser.add_argument("--repo", type=str, help="Single repo (owner/name)")
     parser.add_argument("--manifest", type=str, help="Path to workspace-manifest.json")
     parser.add_argument(
         "--mode",
-        choices=["evaluate", "plan", "file-ideas", "refine", "health-scan", "pr-cards"],
+        choices=["evaluate", "plan", "file-ideas", "refine", "health-scan", "pr-cards", "dashboard"],
         default="evaluate",
     )
     parser.add_argument(
@@ -948,6 +991,11 @@ def main() -> None:
         "--no-copilot-assign",
         action="store_true",
         help="Disable automatic Copilot assignment for health-scan-created issues",
+    )
+    parser.add_argument(
+        "--output",
+        default="dashboard.html",
+        help="Output file path for dashboard mode (default: dashboard.html)",
     )
     args = parser.parse_args()
     if args.repo is not None and not _is_valid_repo_slug(args.repo):
@@ -980,6 +1028,12 @@ def main() -> None:
         log.info("autoRefine starting — mode=pr-cards, %d repos", len(repos))
         carded = sweep_pr_cards(repos, dry_run=args.dry_run)
         log.info("autoRefine complete — carded %d PR(s).", carded)
+        return
+    # dashboard mode: run health-scan pipeline then emit an HTML dashboard file.
+    if args.mode == "dashboard":
+        log.info("autoRefine starting — mode=dashboard, %d repos", len(repos))
+        run_dashboard_mode(repos, output=args.output)
+        log.info("autoRefine complete.")
         return
     if args.mode == "refine":
         log.warning(
