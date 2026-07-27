@@ -82,6 +82,7 @@ def evaluate_project(project_dir: Path, config: ProjectConfig) -> dict:
 
     # Technical quality checks (deterministic)
     findings = run_quality_checks(str(project_dir), config)
+    feature_suggestions = suggest_feature_improvements(config)
 
     report = {
         "project": config.name,
@@ -91,13 +92,54 @@ def evaluate_project(project_dir: Path, config: ProjectConfig) -> dict:
             for f in findings
         ],
         "score": max(0, 100 - sum(f.weight for f in findings)),
+        "feature_suggestions": feature_suggestions,
     }
 
     log.info(
-        "Evaluation complete: %s — score %d/100, %d findings",
+        "Evaluation complete: %s — score %d/100, %d findings, %d feature suggestions",
         config.name, report["score"], len(findings),
+        len(feature_suggestions),
     )
     return report
+
+
+def suggest_feature_improvements(config: ProjectConfig) -> list[dict]:
+    """Suggest potential functional improvements from project.yaml goals + similar products."""
+    suggestions: list[dict] = []
+
+    for goal in config.goals[:2]:
+        goal_text = str(goal).strip()
+        if not goal_text:
+            continue
+        suggestions.append(
+            {
+                "title": f"Goal-aligned capability: {goal_text}",
+                "description": (
+                    "Define and implement a user-facing capability that directly advances "
+                    f"the goal: {goal_text}."
+                ),
+                "priority": "P1",
+                "category": "feature",
+            }
+        )
+
+    for product in config.similar[:2]:
+        product_name = str(product).strip()
+        if not product_name:
+            continue
+        suggestions.append(
+            {
+                "title": f"Feature parity review with {product_name}",
+                "description": (
+                    f"Compare current capabilities against {product_name} and implement one "
+                    "high-value missing feature that fits this project's goals."
+                ),
+                "priority": "P1",
+                "category": "feature-parity",
+            }
+        )
+
+    return suggestions[:3]
 
 
 def load_config(project_dir: Path) -> ProjectConfig | None:

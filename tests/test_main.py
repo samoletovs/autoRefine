@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.config import ProjectConfig
-from agent.main import load_config, load_repos_from_manifest, main
+from agent.main import evaluate_project, load_config, load_repos_from_manifest, main
 
 
 @pytest.fixture
@@ -98,6 +98,43 @@ def test_main_rejects_invalid_mode() -> None:
     with patch("sys.argv", ["autorefine", "--repo", "owner/repo", "--mode", "bad"]):
         with pytest.raises(SystemExit, match="2"):
             main()
+
+
+def test_evaluate_project_adds_feature_suggestions_from_project_yaml(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("agent.main.run_quality_checks", lambda _p, _c: [])
+    config = ProjectConfig(
+        name="demo",
+        purpose="Test",
+        users="Devs",
+        stage="active",
+        goals=["Improve onboarding"],
+        similar=["CompetitorX"],
+        quality=[],
+    )
+
+    report = evaluate_project(tmp_path, config)
+
+    suggestions = report["feature_suggestions"]
+    assert len(suggestions) == 2
+    assert "Improve onboarding" in suggestions[0]["title"]
+    assert "CompetitorX" in suggestions[1]["title"]
+
+
+def test_evaluate_project_returns_empty_feature_suggestions_without_inputs(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("agent.main.run_quality_checks", lambda _p, _c: [])
+    config = ProjectConfig(
+        name="demo",
+        purpose="Test",
+        users="Devs",
+        stage="active",
+        goals=[],
+        similar=[],
+        quality=[],
+    )
+
+    report = evaluate_project(tmp_path, config)
+
+    assert report["feature_suggestions"] == []
 
 
 @pytest.mark.parametrize(
