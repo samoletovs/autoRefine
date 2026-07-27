@@ -7,6 +7,8 @@ API services".
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import agent.main as m
 
 
@@ -217,6 +219,87 @@ def test_file_and_card_skips_when_filing_fails(monkeypatch):
         carder=lambda *a: carded.append(a) or True,
     )
     assert count == 0 and not carded
+
+
+# --- lab wiki context injection (memex knowledge → ideation) ------------------
+
+
+def _write_wiki_page(folder, name, *, title, tldr, verified):
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{name}.md").write_text(
+        f"# {title}\n\n**Status:** active\n**Last verified:** {verified}\n\n## TL;DR\n{tldr}\n",
+        encoding="utf-8",
+    )
+
+
+def _today() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def test_functional_task_appends_wiki_context():
+    base = m._functional_task()
+    with_ctx = m._functional_task(wiki_context="- **Encoded rules** — beats LLM per call")
+    assert "Recent lab knowledge" not in base
+    assert "Recent lab knowledge" in with_ctx
+    assert "Encoded rules" in with_ctx
+
+
+def test_wiki_title_and_tldr_reads_heading_and_tldr():
+    text = "# Death of buttons\n\n**Status:** active\n\n## TL;DR\nAgents replace UI.\n\n## Body\nmore"
+    title, summary = m._wiki_title_and_tldr("stem", text)
+    assert title == "Death of buttons"
+    assert summary == "Agents replace UI."
+
+
+def test_wiki_title_and_tldr_falls_back_to_first_paragraph():
+    text = "# Only title\n\nFirst real sentence here.\n"
+    title, summary = m._wiki_title_and_tldr("stem", text)
+    assert title == "Only title"
+    assert summary == "First real sentence here."
+
+
+def test_wiki_recent_true_for_today_false_for_old():
+    assert m._wiki_recent(f"**Last verified:** {_today()}") is True
+    assert m._wiki_recent("**Last verified:** 2020-01-01") is False
+
+
+def test_wiki_recent_false_when_missing_or_invalid():
+    assert m._wiki_recent("no date here") is False
+    assert m._wiki_recent("**Last verified:** 2026-13-40") is False
+
+
+def test_extract_wiki_insights_empty_without_wiki(monkeypatch):
+    monkeypatch.setattr(m, "_resolve_lab_wiki_dir", lambda: None)
+    assert m._extract_relevant_wiki_insights("era") == ""
+
+
+def test_resolve_lab_wiki_dir_prefers_env(tmp_path, monkeypatch):
+    wiki = tmp_path / "wiki"
+    (wiki / "insights").mkdir(parents=True)
+    monkeypatch.setenv("NAURO_GOVERNANCE_PATH", str(tmp_path))
+    assert m._resolve_lab_wiki_dir() == wiki
+
+
+def test_extract_wiki_insights_leads_with_named_project(tmp_path, monkeypatch):
+    wiki = tmp_path / "wiki"
+    _write_wiki_page(wiki / "insights", "encoded-rules", title="Encoded rules for era",
+                     tldr="era benefits from hand-coded rules.", verified=_today())
+    _write_wiki_page(wiki / "trends", "misc-trend", title="Some other trend",
+                     tldr="Unrelated lab-wide shift.", verified=_today())
+    monkeypatch.setenv("NAURO_GOVERNANCE_PATH", str(tmp_path))
+    block = m._extract_relevant_wiki_insights("era")
+    assert "Encoded rules for era" in block
+    assert block.splitlines()[0].startswith("- **Encoded rules for era**")
+
+
+def test_extract_wiki_insights_caps_pages(tmp_path, monkeypatch):
+    insights = tmp_path / "wiki" / "insights"
+    for i in range(m.WIKI_CONTEXT_MAX_PAGES + 4):
+        _write_wiki_page(insights, f"p{i}", title=f"era idea {i}",
+                         tldr=f"era summary {i}.", verified=_today())
+    monkeypatch.setenv("NAURO_GOVERNANCE_PATH", str(tmp_path))
+    block = m._extract_relevant_wiki_insights("era")
+    assert 0 < len(block.splitlines()) <= m.WIKI_CONTEXT_MAX_PAGES
 
 
 def test_handle_cards_routes_to_carder(monkeypatch):

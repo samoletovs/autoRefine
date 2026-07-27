@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -67,6 +68,12 @@ FUNCTIONAL_IDEA_CAP = 1
 FUNCTIONAL_PLAN_ATTEMPTS = 3
 FUNCTIONAL_RETRY_DELAY_S = 5
 GOVERNANCE_REPO_URL = "https://github.com/samoletovs/nauroLabs-github.git"
+# Functional ideation can draw on the lab wiki (memex-ingested insights/trends) so ideas
+# reflect freshly-learned knowledge, not just the project's own files. Best-effort + capped.
+WIKI_CONTEXT_MAX_PAGES = 6
+WIKI_CONTEXT_MAX_CHARS = 2400
+WIKI_CONTEXT_RECENT_DAYS = 60
+WIKI_CONTEXT_OTHER_CAP = 2
 
 
 def load_repos_from_manifest(manifest_path: Path) -> list[str]:
@@ -437,11 +444,115 @@ def _functional_mode() -> str:
     return mode if mode in {"off", "propose", "file", "cards"} else "off"
 
 
-def _functional_task(cap: int = FUNCTIONAL_IDEA_CAP, avoid_context: str = "") -> str:
+def _resolve_lab_wiki_dir() -> Path | None:
+    """Locate the lab wiki (``.github/wiki``) from the governance checkout — best-effort.
+
+    Mirrors ``_resolve_file_idea_script``'s candidates but never clones: wiki context is an
+    optional enrichment for functional ideation, so a miss just means "no wiki context"
+    (e.g. local dev without a governance checkout).
+    """
+    candidates: list[Path] = []
+    env_root = os.environ.get("NAURO_GOVERNANCE_PATH")
+    if env_root:
+        candidates.append(Path(env_root) / "wiki")
+    candidates.append(REPO_ROOT / ".github-gov" / "wiki")
+    candidates.append(Path("/tmp/nauroLabs-github") / "wiki")
+    return next((d for d in candidates if d.is_dir()), None)
+
+
+def _wiki_recent(text: str) -> bool:
+    """True when a page's ``**Last verified:**`` date is within WIKI_CONTEXT_RECENT_DAYS.
+
+    Parsed from page content (not file mtime) so it survives a fresh CI checkout.
+    """
+    m = re.search(r"\*\*Last verified:\*\*\s*(\d{4})-(\d{2})-(\d{2})", text)
+    if not m:
+        return False
+    try:
+        verified = datetime(int(m[1]), int(m[2]), int(m[3]), tzinfo=timezone.utc)
+    except ValueError:
+        return False
+    return (datetime.now(timezone.utc) - verified).days <= WIKI_CONTEXT_RECENT_DAYS
+
+
+def _wiki_title_and_tldr(stem: str, text: str) -> tuple[str, str]:
+    """Pull a page's ``# Title`` and ``## TL;DR`` (or first real paragraph) for the prompt."""
+    lines = text.splitlines()
+    title = stem
+    for line in lines:
+        if line.strip().startswith("# "):
+            title = line.strip()[2:].strip()
+            break
+    summary = ""
+    for i, line in enumerate(lines):
+        if line.strip().lower().startswith("## tl;dr"):
+            body = []
+            for nxt in lines[i + 1:]:
+                if nxt.strip().startswith("## "):
+                    break
+                if nxt.strip():
+                    body.append(nxt.strip())
+            summary = " ".join(body)
+            break
+    if not summary:
+        for line in lines:
+            s = line.strip()
+            if s and not s.startswith(("#", ">", "**", "|", "-", "`")):
+                summary = s
+                break
+    return title, summary
+
+
+def _extract_relevant_wiki_insights(project_name: str) -> str:
+    """Compact markdown of recent lab-wiki insights/trends relevant to ``project_name``.
+
+    Scores each ``insights/`` and ``trends/`` page by whether it names the project (+2) and
+    whether it was verified recently (+1). Project-mentioning pages lead; a couple of recent
+    lab-wide pages ride along for cross-pollination. Returns "" when no wiki is available.
+    Best-effort — never raises into the ideation path.
+    """
+    wiki_dir = _resolve_lab_wiki_dir()
+    if not wiki_dir:
+        return ""
+    name_l = project_name.lower()
+    mentioned: list[tuple[float, str, str]] = []
+    others: list[tuple[float, str, str]] = []
+    for sub in ("insights", "trends"):
+        d = wiki_dir / sub
+        if not d.is_dir():
+            continue
+        for page in sorted(d.glob("*.md")):
+            try:
+                text = page.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            names_project = name_l in text.lower()
+            score = (2.0 if names_project else 0.0) + (1.0 if _wiki_recent(text) else 0.0)
+            if score <= 0:
+                continue
+            title, summary = _wiki_title_and_tldr(page.stem, text)
+            (mentioned if names_project else others).append((score, title, summary))
+    if not mentioned and not others:
+        return ""
+    mentioned.sort(key=lambda t: t[0], reverse=True)
+    others.sort(key=lambda t: t[0], reverse=True)
+    lead = mentioned[:WIKI_CONTEXT_MAX_PAGES]
+    slots = max(0, WIKI_CONTEXT_MAX_PAGES - len(lead))
+    chosen = lead + others[: min(WIKI_CONTEXT_OTHER_CAP, slots)]
+    lines = [f"- **{title}** — {summary}"[:400].rstrip() for _s, title, summary in chosen]
+    block = "\n".join(lines)
+    if len(block) > WIKI_CONTEXT_MAX_CHARS:
+        block = block[:WIKI_CONTEXT_MAX_CHARS].rsplit("\n", 1)[0]
+    return block
+
+
+def _functional_task(cap: int = FUNCTIONAL_IDEA_CAP, avoid_context: str = "", wiki_context: str = "") -> str:
     """Foundry task that asks for vision-aligned feature ideas, not technical fixes.
 
     ``avoid_context`` carries recently declined ideas (+ their Telegram reasons) so the
     agent proposes something *different* — closing the loop from a 👎 back into ideation.
+    ``wiki_context`` carries recent lab knowledge (memex-ingested insights/trends) so ideas
+    can draw on what the lab just learned, not only the project's own files.
     """
     task = (
         "Propose FUNCTIONAL improvements that advance this project's VISION — concrete, buildable "
@@ -455,6 +566,13 @@ def _functional_task(cap: int = FUNCTIONAL_IDEA_CAP, avoid_context: str = "") ->
         "title, a 1-2 sentence description, a realistic priority (P0-P2 — most will be P1 or P2) "
         f"and effort (S/M/L). Submit your best {cap + 3} ideas via the submit_plan tool, strongest first."
     )
+    if wiki_context:
+        task += (
+            "\n\n## Recent lab knowledge (memex wiki — insights & trends)\n"
+            "Use these where they suggest a capability for THIS project. If an idea is inspired "
+            "by one, name it in the description (e.g. \"per lab insight: <title>\") so the source "
+            "is traceable. Do not force-fit; ignore irrelevant ones.\n" + wiki_context
+        )
     if avoid_context:
         task += "\n\n" + avoid_context
     return task
@@ -482,7 +600,14 @@ def plan_functional(
 
     client = AgentsClient(endpoint=endpoint, credential=DefaultAzureCredential())
     agent_id = create_agent(client, mode="plan", model=model)
-    task = _functional_task(avoid_context=avoid_context)
+    wiki_context = _extract_relevant_wiki_insights(config.name)
+    if wiki_context:
+        log.info(
+            "Functional ideation for %s: injected %d chars of lab wiki context.",
+            config.name,
+            len(wiki_context),
+        )
+    task = _functional_task(avoid_context=avoid_context, wiki_context=wiki_context)
     try:
         # Foundry runs fail transiently (server_error / rate_limit); each run_agent uses
         # a fresh thread, so a retry with the same agent recovers a one-off blip.

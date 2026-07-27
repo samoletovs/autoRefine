@@ -92,7 +92,7 @@ def send_idea_card(
     bot_token: str | None = None,
     chat_id: str | None = None,
 ) -> bool:
-    """Send an idea approval card with 👍 Build / 👎 Not now buttons.
+    """Send an idea approval card with 👍 Build / 🅿️ Park / 👎 Not now buttons.
 
     The buttons carry ``arf:<repo>:<num>:y|n`` and the text echoes ``arf:<repo>:<num>`` so a
     text reply to the card can be attributed back to the issue by nauroBot. ``repo`` may be
@@ -120,6 +120,7 @@ def send_idea_card(
         "reply_markup": {
             "inline_keyboard": [[
                 {"text": "👍 Build", "callback_data": f"arf:{name}:{issue_number}:y"},
+                {"text": "🅿️ Park", "callback_data": f"arf:{name}:{issue_number}:p"},
                 {"text": "👎 Not now", "callback_data": f"arf:{name}:{issue_number}:n"},
             ]],
         },

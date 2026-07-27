@@ -143,7 +143,8 @@ def test_idea_card_encodes_buttons_and_token(monkeypatch: pytest.MonkeyPatch) ->
     # Bare repo name is encoded (nauroBot prepends the owner).
     buttons = payload["reply_markup"]["inline_keyboard"][0]
     assert buttons[0]["callback_data"] == "arf:era:12:y"
-    assert buttons[1]["callback_data"] == "arf:era:12:n"
+    assert buttons[1]["callback_data"] == "arf:era:12:p"
+    assert buttons[2]["callback_data"] == "arf:era:12:n"
     # The card text carries the arf token so a reply can be attributed to the issue.
     assert "arf:era:12" in payload["text"]
     assert "Add CSV export" in payload["text"]
