@@ -67,6 +67,7 @@ FUNCTIONAL_IDEA_CAP = 1
 # functional plan a couple of times so a single blip doesn't skip the whole ideation.
 FUNCTIONAL_PLAN_ATTEMPTS = 3
 FUNCTIONAL_RETRY_DELAY_S = 5
+IDEA_CARD_REMINDER_DAYS = 3
 GOVERNANCE_REPO_URL = "https://github.com/samoletovs/nauroLabs-github.git"
 # Functional ideation can draw on the lab wiki (memex-ingested insights/trends) so ideas
 # reflect freshly-learned knowledge, not just the project's own files. Best-effort + capped.
@@ -730,25 +731,47 @@ def _file_one_idea(
     return run.stdout.strip()
 
 
-def _has_open_idea_card(repo: str) -> bool:
-    """True if ``repo`` already has an un-acted idea card (open issue + ``needs-approval``).
+def _open_idea_card(repo: str) -> dict | None:
+    """Return the oldest un-acted idea card, or ``None`` when there is no pending card.
 
     Keeps the cards flow to one pending card per project: a manual evaluate run plus the
     daily cron — which GitHub often delays by hours — won't stack a second un-acted card,
     and fresh ideas resume once you 👍/👎 the last one (which clears ``needs-approval``).
-    Best-effort: any gh failure returns False so ideation is never blocked by a hiccup.
+    Best-effort: any gh failure returns ``None`` so ideation is never blocked by a hiccup.
     """
     try:
         out = subprocess.run(
             ["gh", "issue", "list", "--repo", repo, "--label", "needs-approval",
-             "--state", "open", "--json", "number", "--limit", "5"],
+             "--state", "open", "--json", "number,title,labels", "--limit", "5"],
             capture_output=True, text=True, timeout=30,
         )
         if out.returncode != 0:
-            return False
-        return len(json.loads(out.stdout or "[]")) > 0
+            return None
+        issues = json.loads(out.stdout or "[]")
+        return issues[-1] if issues else None
     except (OSError, ValueError, subprocess.SubprocessError):
-        return False
+        return None
+
+
+def _idea_card_reminder_due(repo: str, issue_number: int) -> bool:
+    """Spread pending-card reminders over several days; manual runs always resurface them."""
+    if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
+        return True
+    slot = sum(repo.encode("utf-8")) + issue_number
+    return (datetime.now(timezone.utc).date().toordinal() + slot) % IDEA_CARD_REMINDER_DAYS == 0
+
+
+def _remind_open_idea_card(repo: str, issue: dict) -> bool:
+    """Resend a pending idea's Telegram card without filing a duplicate issue."""
+    labels = {
+        str(label.get("name", "")).upper()
+        for label in issue.get("labels", [])
+        if isinstance(label, dict)
+    }
+    priority = next((label for label in labels if label in FUNCTIONAL_PRIORITIES), "P2")
+    title = re.sub(r"^\[idea\]\s*", "", str(issue.get("title", "")), flags=re.IGNORECASE)
+    improvement = {"title": title, "priority": priority}
+    return _notify_idea_card(repo, int(issue["number"]), improvement)
 
 
 def file_and_card_functional_ideas(
@@ -894,11 +917,16 @@ def handle_functional_ideas(
         return selected
 
     if mode == "cards":
-        if not dry_run and _has_open_idea_card(repo):
+        pending = None if dry_run else _open_idea_card(repo)
+        if pending:
+            reminded = False
+            if _idea_card_reminder_due(repo, int(pending["number"])):
+                reminded = _remind_open_idea_card(repo, pending)
             log.info(
-                "%s already has an open idea card awaiting 👍/👎 — skipping to keep one "
-                "pending card per project (a manual run + the delayed daily cron won't double).",
+                "%s already has an open idea card awaiting 👍/👎 — %s; skipping a new "
+                "idea to keep one pending card per project.",
                 repo,
+                "reminder sent" if reminded else "reminder not due",
             )
             return selected
         carded = (carder or file_and_card_functional_ideas)(repo, selected, dry_run=dry_run)

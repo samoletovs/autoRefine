@@ -303,7 +303,7 @@ def test_extract_wiki_insights_caps_pages(tmp_path, monkeypatch):
 
 
 def test_handle_cards_routes_to_carder(monkeypatch):
-    monkeypatch.setattr(m, "_has_open_idea_card", lambda repo: False)
+    monkeypatch.setattr(m, "_open_idea_card", lambda repo: None)
     plan = _plan(("A", "P1"), ("B", "P2"))
     calls: dict = {}
 
@@ -322,7 +322,12 @@ def test_handle_cards_routes_to_carder(monkeypatch):
 def test_handle_cards_skips_when_open_card_exists(monkeypatch):
     # An un-acted card already exists → don't stack a second one (guards a manual run +
     # the delayed daily cron from double-filing).
-    monkeypatch.setattr(m, "_has_open_idea_card", lambda repo: True)
+    monkeypatch.setattr(
+        m,
+        "_open_idea_card",
+        lambda repo: {"number": 42, "title": "[idea] Existing", "labels": []},
+    )
+    monkeypatch.setattr(m, "_idea_card_reminder_due", lambda repo, number: False)
     plan = _plan(("A", "P1"))
     called = {"n": 0}
 
@@ -334,6 +339,29 @@ def test_handle_cards_skips_when_open_card_exists(monkeypatch):
         "samoletovs/era", plan, mode="cards", carder=fake_carder, notifier=lambda s: None
     )
     assert called["n"] == 0
+
+
+def test_handle_cards_resurfaces_due_pending_card_without_filing(monkeypatch):
+    pending = {"number": 42, "title": "[idea] Existing", "labels": []}
+    monkeypatch.setattr(m, "_open_idea_card", lambda repo: pending)
+    monkeypatch.setattr(m, "_idea_card_reminder_due", lambda repo, number: True)
+    reminded: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        m,
+        "_remind_open_idea_card",
+        lambda repo, issue: reminded.append((repo, issue)) or True,
+    )
+    filed: list[str] = []
+
+    m.handle_functional_ideas(
+        "samoletovs/era",
+        _plan(("New idea", "P1")),
+        mode="cards",
+        carder=lambda *args, **kwargs: filed.append("new") or 1,
+    )
+
+    assert reminded == [("samoletovs/era", pending)]
+    assert filed == []
 
 
 # --- plan_functional transient-failure retry --------------------------------
