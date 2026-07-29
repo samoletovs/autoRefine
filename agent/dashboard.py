@@ -11,6 +11,16 @@ Usage (standalone):
 
 Or via CLI:
     python -m agent.main --mode dashboard --repo owner/repo
+
+Interactive features
+--------------------
+* **Auto-refresh** — the page reloads itself every ``refresh_seconds`` seconds
+  (default 300 s / 5 min).  Pass ``refresh_seconds=0`` to disable.
+* **Sortable project table** — click any column header to sort ascending;
+  click again to sort descending.
+* **Improvement suggestions** — a dedicated section renders feature suggestions
+  passed in ``analysis["feature_suggestions"]``, surfacing goal-aligned and
+  feature-parity ideas alongside the AI recommendations.
 """
 
 from __future__ import annotations
@@ -198,6 +208,43 @@ def _render_list(items: list[Any], ordered: bool = False) -> str:
     return f"<{tag}>{lis}</{tag}>"
 
 
+def _render_feature_suggestions(suggestions: list[Any]) -> str:
+    """Render feature/improvement suggestions as a card list.
+
+    Each suggestion is expected to be a dict with ``title``, ``description``,
+    and optionally ``priority`` and ``category`` keys (matching the shape
+    produced by ``main.suggest_feature_improvements``).
+    """
+    if not suggestions:
+        return "<p class=\"muted\">No improvement suggestions available.</p>"
+
+    _priority_class = {"P0": "priority-p0", "P1": "priority-p1", "P2": "priority-p2"}
+
+    cards = []
+    for s in suggestions:
+        if isinstance(s, str):
+            cards.append(f"<div class=\"suggestion-card\"><p>{_esc(s)}</p></div>")
+            continue
+        title = _esc(s.get("title", "Untitled"))
+        desc = _esc(s.get("description", ""))
+        priority = str(s.get("priority", ""))
+        category = _esc(s.get("category", ""))
+        p_class = _priority_class.get(priority, "priority-default")
+        badges = ""
+        if priority:
+            badges += f"<span class=\"badge {p_class}\">{_esc(priority)}</span> "
+        if category:
+            badges += f"<span class=\"badge badge-cat\">{category}</span>"
+        cards.append(
+            f"<div class=\"suggestion-card\">"
+            f"<div class=\"suggestion-title\">{title}</div>"
+            f"{('<div class=\"suggestion-badges\">' + badges + '</div>') if badges else ''}"
+            f"{('<div class=\"suggestion-desc\">' + desc + '</div>') if desc else ''}"
+            f"</div>"
+        )
+    return "<div class=\"suggestions-grid\">" + "".join(cards) + "</div>"
+
+
 # ── Public API ─────────────────────────────────────────────────────────────
 
 
@@ -207,18 +254,38 @@ def render_html_dashboard(
     analysis: dict[str, Any],
     app_insights_data: dict[str, Any] | None = None,
     url_health_data: dict[str, Any] | None = None,
+    refresh_seconds: int = 300,
 ) -> str:
     """Return a self-contained HTML dashboard page from health-scan data.
 
     All arguments mirror those of ``health_scan.generate_report``.
     The returned string is a complete HTML document that can be saved to a
     file or sent as an e-mail attachment.
+
+    Parameters
+    ----------
+    github_data:
+        Per-repo GitHub metrics from ``health_scan.scan_github``.
+    cost_data:
+        Azure cost data from ``health_scan.scan_azure_costs``.
+    analysis:
+        AI-generated analysis from ``health_scan.analyze_with_ai``.
+        May also contain a ``feature_suggestions`` list (produced by
+        ``main.suggest_feature_improvements``).
+    app_insights_data:
+        Optional Application Insights telemetry dict.
+    url_health_data:
+        Optional dict of deployed URL health-check results.
+    refresh_seconds:
+        Seconds between automatic page reloads.  Set to ``0`` to disable
+        auto-refresh (useful when embedding the page or during testing).
     """
     scores = analysis.get("health_scores", {})
     alerts = analysis.get("alerts", [])
     recs = analysis.get("recommendations", [])
     focus = analysis.get("focus_project", "")
     issues = analysis.get("issues_to_create", [])
+    feature_suggestions = analysis.get("feature_suggestions", [])
 
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -228,6 +295,7 @@ def render_html_dashboard(
     telemetry_section = _render_telemetry(app_insights_data or {})
     alerts_html = _render_list(alerts)
     recs_html = _render_list(recs, ordered=True)
+    suggestions_html = _render_feature_suggestions(feature_suggestions)
 
     issues_rows = "".join(
         f"<tr><td>{_esc(i.get('repo', '?'))}</td><td>{_esc(i.get('title', '?'))}</td></tr>"
@@ -248,6 +316,44 @@ def render_html_dashboard(
         else "<p class=\"muted\">No focus set.</p>"
     )
 
+    # Auto-refresh snippet (disabled when refresh_seconds == 0)
+    refresh_script = (
+        f"<script>setTimeout(function(){{location.reload();}},{refresh_seconds * 1000});</script>"
+        if refresh_seconds > 0
+        else ""
+    )
+
+    # Sortable-table script: clicking a <th> sorts the nearest <tbody> rows.
+    sort_script = """<script>
+(function(){
+  function cellText(row, idx){
+    var c=row.cells[idx];
+    return c ? c.innerText.trim() : '';
+  }
+  function sortTable(th){
+    var table=th.closest('table');
+    if(!table) return;
+    var tbody=table.querySelector('tbody');
+    if(!tbody) return;
+    var idx=Array.from(th.parentElement.children).indexOf(th);
+    var asc=th.dataset.sort!=='asc';
+    th.parentElement.querySelectorAll('th').forEach(function(t){delete t.dataset.sort;});
+    th.dataset.sort=asc?'asc':'desc';
+    var rows=Array.from(tbody.rows);
+    rows.sort(function(a,b){
+      var av=cellText(a,idx), bv=cellText(b,idx);
+      var an=parseFloat(av), bn=parseFloat(bv);
+      if(!isNaN(an)&&!isNaN(bn)) return asc?an-bn:bn-an;
+      return asc?av.localeCompare(bv):bv.localeCompare(av);
+    });
+    rows.forEach(function(r){tbody.appendChild(r);});
+  }
+  document.addEventListener('click',function(e){
+    if(e.target.tagName==='TH') sortTable(e.target);
+  });
+})();
+</script>"""
+
     css = """
         :root { font-family: system-ui, sans-serif; --green: #2da44e; --yellow: #d29922; --red: #cf222e; }
         body { margin: 0; padding: 24px; background: #f6f8fa; color: #1f2328; }
@@ -257,7 +363,10 @@ def render_html_dashboard(
         table { border-collapse: collapse; width: 100%; margin-top: 8px; background: #fff;
                 border: 1px solid #d0d7de; border-radius: 6px; overflow: hidden; }
         th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid #d0d7de; font-size: .9rem; }
-        thead th { background: #f0f3f6; font-weight: 600; }
+        thead th { background: #f0f3f6; font-weight: 600; cursor: pointer; user-select: none; }
+        thead th:hover { background: #e6eaf0; }
+        thead th[data-sort=asc]::after  { content: ' ▲'; font-size: .7rem; }
+        thead th[data-sort=desc]::after { content: ' ▼'; font-size: .7rem; }
         tr:last-child td { border-bottom: none; }
         .score-green  { color: var(--green);  font-weight: 700; }
         .score-yellow { color: var(--yellow); font-weight: 700; }
@@ -273,6 +382,21 @@ def render_html_dashboard(
         .muted { color: #656d76; font-size: .9rem; }
         section { background: #fff; border: 1px solid #d0d7de; border-radius: 8px;
                   padding: 16px 20px; margin-bottom: 20px; }
+        /* Suggestion cards */
+        .suggestions-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(260px,1fr));
+                             gap: 12px; margin-top: 10px; }
+        .suggestion-card { border: 1px solid #d0d7de; border-radius: 6px; padding: 12px 14px;
+                           background: #f6f8fa; }
+        .suggestion-title { font-weight: 600; font-size: .9rem; margin-bottom: 6px; }
+        .suggestion-desc  { color: #444d56; font-size: .85rem; margin-top: 6px; }
+        .suggestion-badges { margin-bottom: 4px; }
+        .badge { display: inline-block; border-radius: 12px; padding: 1px 8px;
+                 font-size: .75rem; font-weight: 600; margin-right: 4px; }
+        .priority-p0 { background: #FFEEF0; color: var(--red); }
+        .priority-p1 { background: #FFF8C5; color: #735C0F; }
+        .priority-p2 { background: #E6F4EA; color: #1a6b2e; }
+        .priority-default { background: #eef0f3; color: #444d56; }
+        .badge-cat { background: #ddf4ff; color: #0969da; }
     """
 
     return f"""<!DOCTYPE html>
@@ -282,10 +406,11 @@ def render_html_dashboard(
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>NauroLabs Dashboard</title>
   <style>{css}</style>
+  {refresh_script}
 </head>
 <body>
   <h1>🤖 NauroLabs Dashboard</h1>
-  <p class="meta">Generated {_esc(now)}</p>
+  <p class="meta">Generated {_esc(now)}{f" · auto-refresh every {refresh_seconds}s" if refresh_seconds > 0 else ""}</p>
 
   <section>
     <h2>📊 Project Health</h2>
@@ -308,6 +433,11 @@ def render_html_dashboard(
   </section>
 
   <section>
+    <h2>🔭 Improvement Suggestions</h2>
+    {suggestions_html}
+  </section>
+
+  <section>
     <h2>💲 Azure Costs</h2>
     {cost_section}
   </section>
@@ -320,5 +450,6 @@ def render_html_dashboard(
     <h2>📋 Issues to Create</h2>
     {issues_table}
   </section>
+  {sort_script}
 </body>
 </html>"""

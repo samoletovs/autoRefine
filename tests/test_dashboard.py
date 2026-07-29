@@ -10,6 +10,7 @@ import pytest
 from agent.dashboard import (
     _health_colour,
     _render_cost_section,
+    _render_feature_suggestions,
     _render_project_table,
     _render_url_health,
     render_html_dashboard,
@@ -276,6 +277,115 @@ def test_render_html_dashboard_empty_data() -> None:
     html = render_html_dashboard({}, {"total": -1, "error": "none"}, {})
     assert "<!DOCTYPE html>" in html
     assert "No project data" in html
+
+
+# ── _render_feature_suggestions ────────────────────────────────────────────
+
+
+def test_render_feature_suggestions_empty() -> None:
+    html = _render_feature_suggestions([])
+    assert "No improvement suggestions" in html
+
+
+def test_render_feature_suggestions_dict_items() -> None:
+    suggestions: list[Any] = [
+        {
+            "title": "Goal-aligned capability: ship daily",
+            "description": "Implement shipping automation.",
+            "priority": "P1",
+            "category": "feature",
+        },
+        {
+            "title": "Feature parity review with Competitor X",
+            "description": "Compare and fill gaps.",
+            "priority": "P0",
+            "category": "feature-parity",
+        },
+    ]
+    html = _render_feature_suggestions(suggestions)
+    assert "Goal-aligned capability" in html
+    assert "Feature parity review" in html
+    assert "priority-p1" in html
+    assert "priority-p0" in html
+    assert "feature-parity" in html
+    assert "Implement shipping automation" in html
+
+
+def test_render_feature_suggestions_string_items() -> None:
+    """Plain string suggestions are also handled gracefully."""
+    html = _render_feature_suggestions(["Add dark mode", "Improve onboarding"])
+    assert "Add dark mode" in html
+    assert "Improve onboarding" in html
+
+
+def test_render_feature_suggestions_xss_escaped() -> None:
+    suggestions: list[Any] = [{"title": "<script>evil()</script>", "description": ""}]
+    html = _render_feature_suggestions(suggestions)
+    assert "<script>evil()</script>" not in html
+    assert "&lt;script&gt;" in html
+
+
+# ── interactive features ───────────────────────────────────────────────────
+
+
+def test_render_html_dashboard_auto_refresh_present_by_default() -> None:
+    html = render_html_dashboard(_GITHUB_DATA, _COST_DATA, _ANALYSIS)
+    assert "setTimeout" in html
+    assert "location.reload()" in html
+    # default is 300 s
+    assert "300000" in html
+
+
+def test_render_html_dashboard_auto_refresh_custom_interval() -> None:
+    html = render_html_dashboard(_GITHUB_DATA, _COST_DATA, _ANALYSIS, refresh_seconds=60)
+    assert "60000" in html
+
+
+def test_render_html_dashboard_auto_refresh_disabled() -> None:
+    html = render_html_dashboard(_GITHUB_DATA, _COST_DATA, _ANALYSIS, refresh_seconds=0)
+    assert "setTimeout" not in html
+    assert "location.reload()" not in html
+
+
+def test_render_html_dashboard_sortable_table_script() -> None:
+    html = render_html_dashboard(_GITHUB_DATA, _COST_DATA, _ANALYSIS)
+    assert "sortTable" in html
+    assert "data-sort" in html
+
+
+def test_render_html_dashboard_includes_improvement_suggestions_section() -> None:
+    analysis_with_suggestions: dict[str, Any] = {
+        **_ANALYSIS,
+        "feature_suggestions": [
+            {
+                "title": "Goal-aligned capability: launch MVP",
+                "description": "Build the core feature set.",
+                "priority": "P0",
+                "category": "feature",
+            }
+        ],
+    }
+    html = render_html_dashboard(_GITHUB_DATA, _COST_DATA, analysis_with_suggestions)
+    assert "Improvement Suggestions" in html
+    assert "Goal-aligned capability" in html
+    assert "priority-p0" in html
+
+
+def test_render_html_dashboard_improvement_suggestions_empty_by_default() -> None:
+    """When analysis has no feature_suggestions the section still renders."""
+    html = render_html_dashboard(_GITHUB_DATA, _COST_DATA, _ANALYSIS)
+    assert "Improvement Suggestions" in html
+    assert "No improvement suggestions" in html
+
+
+def test_render_html_dashboard_meta_shows_refresh_interval() -> None:
+    html = render_html_dashboard(_GITHUB_DATA, _COST_DATA, _ANALYSIS, refresh_seconds=120)
+    assert "auto-refresh every 120s" in html
+
+
+def test_render_html_dashboard_no_refresh_meta_when_disabled() -> None:
+    html = render_html_dashboard(_GITHUB_DATA, _COST_DATA, _ANALYSIS, refresh_seconds=0)
+    assert "auto-refresh" not in html
 
 
 # ── run_dashboard_mode ─────────────────────────────────────────────────────
