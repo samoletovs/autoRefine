@@ -27,6 +27,10 @@ log = logging.getLogger("autorefine")
 # Suppress verbose Azure SDK HTTP logging
 logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.WARNING)
 logging.getLogger("azure.identity").setLevel(logging.WARNING)
+# httpx logs the full request URL at INFO, and the Telegram API puts the bot token in the
+# path — which printed the live token into the container logs, where it is retained by Log
+# Analytics. Silence it; there is no request detail here worth a leaked credential.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 MANIFEST_PATH = Path(__file__).parent.parent.parent / ".github" / "config" / "workspace-manifest.json"
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -1206,94 +1210,107 @@ def main() -> None:
     log.info("autoRefine starting — mode=%s, %d repos", config.mode, len(repos))
 
     for repo in repos:
-        name = repo.split("/")[-1]
-        project_dir = config.workdir / name
-
-        # Clone / update
-        if not clone_repo(repo, project_dir):
-            log.warning("Failed to clone %s — skipping", repo)
-            continue
-
-        # Load project.yaml
-        project_config = load_config(project_dir)
-        if not project_config:
-            log.warning("%s has no project.yaml — skipping", name)
-            continue
-
-        # Step 1: Always evaluate first (deterministic checks)
-        report = evaluate_project(project_dir, project_config)
-
-        if config.mode == "evaluate":
-            print(json.dumps(report, indent=2))
-
-        elif config.mode == "plan":
-            print(json.dumps(report, indent=2))
-            plan = plan_project(
-                project_dir, project_config, report["findings"], model=config.model,
-            )
-            if plan:
-                print("\n--- IMPROVEMENT PLAN ---")
-                print(json.dumps(plan, indent=2))
-
-        elif config.mode == "refine":
-            # Plan first
-            plan = plan_project(
-                project_dir, project_config, report["findings"], model=config.model,
-            )
-            if not plan:
-                log.warning("No plan generated for %s — skipping refine", name)
-                continue
-
-            print(json.dumps(plan, indent=2))
-
-            # Execute improvements
-            log.info(
-                "Executing %d improvements on %s...",
-                len(plan.get("improvements", [])),
-                name,
-            )
-            success = refine_project(
-                project_dir,
-                project_config,
-                plan,
-                repo,
-                dry_run=config.dry_run,
-                model=config.model,
-            )
-            if success:
-                log.info("PR created for %s", name)
-            else:
-                log.info("No PR created for %s (no changes or dry run)", name)
-
-        elif config.mode == "file-ideas":
-            print(json.dumps(report, indent=2))
-            plan = plan_project(project_dir, project_config, report["findings"])
-            if plan:
-                filed_count = file_ideas_for_plan(repo, plan, dry_run=config.dry_run)
-                log.info("Filed %d technical ideas for %s", filed_count, name)
-            else:
-                log.warning("No technical plan generated for %s", name)
-
-            # Observe-first functional ideation (default off; workflow sets 'propose').
-            fmode = _functional_mode()
-            if fmode != "off" and project_config.stage in FUNCTIONAL_STAGES:
-                log.info("Functional ideation (%s) for %s...", fmode, name)
-                # In cards mode, feed recently declined ideas (+ reasons) back to the
-                # generator so a 👎 in Telegram reshapes the next proposals.
-                avoid = (
-                    _format_avoid_context(_recent_declined_reasons(repo))
-                    if fmode == "cards"
-                    else ""
-                )
-                fplan = plan_functional(
-                    project_dir, project_config, model=config.model, avoid_context=avoid
-                )
-                if fplan:
-                    handle_functional_ideas(repo, fplan, mode=fmode, dry_run=config.dry_run)
-                else:
-                    log.warning("No functional plan generated for %s", name)
+        # A scan of every project must survive any single one of them. Two separate bugs
+        # have already ended a run part-way through the list (a missing test runner, a
+        # mistyped project.yaml), costing the remaining projects their evaluation for
+        # reasons that had nothing to do with them. Log the failure against the project it
+        # belongs to and carry on.
+        try:
+            _process_repo(repo, config)
+        except Exception:
+            log.exception("%s failed — continuing with the remaining projects", repo)
 
     log.info("autoRefine complete.")
+
+
+def _process_repo(repo: str, config: AutoRefineConfig) -> None:
+    """Clone, evaluate and act on a single repo according to the run mode."""
+    name = repo.split("/")[-1]
+    project_dir = config.workdir / name
+
+    # Clone / update
+    if not clone_repo(repo, project_dir):
+        log.warning("Failed to clone %s — skipping", repo)
+        return
+
+    # Load project.yaml
+    project_config = load_config(project_dir)
+    if not project_config:
+        log.warning("%s has no project.yaml — skipping", name)
+        return
+
+    # Step 1: Always evaluate first (deterministic checks)
+    report = evaluate_project(project_dir, project_config)
+
+    if config.mode == "evaluate":
+        print(json.dumps(report, indent=2))
+
+    elif config.mode == "plan":
+        print(json.dumps(report, indent=2))
+        plan = plan_project(
+            project_dir, project_config, report["findings"], model=config.model,
+        )
+        if plan:
+            print("\n--- IMPROVEMENT PLAN ---")
+            print(json.dumps(plan, indent=2))
+
+    elif config.mode == "refine":
+        # Plan first
+        plan = plan_project(
+            project_dir, project_config, report["findings"], model=config.model,
+        )
+        if not plan:
+            log.warning("No plan generated for %s — skipping refine", name)
+            return
+
+        print(json.dumps(plan, indent=2))
+
+        # Execute improvements
+        log.info(
+            "Executing %d improvements on %s...",
+            len(plan.get("improvements", [])),
+            name,
+        )
+        success = refine_project(
+            project_dir,
+            project_config,
+            plan,
+            repo,
+            dry_run=config.dry_run,
+            model=config.model,
+        )
+        if success:
+            log.info("PR created for %s", name)
+        else:
+            log.info("No PR created for %s (no changes or dry run)", name)
+
+    elif config.mode == "file-ideas":
+        print(json.dumps(report, indent=2))
+        plan = plan_project(project_dir, project_config, report["findings"])
+        if plan:
+            filed_count = file_ideas_for_plan(repo, plan, dry_run=config.dry_run)
+            log.info("Filed %d technical ideas for %s", filed_count, name)
+        else:
+            log.warning("No technical plan generated for %s", name)
+
+        # Observe-first functional ideation (default off; workflow sets 'propose').
+        fmode = _functional_mode()
+        if fmode != "off" and project_config.stage in FUNCTIONAL_STAGES:
+            log.info("Functional ideation (%s) for %s...", fmode, name)
+            # In cards mode, feed recently declined ideas (+ reasons) back to the
+            # generator so a 👎 in Telegram reshapes the next proposals.
+            avoid = (
+                _format_avoid_context(_recent_declined_reasons(repo))
+                if fmode == "cards"
+                else ""
+            )
+            fplan = plan_functional(
+                project_dir, project_config, model=config.model, avoid_context=avoid
+            )
+            if fplan:
+                handle_functional_ideas(repo, fplan, mode=fmode, dry_run=config.dry_run)
+            else:
+                log.warning("No functional plan generated for %s", name)
 
 
 if __name__ == "__main__":

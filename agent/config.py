@@ -32,10 +32,34 @@ class ProjectConfig:
             purpose=data.get("purpose", ""),
             users=data.get("users", ""),
             stage=data.get("stage", "active"),
-            goals=data.get("goals", []),
-            similar=data.get("similar", []),
-            quality=data.get("quality", []),
+            goals=cls._str_list(data.get("goals"), path, "goals"),
+            similar=cls._str_list(data.get("similar"), path, "similar"),
+            quality=cls._str_list(data.get("quality"), path, "quality"),
         )
+
+    @staticmethod
+    def _str_list(value: object, path: Path, key: str) -> list[str]:
+        """Coerce a project.yaml list field to plain strings.
+
+        These cards are hand-written, so a mistyped entry is a matter of time: a stray
+        `- i18n: false` parses as a dict, and joining that raised a TypeError that killed
+        the whole run mid-way through the projects. One malformed card should cost that
+        card its detail, not the remaining projects, so anything unexpected is stringified
+        and flagged rather than raised.
+        """
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            log.warning("%s: '%s' should be a list, got %s — ignoring", path, key, type(value).__name__)
+            return []
+        out = []
+        for item in value:
+            if isinstance(item, str):
+                out.append(item)
+            else:
+                log.warning("%s: '%s' entry %r is not a string — coercing", path, key, item)
+                out.append(str(item))
+        return out
 
     def to_context(self) -> str:
         """Format as a context string for the LLM."""
