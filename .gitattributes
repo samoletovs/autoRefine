@@ -1,0 +1,5 @@
+# The job script is embedded verbatim into the Bicep template via loadTextContent() and
+# executed by /bin/sh in a Linux container. If a Windows checkout converted it to CRLF,
+# every line would end in \r and the job would fail in a way that looks like anything but
+# a line-ending problem.
+*.sh text eol=lf

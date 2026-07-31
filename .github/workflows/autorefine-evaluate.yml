@@ -1,9 +1,10 @@
 name: "autoRefine — Evaluate All Projects"
 
 on:
-  schedule:
-    # Daily at 06:00 UTC
-    - cron: '0 6 * * *'
+  # The daily 06:00 UTC schedule moved to the Azure Container Apps job `job-autorefine`
+  # (infrastructure/main.bicep). This workflow averaged 43 min/run — ~1,744 Actions minutes
+  # a month, by far the largest consumer across every repo. Kept dispatch-only so a run can
+  # still be triggered by hand from the GitHub UI.
   workflow_dispatch:
     inputs:
       mode:

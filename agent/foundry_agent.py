@@ -218,29 +218,39 @@ def _handle_list_directory(project_dir: Path, args: dict) -> str:
 
 
 def _handle_run_tests(project_dir: Path, _args: dict) -> str:
-    """Run the project's test suite."""
+    """Run the project's test suite.
+
+    A tool the model calls must never be able to abort the run. Whichever runner is
+    missing, times out, or explodes, this reports the failure back to the model as data so
+    the remaining projects still get evaluated.
+    """
     pkg_json = project_dir / "package.json"
     pyproject = project_dir / "pyproject.toml"
 
     if pkg_json.exists():
-        # Node project
-        result = subprocess.run(
-            ["npm", "test", "--", "--reporter=verbose"],
-            cwd=str(project_dir),
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
+        cmd = ["npm", "test", "--", "--reporter=verbose"]
     elif pyproject.exists() or (project_dir / "requirements.txt").exists():
-        result = subprocess.run(
-            ["python", "-m", "pytest", "tests/", "-x", "-q"],
-            cwd=str(project_dir),
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
+        cmd = ["python", "-m", "pytest", "tests/", "-x", "-q"]
     else:
         return json.dumps({"error": "No test runner detected"})
+
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(project_dir),
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except FileNotFoundError:
+        return json.dumps({
+            "error": f"Test runner '{cmd[0]}' is not installed in this environment",
+            "passed": False,
+        })
+    except subprocess.TimeoutExpired:
+        return json.dumps({"error": "Test run timed out after 300s", "passed": False})
+    except OSError as exc:
+        return json.dumps({"error": f"Could not run tests: {exc}", "passed": False})
 
     output = (result.stdout + "\n" + result.stderr)[-2000:]  # cap output
     return json.dumps({
