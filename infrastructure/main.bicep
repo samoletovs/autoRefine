@@ -9,9 +9,9 @@
 // Python Functions runtime image cannot do. Reuses the existing `cae-agents` environment
 // rather than standing up another one.
 //
-// Cost: a full pass measured 85 min. At 0.5 vCPU / 1Gi that is ~78k of the 180k free
-// vCPU-seconds and ~155k of the 360k free GiB-seconds per month. Doubling either
-// dimension would put the run at ~86% of the grant for no gain — the loop spends almost
+// Cost: a full pass over all 20 projects measured 116 min. At 0.5 vCPU / 1Gi that is
+// ~106k of the 180k free vCPU-seconds and ~212k of the 360k free GiB-seconds per month.
+// Doubling either dimension would overrun the grant for no gain — the loop spends almost
 // all of that time blocked on Foundry responses, not computing.
 
 targetScope = 'resourceGroup'
@@ -60,9 +60,10 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
       triggerType: 'Schedule'
       // The run is one long sequential pass; a second concurrent copy would double-file the
       // same idea cards, so retries are serial and overlap is not allowed.
-      // A full pass measured 85 min, so 90 min would leave no margin at all — one slow
-      // Foundry response would kill a run that was almost finished.
-      replicaTimeout: 9000
+      // A full pass measured 116 min and the length moves with how many projects are due
+      // for a new idea card, so this is 3h rather than a snug fit — a timeout throws away
+      // the entire run, and an unused ceiling costs nothing on a job that scales to zero.
+      replicaTimeout: 10800
       replicaRetryLimit: 1
       scheduleTriggerConfig: {
         cronExpression: scheduleEnabled ? cronExpression : '0 0 31 2 *' // 31 Feb = never
@@ -90,9 +91,9 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
           image: 'python:3.12'
           resources: {
             // The run is I/O-bound — it waits on Foundry far more than it computes — so the
-            // smallest size is enough and keeps the run inside the free grant with room to
-            // spare. Raise this only against a measured memory or CPU limit, not a hunch:
-            // 1.0/2Gi was tried once on an OOM theory that turned out to be a missing npm.
+            // smallest size is enough and keeps the run inside the free grant. Raise this
+            // only against a measured memory or CPU limit, not a hunch: 1.0/2Gi was tried
+            // once on an OOM theory that turned out to be a missing npm.
             cpu: json('0.5')
             memory: '1Gi'
           }
