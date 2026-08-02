@@ -12,9 +12,11 @@ name: "autoRefine — PR approval cards"
 
 on:
   schedule:
-    # Hourly during waking hours (UTC). Most runs are no-ops; a card is only sent when a
-    # ready, green Copilot PR appears — so the cost is a cheap gh query + pip cache hit.
-    - cron: '0 6-22 * * *'
+    # Every two hours during waking hours (UTC). Most runs are no-ops; a card is only sent
+    # when a ready, green Copilot PR appears. Hourly meant ~17 sweeps a day to catch a
+    # handful of PRs, and the hourly PR janitor is what actually keeps merges moving - this
+    # sweep only decides how soon the card reaches the phone.
+    - cron: '0 6-22/2 * * *'
   workflow_dispatch:
 
 permissions:

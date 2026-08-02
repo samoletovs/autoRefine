@@ -2,8 +2,10 @@ name: "autoRefine — Daily Health Scan"
 
 on:
   schedule:
-    # Twice daily at 06:00 and 18:00 UTC (was agentMode nauro_health_scan timer)
-    - cron: '0 6,18 * * *'
+    # Daily at 06:00 UTC (was agentMode nauro_health_scan timer). It ran twice a day for
+    # no reason anyone recorded; a daily scan is what the name promises and what the
+    # report is read as.
+    - cron: '0 6 * * *'
   workflow_dispatch:
 
 permissions:
