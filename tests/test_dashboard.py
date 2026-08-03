@@ -388,6 +388,47 @@ def test_render_html_dashboard_no_refresh_meta_when_disabled() -> None:
     assert "auto-refresh" not in html
 
 
+# ── customizable views ─────────────────────────────────────────────────────
+
+
+def test_render_html_dashboard_filter_control_present() -> None:
+    """A project-filter input must appear in the project-health section."""
+    html = render_html_dashboard(_GITHUB_DATA, _COST_DATA, _ANALYSIS)
+    assert 'id="project-filter"' in html
+    assert 'type="search"' in html
+    assert "Filter projects" in html
+
+
+def test_render_html_dashboard_filter_script_present() -> None:
+    """The live-filter JS must be injected into the page."""
+    html = render_html_dashboard(_GITHUB_DATA, _COST_DATA, _ANALYSIS)
+    assert "project-filter" in html
+    assert "project-health-table" in html
+    # row-visibility toggle
+    assert "style.display" in html
+
+
+def test_render_html_dashboard_project_table_has_class() -> None:
+    """The project health table must carry the 'project-health-table' CSS class."""
+    html = render_html_dashboard(_GITHUB_DATA, _COST_DATA, _ANALYSIS)
+    assert 'class="project-health-table"' in html
+
+
+def test_render_html_dashboard_collapse_script_present() -> None:
+    """The collapsible-sections JS must be injected into the page."""
+    html = render_html_dashboard(_GITHUB_DATA, _COST_DATA, _ANALYSIS)
+    assert "collapse-indicator" in html
+    assert "data.collapsed" in html or "dataset.collapsed" in html
+
+
+def test_render_html_dashboard_collapse_css_present() -> None:
+    """CSS for the collapse indicator and filter bar must be present."""
+    html = render_html_dashboard(_GITHUB_DATA, _COST_DATA, _ANALYSIS)
+    assert "collapse-indicator" in html
+    assert "filter-bar" in html
+    assert "project-filter" in html
+
+
 # ── run_dashboard_mode ─────────────────────────────────────────────────────
 
 

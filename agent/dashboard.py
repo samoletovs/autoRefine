@@ -96,7 +96,7 @@ def _render_project_table(
         )
 
     return (
-        "<table>"
+        "<table class=\"project-health-table\">"
         "<thead><tr>"
         "<th>Project</th><th>Issues</th><th>Bugs</th><th>PRs</th>"
         "<th>Commits (7d)</th><th>CI</th>"
@@ -354,6 +354,44 @@ def render_html_dashboard(
 })();
 </script>"""
 
+    # Filter-by-name script: live-filter project table rows by the first column.
+    filter_script = """<script>
+(function(){
+  var input=document.getElementById('project-filter');
+  if(!input) return;
+  input.addEventListener('input',function(){
+    var q=this.value.trim().toLowerCase();
+    var table=document.querySelector('.project-health-table');
+    if(!table) return;
+    Array.from(table.querySelectorAll('tbody tr')).forEach(function(row){
+      var name=row.cells[0]?row.cells[0].innerText.toLowerCase():'';
+      row.style.display=(!q||name.includes(q))?'':'none';
+    });
+  });
+})();
+</script>"""
+
+    # Collapsible-sections script: clicking an h2 toggles the section body.
+    collapse_script = """<script>
+(function(){
+  document.querySelectorAll('section h2').forEach(function(h){
+    var ind=document.createElement('span');
+    ind.className='collapse-indicator';
+    ind.textContent=' \u25be';
+    h.appendChild(ind);
+    h.addEventListener('click',function(){
+      var section=h.closest('section');
+      var collapsed=section.dataset.collapsed==='true';
+      section.dataset.collapsed=collapsed?'false':'true';
+      Array.from(section.children).forEach(function(c){
+        if(c!==h) c.style.display=collapsed?'':'none';
+      });
+      ind.textContent=collapsed?' \u25be':' \u25b8';
+    });
+  });
+})();
+</script>"""
+
     css = """
         :root { font-family: system-ui, sans-serif; --green: #2da44e; --yellow: #d29922; --red: #cf222e; }
         body { margin: 0; padding: 24px; background: #f6f8fa; color: #1f2328; }
@@ -397,6 +435,17 @@ def render_html_dashboard(
         .priority-p2 { background: #E6F4EA; color: #1a6b2e; }
         .priority-default { background: #eef0f3; color: #444d56; }
         .badge-cat { background: #ddf4ff; color: #0969da; }
+        /* Filter bar */
+        .filter-bar { margin-bottom: 8px; }
+        #project-filter { width: 100%; max-width: 320px; padding: 6px 10px;
+                          border: 1px solid #d0d7de; border-radius: 6px;
+                          font-size: .9rem; outline: none; }
+        #project-filter:focus { border-color: #0969da;
+                                box-shadow: 0 0 0 3px rgba(9,105,218,.12); }
+        /* Collapsible sections */
+        .collapse-indicator { font-size: .75rem; color: #656d76; margin-left: 4px;
+                              user-select: none; }
+        section h2:hover .collapse-indicator { color: #0969da; }
     """
 
     return f"""<!DOCTYPE html>
@@ -414,6 +463,7 @@ def render_html_dashboard(
 
   <section>
     <h2>📊 Project Health</h2>
+    <div class="filter-bar"><input id="project-filter" type="search" placeholder="Filter projects…" aria-label="Filter projects by name" autocomplete="off"></div>
     {project_table}
   </section>
 
@@ -451,5 +501,7 @@ def render_html_dashboard(
     {issues_table}
   </section>
   {sort_script}
+  {filter_script}
+  {collapse_script}
 </body>
 </html>"""
