@@ -309,6 +309,8 @@ def test_render_feature_suggestions_dict_items() -> None:
     assert "priority-p0" in html
     assert "feature-parity" in html
     assert "Implement shipping automation" in html
+    assert "vote-btn" in html
+    assert "suggestion-comment-input" in html
 
 
 def test_render_feature_suggestions_string_items() -> None:
@@ -316,6 +318,7 @@ def test_render_feature_suggestions_string_items() -> None:
     html = _render_feature_suggestions(["Add dark mode", "Improve onboarding"])
     assert "Add dark mode" in html
     assert "Improve onboarding" in html
+    assert "suggestion-feedback" in html
 
 
 def test_render_feature_suggestions_xss_escaped() -> None:
@@ -369,6 +372,8 @@ def test_render_html_dashboard_includes_improvement_suggestions_section() -> Non
     assert "Improvement Suggestions" in html
     assert "Goal-aligned capability" in html
     assert "priority-p0" in html
+    assert "autorefine.suggestion_feedback.v1" in html
+    assert "suggestion-comment-list" in html
 
 
 def test_render_html_dashboard_improvement_suggestions_empty_by_default() -> None:

@@ -26,6 +26,7 @@ Interactive features
 from __future__ import annotations
 
 import datetime
+import hashlib
 import html as html_lib
 import logging
 from typing import Any
@@ -38,6 +39,7 @@ _HEALTH_YELLOW = 6
 
 # Azure budget warning threshold (matches health_scan.BUDGET_WARNING_THRESHOLD_PCT)
 _BUDGET_WARNING_PCT = 70
+_SUGGESTION_COMMENT_MAXLEN = 300
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -220,10 +222,51 @@ def _render_feature_suggestions(suggestions: list[Any]) -> str:
 
     _priority_class = {"P0": "priority-p0", "P1": "priority-p1", "P2": "priority-p2"}
 
+    def _feedback_controls(suggestion_id: str) -> str:
+        return (
+            "<div class=\"suggestion-feedback\" data-suggestion-id=\""
+            + suggestion_id
+            + "\">"
+            + "<div class=\"suggestion-votes\">"
+            + "<button type=\"button\" class=\"vote-btn\" data-vote=\"up\""
+            + " aria-label=\"Upvote suggestion\">👍</button>"
+            + "<span class=\"vote-count\" data-vote-count=\"up\">0</span>"
+            + "<button type=\"button\" class=\"vote-btn\" data-vote=\"down\""
+            + " aria-label=\"Downvote suggestion\">👎</button>"
+            + "<span class=\"vote-count\" data-vote-count=\"down\">0</span>"
+            + "</div>"
+            + "<div class=\"suggestion-comments\">"
+            + "<label class=\"sr-only\" for=\"suggestion-comment-"
+            + suggestion_id
+            + "\">Comment on suggestion</label>"
+            + "<input id=\"suggestion-comment-"
+            + suggestion_id
+            + "\" class=\"suggestion-comment-input\" type=\"text\""
+            + f" placeholder=\"Add comment…\" maxlength=\"{_SUGGESTION_COMMENT_MAXLEN}\">"
+            + "<button type=\"button\" class=\"comment-btn\">Comment</button>"
+            + "<ul class=\"suggestion-comment-list\"></ul>"
+            + "</div>"
+            + "</div>"
+        )
+
     cards = []
-    for s in suggestions:
+    for idx, s in enumerate(suggestions):
+        if isinstance(s, dict):
+            identity_text = (
+                f"{s.get('title', '')}|{s.get('description', '')}|"
+                f"{s.get('priority', '')}|{s.get('category', '')}|{idx}"
+            )
+        else:
+            identity_text = f"{s}|{idx}"
+        suggestion_id = hashlib.sha1(
+            identity_text.encode("utf-8"), usedforsecurity=False
+        ).hexdigest()[:12]
+
         if isinstance(s, str):
-            cards.append(f"<div class=\"suggestion-card\"><p>{_esc(s)}</p></div>")
+            cards.append(
+                f"<div class=\"suggestion-card\"><div class=\"suggestion-title\">{_esc(s)}</div>"
+                f"{_feedback_controls(suggestion_id)}</div>"
+            )
             continue
         title = _esc(s.get("title", "Untitled"))
         desc = _esc(s.get("description", ""))
@@ -240,6 +283,7 @@ def _render_feature_suggestions(suggestions: list[Any]) -> str:
             f"<div class=\"suggestion-title\">{title}</div>"
             f"{('<div class=\"suggestion-badges\">' + badges + '</div>') if badges else ''}"
             f"{('<div class=\"suggestion-desc\">' + desc + '</div>') if desc else ''}"
+            f"{_feedback_controls(suggestion_id)}"
             f"</div>"
         )
     return "<div class=\"suggestions-grid\">" + "".join(cards) + "</div>"
@@ -392,6 +436,107 @@ def render_html_dashboard(
 })();
 </script>"""
 
+    suggestion_feedback_script = (
+        """<script>
+(function(){
+  var STORAGE_KEY='autorefine.suggestion_feedback.v1';
+  var MAX_COMMENT_LEN=__MAXLEN__;
+  function loadState(){
+    try{
+      var raw=localStorage.getItem(STORAGE_KEY);
+      return raw?JSON.parse(raw):{};
+    }catch(_e){return {};}
+  }
+  function saveState(state){
+    try{localStorage.setItem(STORAGE_KEY,JSON.stringify(state));}catch(_e){}
+  }
+  function ensureEntry(state,id){
+    if(!state[id]) state[id]={up:0,down:0,comments:[]};
+    if(!Array.isArray(state[id].comments)) state[id].comments=[];
+    if(state[id].user_vote!=='up' && state[id].user_vote!=='down') state[id].user_vote='';
+    if(state[id].user_vote==='up'){
+      state[id].up=1;
+      state[id].down=0;
+    }else if(state[id].user_vote==='down'){
+      state[id].up=0;
+      state[id].down=1;
+    }else{
+      state[id].up=0;
+      state[id].down=0;
+    }
+    return state[id];
+  }
+  function render(card,entry){
+    var up=card.querySelector('[data-vote-count="up"]');
+    var down=card.querySelector('[data-vote-count="down"]');
+    if(up) up.textContent=String(entry.up||0);
+    if(down) down.textContent=String(entry.down||0);
+    var list=card.querySelector('.suggestion-comment-list');
+    if(list){
+      list.innerHTML='';
+      (entry.comments||[]).forEach(function(c){
+        var li=document.createElement('li');
+        li.textContent=c;
+        list.appendChild(li);
+      });
+    }
+  }
+  var state=loadState();
+  document.querySelectorAll('.suggestion-feedback').forEach(function(card){
+    var id=card.dataset.suggestionId;
+    if(!id) return;
+    var entry=ensureEntry(state,id);
+    render(card,entry);
+    card.querySelectorAll('.vote-btn').forEach(function(btn){
+      btn.addEventListener('click',function(){
+        var vote=btn.dataset.vote;
+        if(vote==='up'){
+          if(entry.user_vote==='up'){
+            entry.user_vote='';
+            entry.up=0;
+          }else{
+            entry.user_vote='up';
+            entry.up=1;
+            entry.down=0;
+          }
+        }
+        if(vote==='down'){
+          if(entry.user_vote==='down'){
+            entry.user_vote='';
+            entry.down=0;
+          }else{
+            entry.user_vote='down';
+            entry.down=1;
+            entry.up=0;
+          }
+        }
+        saveState(state);
+        render(card,entry);
+      });
+    });
+    var input=card.querySelector('.suggestion-comment-input');
+    var submit=card.querySelector('.comment-btn');
+    if(input&&submit){
+      submit.addEventListener('click',function(){
+        var text=(input.value||'').trim();
+        if(!text) return;
+        entry.comments.push(text.slice(0,MAX_COMMENT_LEN));
+        input.value='';
+        saveState(state);
+        render(card,entry);
+      });
+      input.addEventListener('keydown',function(e){
+        if(e.key==='Enter'){
+          e.preventDefault();
+          submit.click();
+        }
+      });
+    }
+  });
+})();
+</script>""".replace("__MAXLEN__", str(_SUGGESTION_COMMENT_MAXLEN))
+    )
+
     css = """
         :root { font-family: system-ui, sans-serif; --green: #2da44e; --yellow: #d29922; --red: #cf222e; }
         body { margin: 0; padding: 24px; background: #f6f8fa; color: #1f2328; }
@@ -435,6 +580,24 @@ def render_html_dashboard(
         .priority-p2 { background: #E6F4EA; color: #1a6b2e; }
         .priority-default { background: #eef0f3; color: #444d56; }
         .badge-cat { background: #ddf4ff; color: #0969da; }
+        .suggestion-feedback { margin-top: 10px; }
+        .suggestion-votes { display: flex; align-items: center; gap: 6px; }
+        .vote-btn, .comment-btn {
+            border: 1px solid #d0d7de; background: #fff; border-radius: 6px;
+            padding: 2px 8px; font-size: .8rem; cursor: pointer;
+        }
+        .vote-btn:hover, .comment-btn:hover { background: #f0f3f6; }
+        .vote-count { min-width: 1ch; font-size: .8rem; color: #57606a; }
+        .suggestion-comments { margin-top: 8px; }
+        .suggestion-comment-input {
+            width: calc(100% - 86px); max-width: 100%; margin-right: 6px;
+            border: 1px solid #d0d7de; border-radius: 6px; padding: 4px 8px; font-size: .8rem;
+        }
+        .suggestion-comment-list { margin: 8px 0 0 0; padding-left: 1.2em; }
+        .sr-only {
+            position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+            overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0;
+        }
         /* Filter bar */
         .filter-bar { margin-bottom: 8px; }
         #project-filter { width: 100%; max-width: 320px; padding: 6px 10px;
@@ -503,5 +666,6 @@ def render_html_dashboard(
   {sort_script}
   {filter_script}
   {collapse_script}
+  {suggestion_feedback_script}
 </body>
 </html>"""
