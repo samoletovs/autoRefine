@@ -21,6 +21,8 @@ Interactive features
 * **Improvement suggestions** — a dedicated section renders feature suggestions
   passed in ``analysis["feature_suggestions"]``, surfacing goal-aligned and
   feature-parity ideas alongside the AI recommendations.
+* **Progress tracking** — recent autoRefine idea issues are shown with status,
+  activity, and links when available from GitHub scanning.
 """
 
 from __future__ import annotations
@@ -40,6 +42,7 @@ _HEALTH_YELLOW = 6
 # Azure budget warning threshold (matches health_scan.BUDGET_WARNING_THRESHOLD_PCT)
 _BUDGET_WARNING_PCT = 70
 _SUGGESTION_COMMENT_MAXLEN = 300
+_STATUS_CLASS_MAXLEN = 50
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -278,15 +281,72 @@ def _render_feature_suggestions(suggestions: list[Any]) -> str:
             badges += f"<span class=\"badge {p_class}\">{_esc(priority)}</span> "
         if category:
             badges += f"<span class=\"badge badge-cat\">{category}</span>"
+        badges_html = f"<div class=\"suggestion-badges\">{badges}</div>" if badges else ""
+        desc_html = f"<div class=\"suggestion-desc\">{desc}</div>" if desc else ""
         cards.append(
             f"<div class=\"suggestion-card\">"
             f"<div class=\"suggestion-title\">{title}</div>"
-            f"{('<div class=\"suggestion-badges\">' + badges + '</div>') if badges else ''}"
-            f"{('<div class=\"suggestion-desc\">' + desc + '</div>') if desc else ''}"
+            f"{badges_html}"
+            f"{desc_html}"
             f"{_feedback_controls(suggestion_id)}"
             f"</div>"
         )
     return "<div class=\"suggestions-grid\">" + "".join(cards) + "</div>"
+
+
+def _safe_link(url: Any) -> str:
+    """Return an escaped http(s) URL for href use, or an empty string."""
+    text = str(url).strip()
+    if text.startswith(("https://", "http://")):
+        return _esc(text)
+    return ""
+
+
+def _render_progress_tracking(github_data: dict[str, Any]) -> str:
+    """Render recent autoRefine idea progress collected during GitHub scanning."""
+    rows = []
+    for repo, data in github_data.items():
+        if not isinstance(data, dict):
+            continue
+        for item in data.get("recent_ideas", []):
+            if not isinstance(item, dict):
+                continue
+            title = _esc(item.get("title", "Untitled"))
+            url = _safe_link(item.get("url", ""))
+            status = str(item.get("status", "proposed"))
+            normalized_status = "".join(
+                c if c.isalnum() else "-" for c in status.lower()
+            ).strip("-")
+            status_class = normalized_status[:_STATUS_CLASS_MAXLEN].strip("-")
+            if not status_class:
+                status_class = "unknown"
+            title_html = (
+                f"<a href=\"{url}\" target=\"_blank\" rel=\"noopener noreferrer\">{title}</a>"
+                if url
+                else title
+            )
+            raw_actions = item.get("actions")
+            actions = _esc(str(raw_actions)) if raw_actions is not None else "&mdash;"
+            rows.append(
+                "<tr>"
+                f"<td>{_esc(repo)}</td>"
+                f"<td>{title_html}</td>"
+                f"<td><span class=\"progress-status status-{status_class}\">"
+                f"{_esc(status)}</span></td>"
+                f"<td>{actions}</td>"
+                "</tr>"
+            )
+
+    if not rows:
+        return "<p class=\"muted\">No tracked improvement progress yet.</p>"
+
+    return (
+        "<table class=\"progress-table\">"
+        "<thead><tr><th>Project</th><th>Improvement</th><th>Status</th>"
+        "<th>Activity</th></tr></thead>"
+        "<tbody>" + "".join(rows) + "</tbody>"
+        "</table>"
+    )
 
 
 # ── Public API ─────────────────────────────────────────────────────────────
@@ -340,6 +400,7 @@ def render_html_dashboard(
     alerts_html = _render_list(alerts)
     recs_html = _render_list(recs, ordered=True)
     suggestions_html = _render_feature_suggestions(feature_suggestions)
+    progress_html = _render_progress_tracking(github_data)
 
     issues_rows = "".join(
         f"<tr><td>{_esc(i.get('repo', '?'))}</td><td>{_esc(i.get('title', '?'))}</td></tr>"
@@ -580,6 +641,13 @@ def render_html_dashboard(
         .priority-p2 { background: #E6F4EA; color: #1a6b2e; }
         .priority-default { background: #eef0f3; color: #444d56; }
         .badge-cat { background: #ddf4ff; color: #0969da; }
+        .progress-status { display: inline-block; border-radius: 12px; padding: 1px 8px;
+                           font-size: .75rem; font-weight: 600; background: #eef0f3;
+                           color: #444d56; }
+        .status-completed { background: #dafbe1; color: #1a6b2e; }
+        .status-in-progress { background: #ddf4ff; color: #0969da; }
+        .status-awaiting-approval { background: #fff8c5; color: #735c0f; }
+        .status-declined { background: #ffebe9; color: var(--red); }
         .suggestion-feedback { margin-top: 10px; }
         .suggestion-votes { display: flex; align-items: center; gap: 6px; }
         .vote-btn, .comment-btn {
@@ -648,6 +716,11 @@ def render_html_dashboard(
   <section>
     <h2>🔭 Improvement Suggestions</h2>
     {suggestions_html}
+  </section>
+
+  <section>
+    <h2>🧭 Progress Tracking</h2>
+    {progress_html}
   </section>
 
   <section>

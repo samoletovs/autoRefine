@@ -376,6 +376,85 @@ def test_render_html_dashboard_includes_improvement_suggestions_section() -> Non
     assert "suggestion-comment-list" in html
 
 
+def test_render_html_dashboard_includes_progress_tracking() -> None:
+    github_data: dict[str, Any] = {
+        "era": {
+            **_GITHUB_DATA["era"],
+            "recent_ideas": [
+                {
+                    "title": "Enhanced User Dashboard",
+                    "status": "in progress",
+                    "actions": "assigned to Copilot, 1 comment",
+                    "url": "https://github.com/samoletovs/autoRefine/issues/52",
+                }
+            ],
+        }
+    }
+
+    html = render_html_dashboard(github_data, _COST_DATA, _ANALYSIS)
+
+    assert "Progress Tracking" in html
+    assert "Enhanced User Dashboard" in html
+    assert "status-in-progress" in html
+    assert "assigned to Copilot, 1 comment" in html
+    assert "https://github.com/samoletovs/autoRefine/issues/52" in html
+
+
+def test_render_html_dashboard_progress_tracking_empty_by_default() -> None:
+    html = render_html_dashboard(_GITHUB_DATA, _COST_DATA, _ANALYSIS)
+    assert "Progress Tracking" in html
+    assert "No tracked improvement progress yet." in html
+
+
+def test_render_html_dashboard_progress_tracking_escapes_values() -> None:
+    github_data: dict[str, Any] = {
+        "era": {
+            **_GITHUB_DATA["era"],
+            "recent_ideas": [
+                {
+                    "title": "<script>evil()</script>",
+                    "status": "awaiting approval",
+                    "actions": "<b>approved</b>",
+                },
+                {
+                    "title": "Missing activity",
+                    "status": "proposed",
+                    "actions": None,
+                }
+            ]
+        }
+    }
+
+    html = render_html_dashboard(github_data, _COST_DATA, _ANALYSIS)
+
+    assert "<script>evil()</script>" not in html
+    assert "&lt;script&gt;" in html
+    assert "<b>approved</b>" not in html
+    assert "&lt;b&gt;approved&lt;/b&gt;" in html
+    assert "<td>&lt;script&gt;evil()&lt;/script&gt;</td>" in html
+    assert "<td>&mdash;</td>" in html
+
+
+def test_render_html_dashboard_progress_tracking_unsafe_url_fallback() -> None:
+    github_data: dict[str, Any] = {
+        "era": {
+            **_GITHUB_DATA["era"],
+            "recent_ideas": [
+                {
+                    "title": "Unsafe link",
+                    "status": "proposed",
+                    "actions": "created",
+                    "url": "javascript:alert(1)",
+                }
+            ],
+        }
+    }
+
+    html = render_html_dashboard(github_data, _COST_DATA, _ANALYSIS)
+    assert "<td>Unsafe link</td>" in html
+    assert '<a href="javascript:alert(1)"' not in html
+
+
 def test_render_html_dashboard_improvement_suggestions_empty_by_default() -> None:
     """When analysis has no feature_suggestions the section still renders."""
     html = render_html_dashboard(_GITHUB_DATA, _COST_DATA, _ANALYSIS)
@@ -467,8 +546,6 @@ def test_run_dashboard_mode_writes_html_file(
         from agent.main import run_dashboard_mode
 
         run_dashboard_mode(["samoletovs/era"], output=output_file)
-
-    import os
 
     assert os.path.exists(output_file)
     content = open(output_file, encoding="utf-8").read()

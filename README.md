@@ -64,6 +64,9 @@ python -m agent.main --repo owner/repo --mode refine
 
 # All projects in a manifest
 python -m agent.main --manifest config/workspace-manifest.json --mode file-ideas
+
+# Generate a browser dashboard with health, ideas, and progress tracking
+python -m agent.main --repo owner/repo --mode dashboard --output dashboard.html
 ```
 
 ## Project structure
