@@ -25,7 +25,7 @@ name: "Assign Copilot to approved idea issues"
 
 on:
   schedule:
-    - cron: '35 7 * * *'   # daily, after nauro-autopilot (07:00) and triage
+    - cron: '35 7 */2 * *'   # every second day — each assignment starts a 10-30 min Copilot agent run
   workflow_dispatch:
 
 permissions:
