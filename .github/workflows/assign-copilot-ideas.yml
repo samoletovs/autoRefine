@@ -1,40 +1,134 @@
-name: Assign Copilot to unassigned idea issues
+name: "Assign Copilot to approved idea issues"
+
+# Triage labels an idea `approved`, but labelling alone does not make anything
+# happen — an approved issue with no assignee just sits there. That gap is how
+# dozens of approved ideas accumulated across the workspace untouched.
+#
+# This workflow closes the loop: every approved, unassigned idea issue gets the
+# Copilot coding agent assigned so it is actually picked up.
+#
+# Gated on `approved` deliberately. Issues still carrying `needs-approval` are
+# waiting on a human product decision and must NOT be auto-assigned.
+#
+# NOTE ON TOKENS — this changed, and the change broke the pipeline silently:
+# `replaceActorsForAssignable` (what assigning an agent goes through) now
+# rejects GitHub App installation tokens with
+#   "Assigning agents is not supported with GitHub App installation tokens."
+# so the default GITHUB_TOKEN can no longer do this. A *user* token is required.
+# GH_PAT is therefore the primary credential, with GITHUB_TOKEN only a fallback
+# for repos that have not been given the secret yet.
+#
+# NOTE ON FAILURE — the previous version logged a ::warning:: and exited 0, so it
+# reported a green tick every single day while assigning nothing for weeks.
+# Assignment is now verified by re-reading the issue, and unassigned work fails
+# the run. A broken pipeline must look broken.
 
 on:
   schedule:
-    # Run daily at 07:15 UTC (after nauro-autopilot which runs at 07:00)
-    - cron: '15 7 * * *'
+    - cron: '35 7 * * *'   # daily, after nauro-autopilot (07:00) and triage
   workflow_dispatch:
+
+permissions:
+  issues: write
+
+concurrency:
+  group: assign-copilot-ideas
+  cancel-in-progress: false
 
 jobs:
   assign:
     runs-on: ubuntu-latest
-    permissions:
-      issues: write
+    timeout-minutes: 10
     steps:
-      - name: Assign Copilot to open idea issues with no Copilot assignee
+      - name: Assign Copilot to approved, unassigned idea issues
         env:
-          # GITHUB_TOKEN is the installation token for THIS repo.
-          # It is the only token that can add the Copilot bot via
-          # replaceActorsForAssignable — fine-grained PATs do not work.
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          USING_PAT: ${{ secrets.GH_PAT != '' }}
         run: |
+          set -euo pipefail
+
+          if [ "${USING_PAT}" != "true" ]; then
+            echo "::warning::GH_PAT is not set — falling back to GITHUB_TOKEN, which cannot assign the coding agent. Add GH_PAT to this repo."
+          fi
+
+          # Approved ideas that nobody (and nothing) is working on yet.
           ISSUES=$(gh issue list \
             --repo "${{ github.repository }}" \
             --label idea \
+            --label approved \
             --state open \
+            --limit 100 \
             --json number,assignees \
-            --jq '[.[] | select(([.assignees[].login] | index("Copilot")) == null) | .number] | .[]' 2>/dev/null || true)
+            --jq '[.[] | select((.assignees | length) == 0) | .number] | .[]' 2>/dev/null || true)
 
           if [ -z "$ISSUES" ]; then
-            echo "No unassigned idea issues found."
+            echo "No approved, unassigned idea issues found."
+            {
+              echo "## Copilot idea assignment"
+              echo ""
+              echo "Nothing waiting — every approved idea already has a builder."
+            } >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
+          ASSIGNED=0
+          FAILED=0
+          FAILED_LIST=""
+
           for NUM in $ISSUES; do
             echo "Assigning Copilot to ${{ github.repository }}#$NUM"
-            gh issue edit "$NUM" \
-              --repo "${{ github.repository }}" \
-              --add-assignee "Copilot" \
-              || echo "::warning::Could not assign Copilot to #$NUM — Copilot Coding Agent may not be enabled for this repo"
+            # The coding agent resolves under the login `copilot-swe-agent`.
+            # `--add-assignee Copilot` fails outside the web UI, so try the bot
+            # login first and fall back.
+            gh issue edit "$NUM" --repo "${{ github.repository }}" \
+                 --add-assignee "copilot-swe-agent" 2>/dev/null \
+              || gh issue edit "$NUM" --repo "${{ github.repository }}" \
+                   --add-assignee "Copilot" 2>/dev/null \
+              || true
+
+            # Verify rather than trust the exit code: `gh issue edit` has exited 0
+            # on assignment failures, which is precisely how this went unnoticed.
+            CURRENT=$(gh issue view "$NUM" --repo "${{ github.repository }}" \
+              --json assignees --jq '[.assignees[].login] | join(",")' 2>/dev/null || true)
+
+            case "$(echo "$CURRENT" | tr '[:upper:]' '[:lower:]')" in
+              *copilot*)
+                ASSIGNED=$((ASSIGNED + 1))
+                ;;
+              *)
+                FAILED=$((FAILED + 1))
+                FAILED_LIST="${FAILED_LIST} #${NUM}"
+                echo "::error::Could not assign Copilot to #$NUM — assignees are now '${CURRENT:-none}'"
+                ;;
+            esac
           done
+
+          {
+            echo "## Copilot idea assignment"
+            echo ""
+            echo "| Result | Count |"
+            echo "|--------|-------|"
+            echo "| Assigned | ${ASSIGNED} |"
+            echo "| Failed | ${FAILED} |"
+            if [ "${FAILED}" -gt 0 ]; then
+              echo ""
+              echo "Not assigned:${FAILED_LIST}"
+              echo ""
+              echo "Assigning an agent needs a **user** token. Check that \`GH_PAT\` is set"
+              echo "on this repo and that the Copilot coding agent is enabled for it."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Approved work with no builder is a stopped pipeline. Fail loudly —
+          # but only when the credential that *can* do the job was available.
+          # Without GH_PAT this cannot possibly work, so a red run every day
+          # would be noise; the warning above says what to fix, and the
+          # fleet-wide nauro-idea-flow check in the governance repo still
+          # assigns these.
+          if [ "${FAILED}" -gt 0 ]; then
+            if [ "${USING_PAT}" = "true" ]; then
+              echo "::error::${FAILED} approved idea(s) still have no builder assigned."
+              exit 1
+            fi
+            echo "::warning::${FAILED} approved idea(s) could not be assigned because GH_PAT is missing on this repo."
+          fi
