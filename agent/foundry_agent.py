@@ -132,7 +132,11 @@ def submit_plan(
 
     :param score: Overall project quality score 0-100
     :param summary: 2-3 sentence executive summary of findings
-    :param improvements: Ordered list of recommended improvements (dicts with title, description, priority, effort, category)
+    :param improvements: Ordered list of recommended improvements. Each is a dict with
+        title, description, priority, effort, category, approach, success_criteria.
+        `approach` must name the actual files/commands to change — not a restatement
+        of the title. `success_criteria` must be checkable by someone who did not do
+        the work, e.g. "pytest exits 0 with >=60 passing tests", not "it is implemented".
     :param research_insights: Insights from researching similar products
     """
     return ""
@@ -653,6 +657,27 @@ def build_plan_task(findings: list[dict], config: ProjectConfig) -> str:
 6. Submit a structured improvement plan via submit_plan.
 
 Focus on actionable, specific improvements — not generic advice.
+
+## Every improvement must be buildable from the memo alone
+
+Each improvement becomes a GitHub issue, and the coding agent that implements it
+sees ONLY that issue. It cannot ask you what you meant. So for each one give:
+
+- `approach` — the actual steps: which files, which functions, which commands.
+  NOT a restatement of the title. "Implement 'Increase Test Coverage'" is useless.
+  "Add tests/test_router.ts covering the 4 error branches in router.ts:88-140" is not.
+- `success_criteria` — something a reviewer can check without having done the work.
+  It must be falsifiable. Prefer a number, a command and its expected output, or a
+  concrete observable state.
+    GOOD: "pytest -q reports >=60 passing tests, up from 40"
+    GOOD: "no occurrence of `grep -oP` remains in .github/workflows/*.yml"
+    GOOD: "GET /api/health returns 200 within 500ms"
+    BAD:  "'X' is implemented and usable as described"
+    BAD:  "the feature works correctly"
+
+If you cannot state a checkable success criterion for an improvement, you do not
+understand it well enough yet — read more of the code, or drop it from the plan.
+A short plan of specified work beats a long list of vague intentions.
 {findings_text}{similar_text}"""
 
 

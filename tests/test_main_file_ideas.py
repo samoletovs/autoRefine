@@ -65,6 +65,22 @@ def test_build_file_idea_command_uses_supported_options(monkeypatch) -> None:
     assert "--dry-run" in cmd
 
 
+def _spec(title: str, priority: str, category: str) -> dict:
+    """An improvement specified well enough to be filed.
+
+    `approach` and `success_criteria` are required now: autoRefine used to invent
+    them from the title so validation would pass, which put 81 unbuildable ideas
+    into the approval queue.
+    """
+    return {
+        "title": title,
+        "priority": priority,
+        "category": category,
+        "approach": f"Edit src/{category}.ts and cover the new branch in tests/.",
+        "success_criteria": "npm test exits 0 with 12 passing specs, up from 10.",
+    }
+
+
 def test_file_ideas_for_plan_filters_and_deduplicates(monkeypatch) -> None:
     monkeypatch.setattr(main, "_resolve_file_idea_script", lambda: Path("/tmp/fake-file-idea.py"))
     monkeypatch.setattr(main, "_build_run_references", lambda: "- commit: `abc`")
@@ -90,10 +106,10 @@ def test_file_ideas_for_plan_filters_and_deduplicates(monkeypatch) -> None:
         repo="samoletovs/era",
         plan={
             "improvements": [
-                {"title": "Critical fix", "priority": "P0", "category": "security"},
-                {"title": "Critical fix", "priority": "P0", "category": "security"},
-                {"title": "Important cleanup", "priority": "P1", "category": "quality"},
-                {"title": "Later cleanup", "priority": "P2", "category": "quality"},
+                _spec("Critical fix", "P0", "security"),
+                _spec("Critical fix", "P0", "security"),
+                _spec("Important cleanup", "P1", "quality"),
+                _spec("Later cleanup", "P2", "quality"),
             ],
         },
     )
@@ -102,3 +118,68 @@ def test_file_ideas_for_plan_filters_and_deduplicates(monkeypatch) -> None:
     assert len(calls) == 2
     assert calls[0][-1] == "Critical fix"
     assert calls[1][-1] == "Important cleanup"
+
+
+def test_file_ideas_for_plan_skips_unspecified_improvements(monkeypatch) -> None:
+    """An improvement with no real approach/criteria is dropped, not dressed up.
+
+    This is the regression that mattered: the old code synthesized
+    "Implement '<title>' (P0)" and "'<title>' is implemented and usable as
+    described", which satisfied file-idea.py's schema check while telling the
+    builder nothing.
+    """
+    monkeypatch.setattr(main, "_resolve_file_idea_script", lambda: Path("/tmp/fake-file-idea.py"))
+    monkeypatch.setattr(main, "_build_run_references", lambda: "- commit: `abc`")
+    monkeypatch.setattr(
+        main,
+        "_build_file_idea_command",
+        lambda script_path, repo, improvement, references, dry_run: [
+            "python", str(script_path), improvement["title"],
+        ],
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        main.subprocess, "run",
+        lambda cmd, capture_output, text: (
+            calls.append(cmd), SimpleNamespace(returncode=0, stdout="", stderr="")
+        )[1],
+    )
+
+    filed = main.file_ideas_for_plan(
+        repo="samoletovs/era",
+        plan={
+            "improvements": [
+                # No approach or criteria at all.
+                {"title": "Increase Test Coverage", "priority": "P0", "category": "quality"},
+                # Present, but only restates the title — the old synthesized form.
+                {
+                    "title": "Add heartbeat system",
+                    "priority": "P0",
+                    "category": "quality",
+                    "approach": "Implement 'Add heartbeat system' (P0).",
+                    "success_criteria": (
+                        "'Add heartbeat system' is implemented and usable as described, "
+                        "with no regression to existing flows."
+                    ),
+                },
+                _spec("Fix the retry backoff", "P0", "quality"),
+            ],
+        },
+    )
+
+    assert filed == 1
+    assert [c[-1] for c in calls] == ["Fix the retry backoff"]
+
+
+def test_is_specified_accepts_a_real_memo_and_rejects_filler() -> None:
+    assert main.is_specified({
+        "title": "Add unit tests for foundry_agent.py",
+        "approach": "Add tests/test_foundry_agent.py covering build_plan_task and submit_plan.",
+        "success_criteria": "pytest -q reports >=60 passing tests, up from 40.",
+    })
+    assert not main.is_specified({
+        "title": "Increase Test Coverage",
+        "approach": "Implement 'Increase Test Coverage' (P0).",
+        "success_criteria": "'Increase Test Coverage' is implemented and usable as described.",
+    })
+    assert not main.is_specified({"title": "Increase Test Coverage"})

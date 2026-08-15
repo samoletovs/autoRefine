@@ -294,6 +294,46 @@ def _effort_to_requests(effort: object) -> str:
     return {"S": "20", "M": "40", "L": "80"}.get(str(effort or "").strip().upper(), "40")
 
 
+def is_specified(improvement: dict) -> bool:
+    """True when the model supplied a real approach and a checkable success criterion.
+
+    We used to synthesize both from the title so file-idea.py's schema check would
+    pass. It passed; the memos were empty. 81 ideas reached the approval queue
+    carrying "Implement '<title>' (P0)" as their plan and "'<title>' is implemented
+    and usable as described" as their acceptance test — nothing a builder could act
+    on, nothing a reviewer could check, and courier's recipient management got built
+    four separate times because no one could tell it was already done.
+
+    An unspecified improvement is now skipped rather than dressed up. Silence is a
+    better signal than filler: it shows up as a project producing no ideas, which is
+    visible, instead of a queue of work nobody can start.
+    """
+    approach = str(improvement.get("approach", "")).strip()
+    criteria = str(improvement.get("success_criteria", "")).strip()
+    if not approach or not criteria:
+        return False
+    # Mirror the governance-side guard: a section must say something its title
+    # does not. Cheap local check so we skip before shelling out to file-idea.py.
+    title_words = set(re.sub(r"[^0-9a-zA-Z]+", " ", str(improvement.get("title", ""))).lower().split())
+    for section in (approach, criteria):
+        words = set(re.sub(r"[^0-9a-zA-Z]+", " ", section).lower().split())
+        if len(words - title_words - _FILLER_WORDS) < 2:
+            return False
+    return True
+
+
+# Words common to every memo, so they cannot be what makes one specific.
+_FILLER_WORDS = frozenset("""
+implement implemented implementing implementation add added adding usable used
+as per this that describe described description work works working correct
+correctly proper properly success successful successfully expected regression
+regressions existing current flow flows feature features functionality
+change changes update updates ensure ensures make makes should must will can
+no not any all and or but with without for from into the a an of to in on at
+by is are be been being was were do does done p0 p1 p2 p3
+""".split())
+
+
 def _build_file_idea_command(
     script_path: Path,
     repo: str,
@@ -320,13 +360,10 @@ def _build_file_idea_command(
     _add_option("--source", "autorefine")
     _add_option("--type", idea_type)
     _add_option("--problem", description)
-    _add_option("--approach", f"Implement '{title}' ({improvement.get('priority', 'P2')}).")
-    # file-idea.py enforces the full idea-memo schema; synthesize the remaining required
-    # sections from the improvement so validation passes (these are autoRefine estimates).
-    _add_option(
-        "--success-criteria",
-        f"'{title}' is implemented and usable as described, with no regression to existing flows.",
-    )
+    # Pass the model's own words through. Callers must gate on is_specified()
+    # first — these fields are never fabricated to satisfy validation.
+    _add_option("--approach", str(improvement.get("approach", "")).strip())
+    _add_option("--success-criteria", str(improvement.get("success_criteria", "")).strip())
     _add_option("--sam-time", "10")
     _add_option("--azure-cost", "0")
     _add_option("--copilot-requests", _effort_to_requests(improvement.get("effort")))
@@ -410,6 +447,16 @@ def file_ideas_for_plan(
         if title_key in seen_titles:
             continue
         seen_titles.add(title_key)
+
+        # Skip rather than fabricate. See is_specified().
+        if not is_specified(improvement):
+            log.warning(
+                "Skipping unspecified improvement for %s: %r — the model gave no "
+                "usable approach/success_criteria, and filling them in is what "
+                "flooded the queue with unbuildable ideas.",
+                repo, title,
+            )
+            continue
 
         cmd = _build_file_idea_command(script_path, repo, improvement, references, dry_run=dry_run)
         run = subprocess.run(cmd, capture_output=True, text=True)
@@ -722,6 +769,13 @@ def _file_one_idea(
     dry_run: bool,
 ) -> str | None:
     """File a single idea labelled `needs-approval`. Returns the issue URL (or None)."""
+    if not is_specified(improvement):
+        log.warning(
+            "Skipping unspecified improvement for %s: %r — no usable "
+            "approach/success_criteria to build or judge against.",
+            repo, improvement.get("title", ""),
+        )
+        return None
     cmd = _build_file_idea_command(
         script_path, repo, improvement, references, dry_run=dry_run, needs_approval=True
     )
