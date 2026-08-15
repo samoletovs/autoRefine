@@ -431,6 +431,8 @@ def file_ideas_for_plan(
     priorities = allowed_priorities or DEFAULT_IDEA_PRIORITIES
     references = _build_run_references()
     filed = 0
+    considered = 0
+    unspecified = 0
     seen_titles: set[str] = set()
 
     for improvement in plan.get("improvements", []):
@@ -447,9 +449,11 @@ def file_ideas_for_plan(
         if title_key in seen_titles:
             continue
         seen_titles.add(title_key)
+        considered += 1
 
         # Skip rather than fabricate. See is_specified().
         if not is_specified(improvement):
+            unspecified += 1
             log.warning(
                 "Skipping unspecified improvement for %s: %r — the model gave no "
                 "usable approach/success_criteria, and filling them in is what "
@@ -471,6 +475,20 @@ def file_ideas_for_plan(
                 run.stdout.strip(),
                 run.stderr.strip(),
             )
+
+    # Silence has two very different causes and they need different fixes: the project
+    # is genuinely fine, or the model stopped answering the question. Say which.
+    # Without this the first looks exactly like the second, which is how a broken
+    # ideator stays broken.
+    if considered and unspecified == considered:
+        log.error(
+            "%s: all %d improvement(s) were unspecified — the model is not supplying "
+            "approach/success_criteria. This is a prompt or model problem, not a quiet "
+            "project; no ideas were filed.",
+            repo, considered,
+        )
+    elif unspecified:
+        log.warning("%s: filed %d, dropped %d unspecified.", repo, filed, unspecified)
 
     return filed
 

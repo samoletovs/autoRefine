@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -183,3 +184,23 @@ def test_is_specified_accepts_a_real_memo_and_rejects_filler() -> None:
         "success_criteria": "'Increase Test Coverage' is implemented and usable as described.",
     })
     assert not main.is_specified({"title": "Increase Test Coverage"})
+
+
+def test_all_unspecified_is_logged_as_an_error_not_silence(monkeypatch, caplog) -> None:
+    """A model that stopped answering must not look like a healthy quiet project."""
+    monkeypatch.setattr(main, "_resolve_file_idea_script", lambda: Path("/tmp/fake-file-idea.py"))
+    monkeypatch.setattr(main, "_build_run_references", lambda: "- commit: `abc`")
+
+    with caplog.at_level(logging.ERROR):
+        filed = main.file_ideas_for_plan(
+            repo="samoletovs/era",
+            plan={
+                "improvements": [
+                    {"title": "Increase Test Coverage", "priority": "P0", "category": "quality"},
+                    {"title": "Enhance Documentation", "priority": "P0", "category": "docs"},
+                ],
+            },
+        )
+
+    assert filed == 0
+    assert any("not supplying" in record.getMessage() for record in caplog.records)
