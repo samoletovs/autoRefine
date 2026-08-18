@@ -34,6 +34,9 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 MANIFEST_PATH = Path(__file__).parent.parent.parent / ".github" / "config" / "workspace-manifest.json"
 REPO_ROOT = Path(__file__).resolve().parent.parent
+# Manifest statuses that mean "no further work is wanted here". Evaluating these bought
+# nothing and cost a great deal - see load_repos_from_manifest.
+FINISHED_STATUSES = frozenset({"archived", "complete", "deleted"})
 DEFAULT_IDEA_PRIORITIES = {"P0", "P1"}
 BUGFIX_CATEGORIES = {
     "bug",
@@ -82,10 +85,28 @@ WIKI_CONTEXT_OTHER_CAP = 2
 
 
 def load_repos_from_manifest(manifest_path: Path) -> list[str]:
-    """Load repo list from workspace-manifest.json."""
+    """Load repo list from workspace-manifest.json, skipping finished projects.
+
+    Only `archived` used to be skipped, which meant a project marked `complete` kept
+    being evaluated, kept having ideas filed against it, and kept having them approved
+    and assigned. Each assignment starts a 10-30 minute Copilot agent run whose PR then
+    triggers CI, triage, auto-label and auto-merge.
+
+    amberRepublic is what that costs: `status: complete` in the manifest and 191
+    workflow runs in a single month - 545 billable Actions minutes, 11.7% of the fleet's
+    entire bill - proposing improvements to a project nobody had asked to change, while
+    the account sat at 243% of its allowance. Running out stops every workflow on the
+    account, including the ones that recover it.
+
+    "Complete" has to mean the loop stops, or it means nothing.
+    """
     with open(manifest_path, encoding="utf-8") as f:
         data = json.load(f)
-    return [p["repo"] for p in data.get("projects", []) if p.get("status") != "archived"]
+    return [
+        p["repo"]
+        for p in data.get("projects", [])
+        if p.get("status") not in FINISHED_STATUSES
+    ]
 
 
 def evaluate_project(project_dir: Path, config: ProjectConfig) -> dict:

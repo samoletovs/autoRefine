@@ -45,6 +45,33 @@ def test_load_repos_from_manifest_filters_archived(tmp_path: Path) -> None:
     assert repos == ["owner/active", "owner/default-active"]
 
 
+def test_load_repos_from_manifest_skips_finished_projects(tmp_path: Path) -> None:
+    """A finished project must stop attracting new work.
+
+    Only `archived` was skipped before, so amberRepublic - `status: complete` - kept
+    being evaluated and kept having ideas filed, approved and assigned to the coding
+    agent. That cascade ran 191 times in one month for 545 billable Actions minutes,
+    on a project nobody had asked to change.
+    """
+    manifest = tmp_path / "workspace-manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "projects": [
+                    {"repo": "owner/active", "status": "active"},
+                    {"repo": "owner/mvp", "status": "mvp"},
+                    {"repo": "owner/complete", "status": "complete"},
+                    {"repo": "owner/archived", "status": "archived"},
+                    {"repo": "owner/deleted", "status": "deleted"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert load_repos_from_manifest(manifest) == ["owner/active", "owner/mvp"]
+
+
 def test_load_config_reads_project_yaml(tmp_path: Path) -> None:
     project_dir = tmp_path / "demo"
     project_dir.mkdir()
