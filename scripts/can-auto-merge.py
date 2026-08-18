@@ -33,6 +33,7 @@ import subprocess
 import sys
 import urllib.parse
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Iterable
 
 # Windows stdout defaults to cp1252; force UTF-8 so JSON / emoji output works.
@@ -41,42 +42,80 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # ----- gate configuration ----------------------------------------------------
-#
-# Repo-specific patterns: autoRefine source code lives in `agent/` and
-# `scripts/` rather than the governance repo's `src/`. We include them in
-# BOTH LOW_RISK (so the file-tier gate doesn't escalate) and HIGH_RISK
-# (so the closed loop runs Claude deep-review before merging). The result
-# is: every agent/scripts change requires a deep-review APPROVE verdict,
-# while plain *.md / test files auto-merge with CI alone.
-#
-# Future work: lift these into config/auto-review-patterns.json so every
-# repo can ship its own allowlist without forking the script.
 
-LOW_RISK_PATTERNS: list[re.Pattern[str]] = [
+# Governance repo defaults: scripts/ and .github/workflows/ are in BOTH
+# LOW_RISK (so Gate 2 doesn't block them) and HIGH_RISK (so Claude deep-review
+# must APPROVE before merge). This lets Copilot evolve governance scripts and
+# workflows autonomously, gated only by the LLM review — not a human.
+#
+# These lists are the *fallback*. The live values come from
+# config/auto-review-patterns.json when it exists, so a repo can ship its own
+# tiers without forking this script — which is what nauroLabs-github and
+# autoRefine had done, drifting 37 lines apart by 2026-08-18. Keeping the
+# defaults compiled in means a missing or corrupt config weakens nothing.
+DEFAULT_LOW_RISK_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\.md$", re.IGNORECASE),
     re.compile(r"\.json$", re.IGNORECASE),
-    re.compile(r"\.yml$", re.IGNORECASE),
-    re.compile(r"\.yaml$", re.IGNORECASE),
     re.compile(r"^tests/"),
-    re.compile(r"^docs/"),
+    re.compile(r"^skills/"),
+    re.compile(r"^wiki/"),
     re.compile(r"^reports/"),
-    re.compile(r"^agent/"),
-    re.compile(r"^scripts/"),
-    re.compile(r"^\.github/"),
+    re.compile(r"^\.github/workflow-templates/"),
+    re.compile(r"^\.github/workflows/"),   # workflow changes allowed; deep review required
+    re.compile(r"^scripts/"),              # script changes allowed; deep review required
     re.compile(r"(^|/)\.gitkeep$"),
-    re.compile(r"(^|/)\.env\.example$"),
-    re.compile(r"(^|/)requirements.*\.txt$", re.IGNORECASE),
 ]
 
-HIGH_RISK_PATTERNS: list[re.Pattern[str]] = [
+DEFAULT_HIGH_RISK_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"^src/"),
     re.compile(r"^infrastructure/"),
+    re.compile(r"^api/"),
     re.compile(r"\.bicep$", re.IGNORECASE),
-    re.compile(r"^agent/"),
-    re.compile(r"^scripts/"),
     re.compile(r"auth", re.IGNORECASE),
     re.compile(r"secret", re.IGNORECASE),
     re.compile(r"credential", re.IGNORECASE),
+    re.compile(r"^\.github/workflows/"),   # workflow changes need Claude deep review
+    re.compile(r"^scripts/"),              # script changes need Claude deep review
 ]
+
+PATTERNS_PATH = Path(__file__).resolve().parent.parent / "config" / "auto-review-patterns.json"
+
+
+def load_patterns(
+    path: Path | None = None,
+) -> tuple[list[re.Pattern[str]], list[re.Pattern[str]]]:
+    """Return (low_risk, high_risk) from the config file, or the built-in defaults.
+
+    Every failure mode returns the defaults rather than an empty list. An empty
+    low-risk list would block every merge (loud, harmless); an empty high-risk
+    list would merge infrastructure changes with no review at all (silent, not
+    harmless). Falling back to the stricter known-good set is the only safe
+    reading of a broken config.
+    """
+    path = path or PATTERNS_PATH
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return list(DEFAULT_LOW_RISK_PATTERNS), list(DEFAULT_HIGH_RISK_PATTERNS)
+
+    def compile_list(key: str, fallback: list[re.Pattern[str]]) -> list[re.Pattern[str]]:
+        raw = data.get(key)
+        if not isinstance(raw, list) or not raw:
+            return list(fallback)
+        compiled = []
+        for entry in raw:
+            try:
+                compiled.append(re.compile(str(entry)))
+            except re.error:
+                # One bad regex must not silently shrink the tier it belongs to.
+                return list(fallback)
+        return compiled
+
+    return (compile_list("low_risk", DEFAULT_LOW_RISK_PATTERNS),
+            compile_list("high_risk", DEFAULT_HIGH_RISK_PATTERNS))
+
+
+LOW_RISK_PATTERNS, HIGH_RISK_PATTERNS = load_patterns()
 
 RISKY_LABELS: frozenset[str] = frozenset({
     "bicep", "secret", "dns", "major-bump", "auth", "breaking-change",

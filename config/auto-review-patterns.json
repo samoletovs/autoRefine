@@ -1,0 +1,31 @@
+{
+  "$comment": "File-risk allowlists for scripts/can-auto-merge.py in autoRefine. Split out of the script on 2026-08-18: this repo and nauroLabs-github each carried a full fork of the gate purely to express a different allowlist, and the two copies had drifted 37 lines apart. The script is now identical in both repos; this file is the only thing that differs. Keep it that way — a change belongs here, not in the script.",
+
+  "$semantics": "low_risk decides whether the file-tier gate lets a PR merge unattended at all. high_risk decides whether Claude deep-review must APPROVE first. agent/ and scripts/ appear in both: autoRefine's source lives there, so every source change merges without a human but only after the LLM review passes, while plain docs and tests merge on CI alone.",
+
+  "low_risk": [
+    "(?i)\\.md$",
+    "(?i)\\.json$",
+    "(?i)\\.yml$",
+    "(?i)\\.yaml$",
+    "^tests/",
+    "^docs/",
+    "^reports/",
+    "^agent/",
+    "^scripts/",
+    "^\\.github/",
+    "(^|/)\\.gitkeep$",
+    "(^|/)\\.env\\.example$",
+    "(?i)(^|/)requirements.*\\.txt$"
+  ],
+
+  "high_risk": [
+    "^infrastructure/",
+    "(?i)\\.bicep$",
+    "^agent/",
+    "^scripts/",
+    "(?i)auth",
+    "(?i)secret",
+    "(?i)credential"
+  ]
+}
