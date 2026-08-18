@@ -13,3 +13,6 @@ __pycache__/
 htmlcov/
 .venv/
 venv/
+
+# Local-only personal-info pattern overrides
+scripts/.leak-patterns.local.txt
