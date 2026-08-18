@@ -12,11 +12,17 @@ name: "autoRefine — PR approval cards"
 
 on:
   schedule:
-    # Every two hours during waking hours (UTC). Most runs are no-ops; a card is only sent
-    # when a ready, green Copilot PR appears. Hourly meant ~17 sweeps a day to catch a
-    # handful of PRs, and the hourly PR janitor is what actually keeps merges moving - this
-    # sweep only decides how soon the card reaches the phone.
-    - cron: '0 6-22/2 * * *'
+    # Every four hours during waking hours (UTC): 06, 10, 14, 18, 22 — five sweeps a day.
+    # Most runs are no-ops; a card is only sent when a ready, green Copilot PR appears,
+    # and the PR janitor is what actually keeps merges moving. This sweep only decides
+    # how soon the card reaches the phone, so its cadence buys latency, not correctness.
+    #
+    # It ran two-hourly (nine sweeps a day, 270 runs a month) and was invisible to the
+    # budget while it did: cronspec could not read a `6-22/2` range and returned None,
+    # which callers treat as "leave it alone", so the single largest scheduled line in
+    # this repo was priced at zero. Now that it is counted, four-hourly removes 120
+    # runs/month for at most a four-hour wait on a notification.
+    - cron: '0 6-22/4 * * *'
   workflow_dispatch:
 
 permissions:
