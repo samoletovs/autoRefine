@@ -246,6 +246,30 @@ def _any_match(filename: str, patterns: Iterable[re.Pattern[str]]) -> bool:
     return any(p.search(filename) for p in patterns)
 
 
+def is_major_dependency_bump(title: str) -> bool:
+    """Does this PR title describe a major version bump?
+
+    `dependabot-auto-merge.yml` refuses these in all 12 repos that carry it -
+    "Never auto-merge a major version bump, leave it for a human." pr-janitor,
+    which sweeps every 6h as the backstop for exactly those workflows, had no
+    such guard: it merged on file-tier plus checks alone. So the backstop was
+    strictly MORE permissive than the fast path it backs up, and a major bump
+    that the per-repo workflow deliberately declined would be merged unattended
+    a few hours later.
+
+    Latent rather than live so far - all four PRs the janitor merged on
+    2026-08-20 were minor (5.5.8 to 5.11.0, 1.1.4 to 1.3.1). Fixed before it
+    stops being latent.
+
+    Matches Dependabot's own title format: "bump <pkg> from 1.2.3 to 2.0.0".
+    A title that does not parse is not treated as major - this gate exists to
+    catch a specific known-unsafe shape, and every other gate still applies.
+    """
+    match = re.search(
+        r"\bfrom\s+v?(\d+)\.\S*\s+to\s+v?(\d+)\.", title or "", re.IGNORECASE)
+    return bool(match) and match.group(1) != match.group(2)
+
+
 def evaluate(repo: str, pr_number: int) -> GateResult:
     pr_obj = _gh_json(["api", f"/repos/{repo}/pulls/{pr_number}"])
     assert isinstance(pr_obj, dict)
@@ -316,6 +340,26 @@ def evaluate(repo: str, pr_number: int) -> GateResult:
             reason=f"risky label(s) applied: {', '.join(risky_labels_found)}",
             low_risk_only=low_risk_only,
             has_risky_label=True,
+            under_daily_cap=under_daily_cap,
+            under_org_daily_cap=under_org_daily_cap,
+            needs_deep_review=needs_deep_review,
+            merged_today=merged_today,
+            merged_today_org=merged_today_org,
+            files_count=len(filenames),
+            risky_labels_found=risky_labels_found,
+            high_risk_files=high_risk,
+            non_low_risk_files=non_low_risk,
+        )
+    if is_major_dependency_bump(pr_obj.get("title") or ""):
+        return GateResult(
+            can_merge=False,
+            gate_failed="major-bump",
+            reason=(
+                "major version bump — the per-repo dependabot-auto-merge "
+                "workflow declines these, so this backstop must too"
+            ),
+            low_risk_only=low_risk_only,
+            has_risky_label=False,
             under_daily_cap=under_daily_cap,
             under_org_daily_cap=under_org_daily_cap,
             needs_deep_review=needs_deep_review,
