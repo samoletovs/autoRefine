@@ -40,6 +40,12 @@
 .PARAMETER Quiet
     Suppress non-essential output. Only print failures.
 
+.PARAMETER History
+    Scan every blob ever committed, not just the current tree. Required before
+    making a repo public: a visibility flip publishes the whole history, so a
+    clean working tree proves nothing about what a reader can recover. Slower
+    (it walks all diffs), so it is opt-in rather than the default.
+
 .EXAMPLE
     ./scripts/audit-leaks.ps1
     Scan all tracked-eligible files in the repo.
@@ -47,6 +53,10 @@
 .EXAMPLE
     ./scripts/audit-leaks.ps1 -Staged
     Pre-commit usage — only staged files.
+
+.EXAMPLE
+    ./scripts/audit-leaks.ps1 -History
+    Full-history scan. Run this — not the default — before flipping a repo public.
 
 .EXAMPLE
     ./scripts/audit-leaks.ps1 -ExtraPatterns @('my-project-rg','custom-secret')
@@ -64,6 +74,7 @@ param(
     [string]$PatternsFile,
     [string]$LocalPatternsFile,
     [string[]]$ExtraPatterns = @(),
+    [switch]$History,
     [switch]$Quiet
 )
 
@@ -295,6 +306,49 @@ try {
         }
     }
 
+    # ── Full history ──
+    # A clean working tree says nothing about what a reader can recover: making a repo
+    # public publishes every blob ever committed, and `git log -p` hands the whole lot
+    # over in one command. Scanning only the tip is therefore the wrong gate for the one
+    # decision that matters most here - repository visibility is the largest Actions-cost
+    # lever the lab has, so this check is what stands between saving minutes and
+    # publishing something that cannot be recalled.
+    if ($History -and -not $Staged -and -not $PrePushRange) {
+        Write-Info "Scanning FULL history for $($allPatterns.Count) pattern(s) (this is slower)..."
+
+        # Only the +/- content lines. `git log -p` also emits `commit <sha>`, `Author:`
+        # and `Date:` headers, and a 40-char SHA is a long run of hex digits: scanning
+        # the raw log makes a loose pattern like the phone regex match 562 times on
+        # commit ids and GitHub's numeric noreply handles, which buries the one hit that
+        # is real. File-content leaks live in the diff body, so that is what we scan.
+        $historyText = & git log --all -p --no-color --format='%n' 2>$null |
+            Where-Object { $_ -match '^[+-]' -and $_ -notmatch '^(\+\+\+|---)' } |
+            Out-String
+
+        if ([string]::IsNullOrWhiteSpace($historyText)) {
+            Write-Info "No history to scan." 'Yellow'
+        }
+        else {
+            function Write-HistoryHits([string]$label, [int]$count) {
+                if ($count -le 0) { return 0 }
+                Write-Host ""
+                Write-Host "[LEAK history $label]" -ForegroundColor Red
+                Write-Host ("  {0} occurrence(s) in committed diffs" -f $count) -ForegroundColor Yellow
+                Write-Host "  A visibility flip would publish these. History rewrite required first." -ForegroundColor Yellow
+                return 1
+            }
+
+            foreach ($p in $literalPatterns) {
+                $n = [regex]::Matches($historyText, [regex]::Escape($p), 'IgnoreCase').Count
+                $leaks += (Write-HistoryHits "'$p'" $n)
+            }
+            foreach ($p in $regexPatterns) {
+                $n = [regex]::Matches($historyText, $p, 'IgnoreCase').Count
+                $leaks += (Write-HistoryHits "re:'$p'" $n)
+            }
+        }
+    }
+
     Write-Host ""
     if ($leaks -gt 0) {
         Write-Host "FAIL: $leaks leak(s) found across $($allPatterns.Count) pattern(s)." -ForegroundColor Red
@@ -302,11 +356,15 @@ try {
         Write-Host "      In commit metadata: fix the identity BEFORE pushing - `git config user.email` to your" -ForegroundColor Red
         Write-Host "      <id>+<user>@users.noreply.github.com alias, then rebase to rewrite the affected commits." -ForegroundColor Red
         Write-Host "      Once pushed, GitHub pins those commits behind refs/pull/* that you cannot rewrite." -ForegroundColor Red
+        Write-Host "      In history: the value is in an old commit. It stays readable after a visibility flip" -ForegroundColor Red
+        Write-Host "      until the history is rewritten - and rewriting does not reach refs/pull/* either." -ForegroundColor Red
         Write-Host "      To bypass once (NOT recommended): git push --no-verify" -ForegroundColor DarkGray
         exit 1
     }
     else {
-        Write-Info "OK: clean across $($allPatterns.Count) pattern(s)." 'Green'
+        $scope = if ($History) { "$($allPatterns.Count) pattern(s), full history" }
+                 else { "$($allPatterns.Count) pattern(s)" }
+        Write-Info "OK: clean across $scope." 'Green'
         exit 0
     }
 }
