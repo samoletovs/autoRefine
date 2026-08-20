@@ -126,6 +126,106 @@ ORG_DAILY_CAP: int = 40
 AUTO_MERGED_LABEL: str = "auto-merged"
 REQUIRED_CHECK_OK_CONCLUSIONS: frozenset[str] = frozenset({"success", "neutral", "skipped"})
 
+# A check that has not finished is not a check that passed. ACTION_REQUIRED in
+# particular reads like a status and is actually "a human must approve this
+# workflow before it will run" — the five stuck `Auto-merge Copilot PRs` runs
+# had been sitting in it since 2026-08-13.
+CHECK_INCOMPLETE_STATES: frozenset[str] = frozenset({
+    "queued", "in_progress", "waiting", "pending", "requested", "expected",
+    "action_required",
+})
+
+NO_CI_REPOS_PATH = Path(__file__).resolve().parent.parent / "config" / "no-ci-repos.json"
+
+
+def no_ci_repos() -> dict[str, str]:
+    """Repos documented as having no PR-triggered CI, mapped to why.
+
+    Deliberately a config file rather than a heuristic. Inferring "does this
+    repo have CI" from its workflow files is a guess made at merge time, and a
+    guess that fails open is how this hole existed in the first place.
+    """
+    try:
+        data = json.loads(NO_CI_REPOS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        # Unreadable config means we cannot tell which repos are exempt. Return
+        # nothing, so every repo is treated as CI-bearing and zero checks
+        # blocks. Failing closed on a missing config is the whole point.
+        return {}
+    repos = data.get("repos")
+    return repos if isinstance(repos, dict) else {}
+
+
+def _normalise_check(node: dict) -> tuple[str, str, str]:
+    """Return (name, state, conclusion) lowercased, for either rollup shape.
+
+    statusCheckRollup mixes two node types: CheckRun (status + conclusion) and
+    StatusContext (a single state). Treating them uniformly matters because a
+    repo can be guarded entirely by one or the other.
+    """
+    name = (node.get("name") or node.get("context") or "unnamed").strip()
+    if "state" in node and "status" not in node:
+        state = (node.get("state") or "").strip().lower()
+        return name, state, state
+    status = (node.get("status") or "").strip().lower()
+    conclusion = (node.get("conclusion") or "").strip().lower()
+    return name, status, conclusion
+
+
+def classify_checks(nodes: list[dict], *, repo: str,
+                    exempt: dict[str, str] | None = None,
+                    awaiting_approval: list[str] | None = None) -> tuple[bool, str]:
+    """Decide whether a PR's checks permit an unattended merge.
+
+    Returns (ok, reason). The reason is written for a human reading an
+    escalation, so it names the offending check.
+
+    The rule this replaces was `all(c in OK for c in conclusions)`, and `all()`
+    over an empty sequence is True. With no branch protection requiring any
+    context on any repo, and pr-janitor never fetching the rollup at all, that
+    meant a PR with no checks whatsoever merged unattended. era#63 - "Harden
+    tenant authorization and OAuth token validation", 5 files - reached
+    production that way on 2026-08-21 with 0 check-runs and a commit status of
+    `pending`.
+    """
+    exempt = no_ci_repos() if exempt is None else exempt
+    short = repo.split("/")[-1]
+
+    if not nodes:
+        if awaiting_approval:
+            return False, (
+                f"{len(awaiting_approval)} workflow run(s) awaiting manual "
+                f"approval and so never started: {', '.join(awaiting_approval[:4])}. "
+                f"Approve them in the Actions tab — this is a stuck button, not "
+                f"a repo without CI."
+            )
+        if short in exempt:
+            return True, f"no checks, and {short} is documented as having none: {exempt[short]}"
+        return False, (
+            f"no checks reported — {short} is not on the documented no-CI list, "
+            f"so zero checks means unverified, not verified. Add it to "
+            f"config/no-ci-repos.json if it genuinely has no PR-triggered CI."
+        )
+
+    incomplete: list[str] = []
+    failed: list[str] = []
+    for node in nodes:
+        name, state, conclusion = _normalise_check(node)
+        if state in CHECK_INCOMPLETE_STATES or conclusion in CHECK_INCOMPLETE_STATES:
+            incomplete.append(f"{name} ({state or conclusion})")
+        elif conclusion not in REQUIRED_CHECK_OK_CONCLUSIONS:
+            failed.append(f"{name} ({conclusion or 'no conclusion'})")
+
+    if failed:
+        return False, f"{len(failed)} check(s) not successful: {', '.join(failed[:4])}"
+    if incomplete:
+        return False, (
+            f"{len(incomplete)} check(s) have not finished: "
+            f"{', '.join(incomplete[:4])} — a check that has not completed is "
+            f"not a check that passed"
+        )
+    return True, f"all {len(nodes)} check(s) successful"
+
 
 # ----- result type -----------------------------------------------------------
 
@@ -270,6 +370,52 @@ def is_major_dependency_bump(title: str) -> bool:
     return bool(match) and match.group(1) != match.group(2)
 
 
+def fetch_check_rollup(repo: str, pr_number: int) -> list[dict]:
+    """statusCheckRollup nodes for a PR's head commit.
+
+    Returns [] both when there are genuinely no checks and when the query
+    fails; classify_checks() treats an empty list as blocking unless the repo
+    is on the documented exemption list, so the ambiguity fails closed.
+    """
+    out = _gh_json([
+        "pr", "view", str(pr_number), "--repo", repo,
+        "--json", "statusCheckRollup",
+    ])
+    if not isinstance(out, dict):
+        return []
+    nodes = out.get("statusCheckRollup")
+    return nodes if isinstance(nodes, list) else []
+
+
+def runs_awaiting_approval(repo: str, pr_number: int) -> list[str]:
+    """Workflow runs for this PR's head that a human must approve before they run.
+
+    These are invisible in statusCheckRollup — they produce no check-run,
+    because they never started — so a PR whose entire CI is stuck behind the
+    approval prompt looks identical to a PR with no CI at all. The two need
+    opposite responses: "click approve" versus "this repo has no checks", and
+    telling someone the second when the first is true sends them to widen the
+    exemption list to fix a button-press.
+
+    nauroLabs-github#191 sat like this for two days: Governance Unit Tests,
+    Auto-review and merge, and Auto-merge Dependabot PRs all `action_required`
+    since 2026-08-18, on a PR that edits scripts/, tests/ AND
+    config/schedule-budget.json.
+    """
+    pr = _gh_json(["pr", "view", str(pr_number), "--repo", repo,
+                   "--json", "headRefOid"])
+    if not isinstance(pr, dict) or not pr.get("headRefOid"):
+        return []
+    runs = _gh_json(["api", f"/repos/{repo}/actions/runs?head_sha={pr['headRefOid']}"])
+    if not isinstance(runs, dict):
+        return []
+    return sorted({
+        r.get("name", "unnamed")
+        for r in runs.get("workflow_runs", [])
+        if (r.get("conclusion") or r.get("status") or "").lower() == "action_required"
+    })
+
+
 def evaluate(repo: str, pr_number: int) -> GateResult:
     pr_obj = _gh_json(["api", f"/repos/{repo}/pulls/{pr_number}"])
     assert isinstance(pr_obj, dict)
@@ -332,6 +478,29 @@ def evaluate(repo: str, pr_number: int) -> GateResult:
             merged_today_org=merged_today_org,
             files_count=0,
             risky_labels_found=risky_labels_found,
+        )
+    # Checks first among the content gates: a PR nothing verified must not
+    # merge however low-risk its files look.
+    rollup = fetch_check_rollup(repo, pr_number)
+    checks_ok, checks_reason = classify_checks(
+        rollup, repo=repo,
+        awaiting_approval=runs_awaiting_approval(repo, pr_number) if not rollup else None)
+    if not checks_ok:
+        return GateResult(
+            can_merge=False,
+            gate_failed="checks",
+            reason=checks_reason,
+            low_risk_only=low_risk_only,
+            has_risky_label=has_risky_label,
+            under_daily_cap=under_daily_cap,
+            under_org_daily_cap=under_org_daily_cap,
+            needs_deep_review=needs_deep_review,
+            merged_today=merged_today,
+            merged_today_org=merged_today_org,
+            files_count=len(filenames),
+            risky_labels_found=risky_labels_found,
+            high_risk_files=high_risk,
+            non_low_risk_files=non_low_risk,
         )
     if has_risky_label:
         return GateResult(
