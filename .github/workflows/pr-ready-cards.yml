@@ -12,17 +12,22 @@ name: "autoRefine — PR approval cards"
 
 on:
   schedule:
-    # Every four hours during waking hours (UTC): 06, 10, 14, 18, 22 — five sweeps a day.
-    # Most runs are no-ops; a card is only sent when a ready, green Copilot PR appears,
-    # and the PR janitor is what actually keeps merges moving. This sweep only decides
-    # how soon the card reaches the phone, so its cadence buys latency, not correctness.
+    # Three sweeps a day (UTC): 07, 13, 19 — roughly morning, midday, evening.
+    # Most runs are no-ops; a card is only sent when a ready, green Copilot PR
+    # appears, and the PR janitor is what actually keeps merges moving. This
+    # sweep only decides how soon the card reaches the phone, so its cadence
+    # buys latency, not correctness.
     #
-    # It ran two-hourly (nine sweeps a day, 270 runs a month) and was invisible to the
-    # budget while it did: cronspec could not read a `6-22/2` range and returned None,
-    # which callers treat as "leave it alone", so the single largest scheduled line in
-    # this repo was priced at zero. Now that it is counted, four-hourly removes 120
-    # runs/month for at most a four-hour wait on a notification.
-    - cron: '0 6-22/4 * * *'
+    # It ran two-hourly (nine sweeps a day, 270 runs a month) and was invisible
+    # to the budget while it did: cronspec could not read a `6-22/2` range and
+    # returned None, which callers treat as "leave it alone", so the single
+    # largest scheduled line in this repo was priced at zero. Four-hourly removed
+    # 120 runs/month. Measured against real job billing it was still the largest
+    # line here at ~223 billed min/month — every sweep pays a whole minute for a
+    # few seconds of API calls, because GitHub rounds each job up. Three a day
+    # halves that again for at most an eight-hour wait on a notification that is
+    # already backed by the janitor's own Telegram alert.
+    - cron: '0 7,13,19 * * *'
   workflow_dispatch:
 
 permissions:
