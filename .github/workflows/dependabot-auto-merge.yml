@@ -120,6 +120,40 @@ jobs:
               console.log(`Auto-merge enabled for PR #${prNumber}`);
             } catch (e) {
               console.log(`Native auto-merge unavailable (${e.message}); merging directly.`);
-              await github.rest.pulls.merge({ owner, repo, pull_number: prNumber, merge_method: 'squash' });
-              console.log(`Squash-merged PR #${prNumber}`);
+
+              // The concurrency group is per-PR, so two Dependabot PRs merge at
+              // the same time by design. Whichever lands first moves the base
+              // branch, and the other gets "Base branch was modified" - a race,
+              // not a broken PR. It used to surface as an unhandled error and
+              // fail the run (amberRepublic run 31982131584), which is how this
+              // workflow came to look permanently red while its PRs were in fact
+              // merging fine.
+              let merged = false;
+              for (let attempt = 1; attempt <= 3 && !merged; attempt++) {
+                try {
+                  await github.rest.pulls.merge({
+                    owner, repo, pull_number: prNumber, merge_method: 'squash'
+                  });
+                  merged = true;
+                  console.log(`Squash-merged PR #${prNumber} on attempt ${attempt}`);
+                } catch (mergeErr) {
+                  const msg = mergeErr.message || '';
+                  const racing = /base branch was modified|head branch was modified/i.test(msg);
+                  if (!racing) throw mergeErr;
+                  console.log(`Attempt ${attempt}: ${msg} — re-reading and retrying.`);
+                  await new Promise(r => setTimeout(r, 4000 * attempt));
+                  const fresh = await github.rest.pulls.get({
+                    owner, repo, pull_number: prNumber
+                  });
+                  if (fresh.data.merged || fresh.data.state !== 'open') {
+                    console.log(`PR #${prNumber} is already resolved — nothing to do.`);
+                    merged = true;
+                  }
+                }
+              }
+              if (!merged) {
+                // Not a failure: the next check_suite event retries, and the
+                // 6-hourly PR janitor sweeps anything these events miss.
+                console.log(`::notice::PR #${prNumber} still racing the base branch after 3 attempts; leaving it for the next event or the PR janitor.`);
+              }
             }
