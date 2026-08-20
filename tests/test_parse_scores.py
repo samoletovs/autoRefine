@@ -4,8 +4,6 @@ import json
 import os
 import tempfile
 
-import pytest
-
 from agent.parse_scores import extract_score_objects
 
 

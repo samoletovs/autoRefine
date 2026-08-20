@@ -218,6 +218,9 @@ def _paginate(url: str, per_page: int = 100) -> list[dict]:
         result.extend(chunk)
         if len(chunk) < per_page:
             return result
+        page += 1
+        if page > 50:  # hard safety; we don't expect repos this large in canary
+            return result
 
 
 def _count_org_auto_merges_today(owner: str, today: str) -> int:
@@ -235,9 +238,6 @@ def _count_org_auto_merges_today(owner: str, today: str) -> int:
         print(f"error: unexpected total_count from search/issues: {total_count}",
               file=sys.stderr)
         sys.exit(3)
-        page += 1
-        if page > 50:  # hard safety; we don't expect repos this large in canary
-            return result
 
 
 # ----- gate evaluation -------------------------------------------------------
