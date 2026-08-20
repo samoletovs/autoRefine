@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -46,6 +47,11 @@ DEFAULT_DEPLOYMENT = os.environ.get("FOUNDRY_DEFAULT_DEPLOYMENT", "gpt-4o-mini")
 ENDPOINT = os.environ.get("FOUNDRY_PROJECT_ENDPOINT", "")
 MAX_FOUNDRY_RETRY_ATTEMPTS = 5
 RETRYABLE_FOUNDRY_STATUS_CODES = {429, 502, 503, 504}
+
+AGENT_NAME = "autorefine"
+# Only sweep agents older than a full run. A run is ~43 min today; 6h leaves
+# generous headroom so a concurrent run's live agent is never collected.
+ORPHAN_AGENT_MAX_AGE = timedelta(hours=6)
 
 # Back-compat alias. Older imports referenced DEPLOYMENT directly; keep it
 # pointing at the env-resolved default so any cached imports still work.
@@ -428,6 +434,49 @@ TOOL_HANDLERS = {
 
 # ── Agent orchestration ──────────────────────────────────────────────────────
 
+def sweep_orphaned_agents(
+    client: AgentsClient,
+    max_age: timedelta = ORPHAN_AGENT_MAX_AGE,
+) -> int:
+    """Delete ``autorefine`` agents stranded by runs that died before cleanup.
+
+    Every run creates an ephemeral agent and deletes it in a ``finally`` block,
+    but a hard kill (CI timeout, OOM, container eviction) never reaches that
+    block and leaves the agent behind in the Foundry project. Sweeping on
+    startup makes the leak self-healing: the next run collects it.
+
+    Agents younger than ``max_age`` are left alone so a run happening in
+    parallel never has its live agent deleted out from under it.
+
+    :return: number of orphans deleted.
+    """
+    cutoff = datetime.now(timezone.utc) - max_age
+
+    try:
+        orphans = [
+            agent
+            for agent in client.list_agents()
+            if agent.name == AGENT_NAME and agent.created_at and agent.created_at < cutoff
+        ]
+    except HttpResponseError as exc:
+        log.warning("Could not list agents to sweep orphans: %s", exc)
+        return 0
+
+    swept = 0
+    for agent in orphans:
+        try:
+            client.delete_agent(agent.id)
+        except HttpResponseError as exc:
+            log.warning("Could not delete orphaned agent %s: %s", agent.id, exc)
+            continue
+        swept += 1
+        log.info("Swept orphaned agent %s (created %s)", agent.id, agent.created_at)
+
+    if swept:
+        log.info("Swept %d orphaned %r agent(s) from previous runs.", swept, AGENT_NAME)
+    return swept
+
+
 def create_agent(
     client: AgentsClient,
     mode: str = "plan",
@@ -441,6 +490,10 @@ def create_agent(
         ``gpt-5`` (deep reasoning) — the CLI ``--model`` arg threads
         through to here so callers can pick per-run.
     """
+    # Housekeeping only — never allowed to block agent creation.
+    if hasattr(client, "list_agents"):
+        sweep_orphaned_agents(client)
+
     tool_functions = {
         read_project_file,
         list_directory,
@@ -457,7 +510,7 @@ def create_agent(
 
     agent = client.create_agent(
         model=deployment,
-        name="autorefine",
+        name=AGENT_NAME,
         instructions=SYSTEM_PROMPT,
         tools=tools.definitions,
         temperature=0.3,

@@ -58,6 +58,23 @@ Bump rules:
 - `pytest` + `pytest-asyncio` for tests
 - `ruff` for linting
 
+## Foundry agent lifecycle
+
+autoRefine's agent is **ephemeral**: `create_agent()` makes one per run, `main.py`
+deletes it in a `finally` block. A hard kill (CI timeout, OOM, container eviction)
+never reaches that block, so agents leaked into the Foundry project at roughly one a
+week until 2026-08-20.
+
+`create_agent()` therefore also calls `sweep_orphaned_agents()`, which deletes agents
+named `autorefine` older than `ORPHAN_AGENT_MAX_AGE` (6h) — a crashed run self-heals on
+the next one. **The age gate is load-bearing:** a run takes ~43 min, so anything younger
+may be a live agent belonging to a run in progress. Don't drop the gate, and don't widen
+the name match — `atlas-*` and `lab-memory` share the project and are persistent.
+
+Note the endpoint reads `…/api/projects/{proj}/assistants`. That is **Foundry classic
+agents**, *not* the retired Azure OpenAI Assistants API — see
+[PLATFORM.md §15.2](../.github/PLATFORM.md).
+
 ## Build & run
 
 ```bash

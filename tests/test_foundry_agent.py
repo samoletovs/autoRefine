@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -150,6 +151,94 @@ def test_create_agent_uses_passed_model() -> None:
 
     assert agent_id == "agent-123"
     assert mock_create_agent.call_args.kwargs["model"] == "gpt-4.1"
+
+
+class FakeSweepClient:
+    """Client double exposing just the listing/deleting surface the sweep uses."""
+
+    def __init__(self, agents: list[SimpleNamespace], undeletable: set[str] | None = None) -> None:
+        self._agents = agents
+        self._undeletable = undeletable or set()
+        self.deleted: list[str] = []
+
+    def list_agents(self) -> list[SimpleNamespace]:
+        return self._agents
+
+    def delete_agent(self, agent_id: str) -> None:
+        if agent_id in self._undeletable:
+            raise HttpResponseError("boom")
+        self.deleted.append(agent_id)
+
+    def create_agent(self, **kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(id="agent-new")
+
+
+def _agent(name: str, agent_id: str, age: timedelta) -> SimpleNamespace:
+    return SimpleNamespace(
+        name=name, id=agent_id, created_at=datetime.now(timezone.utc) - age
+    )
+
+
+def test_sweep_deletes_only_stale_autorefine_agents() -> None:
+    client = FakeSweepClient(
+        [
+            _agent("autorefine", "stale-1", timedelta(days=5)),
+            _agent("autorefine", "stale-2", timedelta(hours=7)),
+            _agent("autorefine", "live", timedelta(minutes=20)),
+            _agent("atlas-teacher", "other-project", timedelta(days=90)),
+        ]
+    )
+
+    swept = foundry_agent.sweep_orphaned_agents(client)
+
+    assert swept == 2
+    assert client.deleted == ["stale-1", "stale-2"]
+
+
+def test_sweep_ignores_agents_without_creation_time() -> None:
+    client = FakeSweepClient([SimpleNamespace(name="autorefine", id="x", created_at=None)])
+
+    assert foundry_agent.sweep_orphaned_agents(client) == 0
+    assert client.deleted == []
+
+
+def test_sweep_returns_zero_when_listing_fails() -> None:
+    client = SimpleNamespace()
+    with patch.object(
+        client, "list_agents", side_effect=HttpResponseError("nope"), create=True
+    ):
+        assert foundry_agent.sweep_orphaned_agents(client) == 0
+
+
+def test_sweep_continues_after_a_failed_delete() -> None:
+    client = FakeSweepClient(
+        [
+            _agent("autorefine", "undeletable", timedelta(days=2)),
+            _agent("autorefine", "deletable", timedelta(days=2)),
+        ],
+        undeletable={"undeletable"},
+    )
+
+    assert foundry_agent.sweep_orphaned_agents(client) == 1
+    assert client.deleted == ["deletable"]
+
+
+def test_create_agent_sweeps_orphans_before_creating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(foundry_agent, "FunctionTool", FakeFunctionTool)
+    client = FakeSweepClient([_agent("autorefine", "stale", timedelta(days=3))])
+
+    assert foundry_agent.create_agent(client, mode="plan") == "agent-new"
+    assert client.deleted == ["stale"]
+
+
+def test_create_agent_still_works_when_client_cannot_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(foundry_agent, "FunctionTool", FakeFunctionTool)
+
+    assert foundry_agent.create_agent(FakeClient(), mode="plan") == "agent-1"
 
 
 def test_tool_definition_stubs_return_empty_string() -> None:
