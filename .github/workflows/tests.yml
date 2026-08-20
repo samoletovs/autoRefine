@@ -1,0 +1,61 @@
+name: Tests
+
+# autoRefine is the lab's own evaluator — it scores ideas, files memos and, via
+# scripts/can-auto-merge.py, decides what merges unattended. It had 261 passing
+# tests and seven workflows, none of which ran them, so every change to the
+# thing that gates other changes went out unverified.
+#
+# Deliberately a separate workflow rather than a step in an existing one: the
+# others are scheduled or issue-triggered, so they fire when nothing has
+# changed and stay silent when code does. Tests belong on the code event.
+#
+# No cron here — this adds nothing to the schedule ceiling in
+# nauroLabs-github/config/schedule-budget.json. Path-filtered because the repo
+# is private and its minutes come out of the monthly allowance.
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - "agent/**"
+      - "scripts/**"
+      - "tests/**"
+      - "config/**"
+      - "requirements.txt"
+      - ".github/workflows/tests.yml"
+  pull_request:
+    paths:
+      - "agent/**"
+      - "scripts/**"
+      - "tests/**"
+      - "config/**"
+      - "requirements.txt"
+      - ".github/workflows/tests.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+
+      - name: Run tests
+        run: python -m pytest tests -q
