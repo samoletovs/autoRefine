@@ -346,6 +346,56 @@ def _any_match(filename: str, patterns: Iterable[re.Pattern[str]]) -> bool:
     return any(p.search(filename) for p in patterns)
 
 
+# Boilerplate the cloud agent emits when it never wrote a description. Compared
+# after whitespace-collapsing and lowercasing.
+BOILERPLATE_DESCRIPTIONS: frozenset[str] = frozenset({
+    "pull request created by ai agent",
+    "pull request created by copilot",
+    "no description provided",
+})
+
+# Measured, not guessed. Sampled across turgo, rosette, atlas and era on
+# 2026-08-21, cloud-agent PR bodies run 432-3,053 characters; the shortest
+# genuine description was era#58 at 432. The two defective PRs that merged into
+# this repo that morning were both exactly 32 ("Pull request created by AI
+# Agent"). 120 sits an order of magnitude clear of the boilerplate and well
+# under the shortest real description, so it separates the two populations
+# without arbitrating between good descriptions.
+MIN_DESCRIPTION_CHARS: int = 120
+
+_HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+
+
+def is_unreviewable_description(body: str | None) -> bool:
+    """Is this PR body too thin for anyone to review the merge after the fact?
+
+    Unattended merge trades human review for automation, and the PR description
+    is what the trade leaves behind — the one artifact that survives into the
+    notification, the digest and the phone screen. When it says nothing, nobody
+    can tell what shipped without reading the diff, which is exactly what
+    unattended merge assumed nobody would do.
+
+    It is also a usable quality signal in its own right. On 2026-08-21 the only
+    two cloud-agent PRs in the fleet carrying boilerplate bodies were
+    nauroLabs-github#200 and #201 — and both shipped defects: a `parse_mode=
+    Markdown` send that 400s on ordinary PR titles, a `|| true` that hides the
+    failure, a digest that marked truncated items as delivered, and a "fix" for
+    a dead Telegram channel that never once checked whether the channel was
+    alive. A session that could not explain itself had not understood the
+    problem.
+
+    HTML comments are stripped before measuring: a body consisting only of a
+    hidden template comment is empty to every reader.
+    """
+    text = _HTML_COMMENT.sub("", body or "").strip()
+    if not text:
+        return True
+    collapsed = " ".join(text.split()).lower().rstrip(".")
+    if collapsed in BOILERPLATE_DESCRIPTIONS:
+        return True
+    return len(text) < MIN_DESCRIPTION_CHARS
+
+
 def is_major_dependency_bump(title: str) -> bool:
     """Does this PR title describe a major version bump?
 
@@ -478,6 +528,30 @@ def evaluate(repo: str, pr_number: int) -> GateResult:
             merged_today_org=merged_today_org,
             files_count=0,
             risky_labels_found=risky_labels_found,
+        )
+    # An undescribed PR is checked before anything that costs an API call: it is
+    # a property of the PR as submitted, and no amount of green CI makes a merge
+    # nobody can account for afterwards a good idea.
+    if is_unreviewable_description(pr_obj.get("body")):
+        return GateResult(
+            can_merge=False,
+            gate_failed="undescribed",
+            reason=(
+                "PR description is empty or boilerplate — unattended merge "
+                "leaves the description as the only record of what shipped, "
+                "and it is all a reviewer on a phone can read"
+            ),
+            low_risk_only=low_risk_only,
+            has_risky_label=has_risky_label,
+            under_daily_cap=under_daily_cap,
+            under_org_daily_cap=under_org_daily_cap,
+            needs_deep_review=needs_deep_review,
+            merged_today=merged_today,
+            merged_today_org=merged_today_org,
+            files_count=len(filenames),
+            risky_labels_found=risky_labels_found,
+            high_risk_files=high_risk,
+            non_low_risk_files=non_low_risk,
         )
     # Checks first among the content gates: a PR nothing verified must not
     # merge however low-risk its files look.
