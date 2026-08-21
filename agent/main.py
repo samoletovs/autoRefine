@@ -109,6 +109,26 @@ DEFAULT_ACTIVITY_LOOKBACK_HOURS = 26
 # or retried schedule, so a commit cannot fall between two windows and be missed.
 DEFAULT_ROTATION_DAYS = 7
 
+# Priority scales the staleness floor, so attention follows the owner's actual
+# interest rather than being spread evenly over 25 experiments.
+#
+# Before this, every project got the same guaranteed slot regardless of whether it
+# was a flagship or an idea nobody has touched since spring. That is the wrong
+# default for a lab whose whole constraint is budget: each planning run costs Foundry
+# tokens, and each idea it files can start a 10-30 minute Copilot run. Spending the
+# same on `payArc` (stage: idea) as on `era` (the flagship Q1 experiment) is a choice,
+# and it was being made by omission.
+#
+# Multipliers, applied to AUTOREFINE_ROTATION_DAYS. Activity still overrides both:
+# a project that was committed to inside the lookback window is always planned,
+# whatever its priority, so a burst of work on a `low` project is never ignored.
+PRIORITY_ROTATION_FACTOR = {
+    "top": 0.5,     # ~3-4 days
+    "normal": 1.0,  # ~7 days
+    "low": 3.0,     # ~21 days
+}
+DEFAULT_PRIORITY = "normal"
+
 # Paths the lab's own cross-repo housekeeping rewrites in every project on the same
 # day: a licence sweep, a synced security script, a governance workflow update. On
 # 2026-08-21 three such sweeps had touched 22 of 24 projects inside 28 hours, so a
@@ -215,10 +235,23 @@ def _rotation_days() -> int:
     return max(days, 1)
 
 
+def _rotation_days_for(priority: str | None = None) -> int:
+    """Staleness floor in days, scaled by the project's priority.
+
+    An unknown or missing priority is treated as ``normal`` — a project that has not
+    been triaged should not silently drop to a 21-day cadence.
+    """
+    base = _rotation_days()
+    factor = PRIORITY_ROTATION_FACTOR.get((priority or DEFAULT_PRIORITY).lower(),
+                                          PRIORITY_ROTATION_FACTOR[DEFAULT_PRIORITY])
+    return max(int(round(base * factor)), 1)
+
+
 def should_plan_repo(
     repo: str,
     project_dir: Path,
     now: datetime | None = None,
+    priority: str | None = None,
 ) -> tuple[bool, str]:
     """Decide whether a swept project earns its Foundry planning runs this cycle.
 
@@ -238,15 +271,23 @@ def should_plan_repo(
         return True, f"changed {age:.1f}h ago (within {lookback:.0f}h)"
 
     since = "no substantive commit ever" if age == float("inf") else f"idle {age:.1f}h"
-    rotation_days = _rotation_days()
+    rotation_days = _rotation_days_for(priority)
+    pri = (priority or DEFAULT_PRIORITY).lower()
     if _rotation_slot_due(repo, now, rotation_days):
-        return True, f"{since} but rotation slot due (every {rotation_days}d)"
+        return True, f"{since} but rotation slot due (every {rotation_days}d, priority={pri})"
 
-    return False, f"{since}, housekeeping only, and not in today's rotation slot"
+    return (False,
+            f"{since}, housekeeping only, and not in today's rotation slot "
+            f"(every {rotation_days}d, priority={pri})")
 
 
 def load_repos_from_manifest(manifest_path: Path) -> list[str]:
     """Load repo list from workspace-manifest.json, skipping finished projects.
+
+    Ordered by priority, highest first. Ordering matters whenever a run is cut
+    short — by a timeout, a budget brake, or a crash — because whatever it did get
+    to should be the work the owner cares about most, not whichever project sorted
+    first alphabetically.
 
     Only `archived` used to be skipped, which meant a project marked `complete` kept
     being evaluated, kept having ideas filed against it, and kept having them approved
@@ -263,11 +304,33 @@ def load_repos_from_manifest(manifest_path: Path) -> list[str]:
     """
     with open(manifest_path, encoding="utf-8") as f:
         data = json.load(f)
-    return [
-        p["repo"]
+    live = [p for p in data.get("projects", [])
+            if p.get("status") not in FINISHED_STATUSES]
+    rank = {"top": 0, "normal": 1, "low": 2}
+    live.sort(key=lambda p: (rank.get(str(p.get("priority", DEFAULT_PRIORITY)).lower(), 1),
+                             p.get("repo", "")))
+    return [p["repo"] for p in live]
+
+
+def load_priorities_from_manifest(manifest_path: Path) -> dict[str, str]:
+    """``{repo_slug: priority}`` so the planning gate can scale its rotation.
+
+    Read separately rather than threaded through the repo list, because the list is
+    also built from ``--repo`` arguments where no manifest entry exists. A repo absent
+    here is planned at ``normal`` cadence, never silently demoted.
+    """
+    try:
+        with open(manifest_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning("Cannot read priorities from %s: %s — treating all as %s",
+                    manifest_path, exc, DEFAULT_PRIORITY)
+        return {}
+    return {
+        p["repo"]: str(p.get("priority", DEFAULT_PRIORITY)).lower()
         for p in data.get("projects", [])
-        if p.get("status") not in FINISHED_STATUSES
-    ]
+        if p.get("repo")
+    }
 
 
 def evaluate_project(project_dir: Path, config: ProjectConfig) -> dict:
@@ -1493,14 +1556,17 @@ def main() -> None:
     # Resolve repo list
     repos: list[str] = []
     swept_manifest = False
+    priorities: dict[str, str] = {}
     if args.repo:
         repos = [args.repo]
     elif args.manifest:
         repos = load_repos_from_manifest(Path(args.manifest))
+        priorities = load_priorities_from_manifest(Path(args.manifest))
         swept_manifest = True
     else:
         if MANIFEST_PATH.exists():
             repos = load_repos_from_manifest(MANIFEST_PATH)
+            priorities = load_priorities_from_manifest(MANIFEST_PATH)
             swept_manifest = True
         else:
             log.error("No --repo or --manifest specified and no default manifest found.")
@@ -1540,6 +1606,7 @@ def main() -> None:
         dry_run=args.dry_run,
         workdir=Path(args.workdir),
         gate_on_activity=swept_manifest,
+        priorities=priorities,
     )
     config.workdir.mkdir(parents=True, exist_ok=True)
 
@@ -1627,7 +1694,9 @@ def _process_repo(repo: str, config: AutoRefineConfig) -> None:
         # the Telegram summary still cover the whole fleet. Only the Foundry planning
         # below is gated, and only on a manifest sweep.
         if config.gate_on_activity:
-            planning_due, reason = should_plan_repo(repo, project_dir)
+            planning_due, reason = should_plan_repo(
+                repo, project_dir, priority=config.priorities.get(repo)
+            )
             if not planning_due:
                 log.info("Skipping Foundry planning for %s — %s", name, reason)
                 return

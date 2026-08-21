@@ -264,3 +264,117 @@ def test_explicit_single_repo_is_never_gated(
     calls = _sweep(tmp_path, monkeypatch, repo, gate_on_activity=False)
 
     assert calls == ["plan_project", "plan_functional"]
+
+
+# ── Priority-scaled rotation ────────────────────────────────────────────────────
+# Added 2026-08-21. Before this, every one of 25 experiments got the same guaranteed
+# rotation slot, so `payArc` (stage: idea, untouched since spring) cost the same
+# Foundry planning and filed ideas at the same rate as `era`, the flagship Q1
+# experiment. In a lab whose binding constraint is budget that is a real allocation
+# decision, and it was being made by omission.
+#
+# These pin the behaviour, not the storage: a `priority` field nothing acts on would
+# pass a shape test and change nothing.
+
+
+def test_top_priority_rotates_sooner_than_normal():
+    assert main._rotation_days_for("top") < main._rotation_days_for("normal")
+
+
+def test_low_priority_rotates_later_than_normal():
+    assert main._rotation_days_for("low") > main._rotation_days_for("normal")
+
+
+@pytest.mark.parametrize("value", ["banana", None, "", "TOP-ish"])
+def test_untriaged_priority_is_treated_as_normal(value):
+    """A project nobody has triaged must never silently drop to the 21-day cadence."""
+    if value == "TOP-ish":
+        assert main._rotation_days_for(value) == main._rotation_days_for("normal")
+    else:
+        assert main._rotation_days_for(value) == main._rotation_days_for("normal")
+
+
+def test_case_is_ignored():
+    assert main._rotation_days_for("TOP") == main._rotation_days_for("top")
+
+
+def test_rotation_never_drops_below_one_day(monkeypatch):
+    monkeypatch.setenv("AUTOREFINE_ROTATION_DAYS", "1")
+    assert main._rotation_days_for("top") >= 1
+
+
+def test_activity_still_beats_priority(tmp_path, monkeypatch):
+    """A burst of work on a `low` project must never be ignored.
+
+    Priority scales the *staleness floor*; it must not become a way to stop looking
+    at a project that is actively being worked on.
+    """
+    monkeypatch.setattr(main, "_hours_since_last_commit", lambda *a, **k: 1.0)
+    due, reason = main.should_plan_repo("samoletovs/x", tmp_path, now=NOW, priority="low")
+    assert due
+    assert "within" in reason
+
+
+def test_skip_reason_names_the_priority(tmp_path, monkeypatch):
+    """A skip nobody can explain is a skip somebody disables."""
+    monkeypatch.setattr(main, "_hours_since_last_commit", lambda *a, **k: 10_000.0)
+    monkeypatch.setattr(main, "_rotation_slot_due", lambda *a, **k: False)
+    due, reason = main.should_plan_repo("samoletovs/x", tmp_path, now=NOW, priority="low")
+    assert not due
+    assert "priority=low" in reason
+
+
+def _manifest(tmp_path, projects):
+    import json
+    p = tmp_path / "m.json"
+    p.write_text(json.dumps({"projects": projects}), encoding="utf-8")
+    return p
+
+
+def test_repos_are_ordered_top_priority_first(tmp_path):
+    # Ordering matters when a run is cut short by a timeout, a budget brake or a
+    # crash: whatever it did reach should be what the owner cares about most.
+    m = _manifest(tmp_path, [
+        {"repo": "o/zzz-low", "status": "active", "priority": "low"},
+        {"repo": "o/aaa-normal", "status": "active", "priority": "normal"},
+        {"repo": "o/mmm-top", "status": "active", "priority": "top"},
+    ])
+    repos = main.load_repos_from_manifest(m)
+    assert repos[0] == "o/mmm-top"
+    assert repos[-1] == "o/zzz-low"
+
+
+def test_untriaged_project_sorts_as_normal_not_last(tmp_path):
+    m = _manifest(tmp_path, [
+        {"repo": "o/low", "status": "active", "priority": "low"},
+        {"repo": "o/untriaged", "status": "active"},
+    ])
+    assert main.load_repos_from_manifest(m)[0] == "o/untriaged"
+
+
+def test_priorities_are_loaded_by_repo_slug(tmp_path):
+    m = _manifest(tmp_path, [
+        {"repo": "o/a", "status": "active", "priority": "TOP"},
+        {"repo": "o/b", "status": "active"},
+    ])
+    pri = main.load_priorities_from_manifest(m)
+    assert pri["o/a"] == "top"
+    assert pri["o/b"] == "normal"
+
+
+def test_unreadable_manifest_yields_no_priorities_rather_than_raising(tmp_path):
+    """Fails open to `normal`: a broken manifest must not demote the whole fleet."""
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json", encoding="utf-8")
+    assert main.load_priorities_from_manifest(bad) == {}
+
+
+def test_the_real_manifest_marks_the_flagships_top():
+    """Pins the actual allocation, so a manifest edit that quietly demotes a flagship
+    fails here rather than surfacing as silence weeks later."""
+    real = Path(__file__).parent.parent.parent / ".github" / "config" / "workspace-manifest.json"
+    if not real.exists():
+        pytest.skip("workspace manifest not available in this checkout")
+    by_name = {r.split("/")[-1]: p for r, p in main.load_priorities_from_manifest(real).items()}
+    for flagship in ("era", "turgo", "atlas", "tPlan", "golazo", "autoRefine", "folio"):
+        assert by_name.get(flagship) == "top", f"{flagship} should be top priority"

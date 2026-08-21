@@ -97,3 +97,8 @@ class AutoRefineConfig:
     # Foundry bill; see should_plan_repo in main.py. An explicit --repo is a human
     # asking for this project now, so it is never gated.
     gate_on_activity: bool = False
+    # {repo_slug: "top"|"normal"|"low"} from the workspace manifest. Scales the
+    # rotation floor in should_plan_repo, so flagship projects come round sooner
+    # than experiments nobody has touched since spring. Empty means everything is
+    # treated as `normal` — a missing manifest must never silently demote a project.
+    priorities: dict[str, str] = field(default_factory=dict)
