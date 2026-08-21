@@ -10,6 +10,7 @@ Requires:
 """
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -29,6 +30,8 @@ from azure.ai.agents.models import (
     RequiredFunctionToolCall,
     SubmitToolOutputsAction,
     ToolOutput,
+    TruncationObject,
+    TruncationStrategy,
 )
 from azure.core.exceptions import HttpResponseError
 from tenacity import (
@@ -59,7 +62,146 @@ DEPLOYMENT = DEFAULT_DEPLOYMENT
 
 SYSTEM_PROMPT = (Path(__file__).parent / "prompts" / "system.md").read_text(encoding="utf-8")
 
+# ── Prompt budget ────────────────────────────────────────────────────────────
+# Two distinct levers, easy to conflate:
+#
+#   max_prompt_tokens  — RUN-WIDE and CUMULATIVE across every turn of a run,
+#                        not a per-call limit. The service ends the run as
+#                        ``incomplete`` once the sum of prompt tokens over all
+#                        turns crosses it. Measured traffic averages ~11.5k
+#                        input tokens per call (23M/day over ~2,000 calls), so
+#                        a plan doing a dozen tool rounds legitimately spends
+#                        well over 100k run-wide. This is therefore only a
+#                        runaway guard, deliberately set high enough that a
+#                        healthy run never trips it. We have no per-run
+#                        distribution yet, so the default is safety-first: a
+#                        tighter cap is opt-in via the env var below, and
+#                        should only be lowered with quality evidence that
+#                        runs still reach submit_plan.
+#
+#   truncation_strategy — the actual PER-TURN cost lever. ``last_messages``
+#                        bounds how much accumulated thread history is re-sent
+#                        on each round, which is what turns a run's input cost
+#                        from O(rounds^2) into roughly O(rounds).
+DEFAULT_MAX_PROMPT_TOKENS = 200_000
+DEFAULT_TRUNCATION_LAST_MESSAGES = 12
+# A run-wide ceiling below ~20k cannot survive more than a couple of turns and
+# would kill plans before submit_plan, so reject it rather than accept a value
+# that silently breaks the agent.
+MIN_MAX_PROMPT_TOKENS = 20_000
+MIN_TRUNCATION_LAST_MESSAGES = 2
+
 T = TypeVar("T")
+
+
+class FoundryRunIncompleteError(RuntimeError):
+    """A run stopped early (``status == "incomplete"``) instead of finishing.
+
+    Raised so a truncated, partial result can never be mistaken for a
+    successful plan. ``reason`` carries ``incomplete_details.reason``, e.g.
+    ``max_prompt_tokens``.
+    """
+
+    def __init__(self, run_id: str, reason: str | None) -> None:
+        self.run_id = run_id
+        self.reason = reason
+        super().__init__(
+            f"Foundry run {run_id} ended incomplete (reason={reason or 'unknown'}). "
+            "Raise AUTOREFINE_MAX_PROMPT_TOKENS / AUTOREFINE_TRUNCATION_LAST_MESSAGES "
+            "or reduce tool output if this recurs."
+        )
+
+
+def _positive_int_from_env(name: str, default: int, minimum: int) -> int:
+    """Read a positive-int knob from the environment, validating explicitly.
+
+    An unset variable uses ``default``. A value that is not an integer, or is
+    below ``minimum``, is rejected loudly rather than silently coerced.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+
+    try:
+        value = int(raw.strip())
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+
+    if value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}, got {value}")
+    return value
+
+
+def resolve_max_prompt_tokens() -> int:
+    """Prompt-token ceiling for a run. Override: ``AUTOREFINE_MAX_PROMPT_TOKENS``."""
+    return _positive_int_from_env(
+        "AUTOREFINE_MAX_PROMPT_TOKENS",
+        DEFAULT_MAX_PROMPT_TOKENS,
+        MIN_MAX_PROMPT_TOKENS,
+    )
+
+
+def resolve_truncation_last_messages() -> int:
+    """Thread window size. Override: ``AUTOREFINE_TRUNCATION_LAST_MESSAGES``."""
+    return _positive_int_from_env(
+        "AUTOREFINE_TRUNCATION_LAST_MESSAGES",
+        DEFAULT_TRUNCATION_LAST_MESSAGES,
+        MIN_TRUNCATION_LAST_MESSAGES,
+    )
+
+
+class FoundryPromptBudgetUnsupportedError(RuntimeError):
+    """The installed SDK cannot express the prompt budget on ``runs.create``.
+
+    Fails closed. A ``**kwargs``-only signature is *not* evidence of support:
+    the generated clients accept arbitrary kwargs and silently drop unknown
+    ones, which would leave runs unbounded while appearing to succeed.
+    """
+
+
+def _prompt_budget_kwargs(create: Callable[..., Any]) -> dict[str, Any]:
+    """Build the prompt-bounding kwargs, requiring explicit SDK support.
+
+    ``max_prompt_tokens`` and ``truncation_strategy`` must appear as named
+    parameters of the pinned ``azure-ai-agents`` ``RunsOperations.create``. If
+    they do not, we raise rather than fall back to an unbounded run, so a
+    dependency bump can never silently restore the runaway-cost behaviour.
+    """
+    max_prompt_tokens = resolve_max_prompt_tokens()
+    last_messages = resolve_truncation_last_messages()
+
+    try:
+        parameters = inspect.signature(create).parameters
+    except (TypeError, ValueError) as exc:  # pragma: no cover - exotic callables
+        raise FoundryPromptBudgetUnsupportedError(
+            f"Cannot introspect {create!r} to confirm prompt-budget support."
+        ) from exc
+
+    missing = [
+        name
+        for name in ("max_prompt_tokens", "truncation_strategy")
+        if name not in parameters
+        or parameters[name].kind is inspect.Parameter.VAR_KEYWORD
+    ]
+    if missing:
+        raise FoundryPromptBudgetUnsupportedError(
+            "Installed azure-ai-agents SDK does not declare "
+            f"{', '.join(missing)} as named parameter(s) of runs.create; "
+            "refusing to start an unbounded run. Pin a supported SDK version."
+        )
+
+    log.info(
+        "Prompt budget: max_prompt_tokens=%d (run-wide), truncation=last_messages(%d)",
+        max_prompt_tokens,
+        last_messages,
+    )
+    return {
+        "max_prompt_tokens": max_prompt_tokens,
+        "truncation_strategy": TruncationObject(
+            type=TruncationStrategy.LAST_MESSAGES,
+            last_messages=last_messages,
+        ),
+    }
 
 
 def _is_retryable_foundry_exception(exception: BaseException) -> bool:
@@ -545,12 +687,14 @@ def run_agent(
         content=message_text,
     )
 
-    # Run the agent
+    # Run the agent with a bounded prompt so accumulated tool output cannot be
+    # re-sent in full on every round.
     run = _call_foundry_with_retry(
         "client.runs.create",
         client.runs.create,
         thread_id=thread.id,
         agent_id=agent_id,
+        **_prompt_budget_kwargs(client.runs.create),
     )
     log.info("Run started: %s", run.id)
 
@@ -605,6 +749,13 @@ def run_agent(
     if run.status == "failed":
         log.error("Run failed: %s", run.last_error)
         return None
+
+    if run.status == "incomplete":
+        details = getattr(run, "incomplete_details", None)
+        reason = getattr(details, "reason", None)
+        log.error("Run %s incomplete (reason=%s)", run.id, reason)
+        _call_foundry_with_retry("client.threads.delete", client.threads.delete, thread.id)
+        raise FoundryRunIncompleteError(run.id, str(reason) if reason is not None else None)
 
     # Get the final message
     messages = client.messages.list(

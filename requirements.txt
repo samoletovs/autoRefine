@@ -2,7 +2,9 @@
 
 # Foundry SDK + auth
 azure-ai-projects>=1.0.0
-azure-ai-agents>=1.1.0
+# Upper bound: foundry_agent fails closed if runs.create stops declaring
+# max_prompt_tokens/truncation_strategy, so a major bump needs re-verification.
+azure-ai-agents>=1.1.0,<2.0.0
 azure-identity>=1.19.0
 
 # OpenAI-compatible client (used by foundry agent + health scan)

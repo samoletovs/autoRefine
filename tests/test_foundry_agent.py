@@ -422,9 +422,16 @@ def test_run_agent_handles_failed_status() -> None:
         delete=lambda _thread_id: None,
     )
     messages_api = SimpleNamespace(create=lambda **_kwargs: None, list=lambda **_kwargs: [])
-    runs_api = SimpleNamespace(
-        create=lambda **_kwargs: SimpleNamespace(id="run-1", status="failed", last_error="boom"),
-    )
+    def create_run(
+        *,
+        thread_id: str,
+        agent_id: str,
+        max_prompt_tokens: int | None = None,
+        truncation_strategy: object = None,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(id="run-1", status="failed", last_error="boom")
+
+    runs_api = SimpleNamespace(create=create_run)
     client = SimpleNamespace(threads=thread_api, messages=messages_api, runs=runs_api)
 
     result = foundry_agent.run_agent(client, "agent-1", Path("."), config, "task")
@@ -481,7 +488,14 @@ def test_run_agent_processes_tool_calls_and_returns_plan(monkeypatch: pytest.Mon
     completed_run = SimpleNamespace(id="run-1", status="completed")
 
     class RunsApi:
-        def create(self, **_kwargs: object) -> SimpleNamespace:
+        def create(
+            self,
+            *,
+            thread_id: str,
+            agent_id: str,
+            max_prompt_tokens: int | None = None,
+            truncation_strategy: object = None,
+        ) -> SimpleNamespace:
             return requires_action_run
 
         def submit_tool_outputs(self, **_kwargs: object) -> SimpleNamespace:
@@ -552,3 +566,157 @@ def test_foundry_retry_does_not_retry_http_400() -> None:
         _call_foundry_with_retry("client.runs.create_and_process", bad_request_operation)
 
     assert calls == 1
+
+
+# ── Prompt-token budget (cost cap) ───────────────────────────────────────────
+
+
+def test_max_prompt_tokens_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AUTOREFINE_MAX_PROMPT_TOKENS", raising=False)
+    monkeypatch.delenv("AUTOREFINE_TRUNCATION_LAST_MESSAGES", raising=False)
+    assert foundry_agent.resolve_max_prompt_tokens() == foundry_agent.DEFAULT_MAX_PROMPT_TOKENS
+    assert (
+        foundry_agent.resolve_truncation_last_messages()
+        == foundry_agent.DEFAULT_TRUNCATION_LAST_MESSAGES
+    )
+
+
+def test_max_prompt_tokens_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AUTOREFINE_MAX_PROMPT_TOKENS", " 90000 ")
+    monkeypatch.setenv("AUTOREFINE_TRUNCATION_LAST_MESSAGES", "5")
+    assert foundry_agent.resolve_max_prompt_tokens() == 90000
+    assert foundry_agent.resolve_truncation_last_messages() == 5
+
+
+@pytest.mark.parametrize("value", ["not-a-number", "0", "-1", "100", "19999"])
+def test_max_prompt_tokens_rejects_invalid(value: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AUTOREFINE_MAX_PROMPT_TOKENS", value)
+    with pytest.raises(ValueError):
+        foundry_agent.resolve_max_prompt_tokens()
+
+
+def test_truncation_last_messages_rejects_below_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AUTOREFINE_TRUNCATION_LAST_MESSAGES", "1")
+    with pytest.raises(ValueError):
+        foundry_agent.resolve_truncation_last_messages()
+
+
+def test_installed_sdk_supports_prompt_budget_kwargs() -> None:
+    """The pinned azure-ai-agents SDK must accept the cap; guards silent no-ops."""
+    from azure.ai.agents.operations import RunsOperations
+
+    params = inspect.signature(RunsOperations.create).parameters
+    assert "max_prompt_tokens" in params
+    assert "truncation_strategy" in params
+
+
+def test_prompt_budget_fails_closed_when_sdk_lacks_params() -> None:
+    """A future SDK dropping the params must error, never run unbounded."""
+
+    def legacy_create(thread_id: str, agent_id: str) -> None: ...
+
+    with pytest.raises(foundry_agent.FoundryPromptBudgetUnsupportedError):
+        foundry_agent._prompt_budget_kwargs(legacy_create)
+
+
+def test_prompt_budget_rejects_kwargs_only_signature() -> None:
+    """**kwargs is not evidence of support: generated clients drop unknown kwargs."""
+
+    def kwargs_only_create(thread_id: str, **kwargs: object) -> None: ...
+
+    with pytest.raises(foundry_agent.FoundryPromptBudgetUnsupportedError) as excinfo:
+        foundry_agent._prompt_budget_kwargs(kwargs_only_create)
+    assert "max_prompt_tokens" in str(excinfo.value)
+    assert "truncation_strategy" in str(excinfo.value)
+
+
+def test_default_max_prompt_tokens_is_a_runaway_guard_not_a_per_call_cap() -> None:
+    """max_prompt_tokens is run-wide cumulative; ~11.5k avg input/call means a
+    dozen-round plan legitimately spends >100k. The default must not throttle that."""
+    assert foundry_agent.DEFAULT_MAX_PROMPT_TOKENS >= 100_000
+
+
+def _budget_run_client(run_status: str, incomplete_reason: str | None = None):
+    recorded: dict = {}
+    incomplete_details = (
+        SimpleNamespace(reason=incomplete_reason) if incomplete_reason is not None else None
+    )
+    run = SimpleNamespace(
+        id="run-1",
+        status=run_status,
+        last_error=None,
+        incomplete_details=incomplete_details,
+    )
+
+    class RunsApi:
+        def create(
+            self,
+            *,
+            thread_id: str,
+            agent_id: str,
+            max_prompt_tokens: int | None = None,
+            truncation_strategy: object = None,
+        ) -> SimpleNamespace:
+            recorded.update(
+                thread_id=thread_id,
+                agent_id=agent_id,
+                max_prompt_tokens=max_prompt_tokens,
+                truncation_strategy=truncation_strategy,
+            )
+            return run
+
+    deleted: list[str] = []
+    thread_api = SimpleNamespace(
+        create=lambda: SimpleNamespace(id="thread-1"),
+        delete=lambda thread_id: deleted.append(thread_id),
+    )
+    messages_api = SimpleNamespace(create=lambda **_kwargs: None, list=lambda **_kwargs: [])
+    client = SimpleNamespace(threads=thread_api, messages=messages_api, runs=RunsApi())
+    return client, recorded, deleted
+
+
+def test_run_agent_passes_bounded_prompt_to_runs_create(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("AUTOREFINE_MAX_PROMPT_TOKENS", raising=False)
+    monkeypatch.setenv("AUTOREFINE_TRUNCATION_LAST_MESSAGES", "4")
+    config = ProjectConfig(name="demo", purpose="", users="", stage="active")
+    client, recorded, _deleted = _budget_run_client("completed")
+
+    foundry_agent.run_agent(client, "agent-1", Path("."), config, "task")
+
+    assert recorded["thread_id"] == "thread-1"
+    assert recorded["agent_id"] == "agent-1"
+    assert recorded["max_prompt_tokens"] == foundry_agent.DEFAULT_MAX_PROMPT_TOKENS
+    assert recorded["truncation_strategy"].as_dict() == {
+        "type": "last_messages",
+        "last_messages": 4,
+    }
+    assert set(recorded) == {
+        "thread_id",
+        "agent_id",
+        "max_prompt_tokens",
+        "truncation_strategy",
+    }
+
+
+def test_run_agent_raises_on_incomplete_max_prompt_tokens() -> None:
+    config = ProjectConfig(name="demo", purpose="", users="", stage="active")
+    client, _recorded, deleted = _budget_run_client("incomplete", "max_prompt_tokens")
+
+    with pytest.raises(foundry_agent.FoundryRunIncompleteError) as excinfo:
+        foundry_agent.run_agent(client, "agent-1", Path("."), config, "task")
+
+    assert excinfo.value.reason == "max_prompt_tokens"
+    assert excinfo.value.run_id == "run-1"
+    assert deleted == ["thread-1"]
+
+
+def test_run_agent_incomplete_without_details_still_raises() -> None:
+    config = ProjectConfig(name="demo", purpose="", users="", stage="active")
+    client, _recorded, _deleted = _budget_run_client("incomplete")
+
+    with pytest.raises(foundry_agent.FoundryRunIncompleteError) as excinfo:
+        foundry_agent.run_agent(client, "agent-1", Path("."), config, "task")
+
+    assert excinfo.value.reason is None

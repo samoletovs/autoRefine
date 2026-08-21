@@ -299,6 +299,8 @@ def test_refine_project_passes_model_to_create_agent(project_config: ProjectConf
         patch(
             "subprocess.run",
             side_effect=[
+                # Baseline snapshot taken before the agent runs (clean tree).
+                SimpleNamespace(stdout="", returncode=0),
                 SimpleNamespace(stdout=" M README.md\n", returncode=0),
                 SimpleNamespace(stdout="", returncode=0),
             ],

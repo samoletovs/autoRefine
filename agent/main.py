@@ -1033,6 +1033,71 @@ def handle_functional_ideas(
     return []
 
 
+def _worktree_snapshot(project_dir: Path) -> set[str]:
+    """Porcelain status lines, identifying files dirty *before* the agent runs.
+
+    Used to distinguish pre-existing user changes (which must never be
+    discarded) from files the agent touched during a run.
+    """
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=str(project_dir),
+        capture_output=True,
+        text=True,
+    )
+    return {line for line in status.stdout.splitlines() if line.strip()}
+
+
+def _status_path(line: str) -> str:
+    """Extract the path from a porcelain status line, handling renames."""
+    path = line[3:].strip() if len(line) > 3 else line.strip()
+    if " -> " in path:
+        path = path.split(" -> ", 1)[1]
+    return path.strip('"')
+
+
+def _rollback_agent_changes(project_dir: Path, baseline: set[str]) -> list[str]:
+    """Revert only the files this run dirtied, leaving pre-existing edits alone.
+
+    An ``incomplete`` refine run may already have called ``write_project_file``,
+    so partial edits can be sitting in the worktree. Left there, a later run
+    would sweep them into a commit as if they were a finished improvement.
+    """
+    baseline_paths = {_status_path(line) for line in baseline}
+    current = _worktree_snapshot(project_dir)
+    reverted: list[str] = []
+
+    for line in current:
+        path = _status_path(line)
+        if path in baseline_paths:
+            continue  # pre-existing user change — never touch it
+
+        if line.startswith("??"):
+            target = project_dir / path
+            try:
+                if target.is_file():
+                    target.unlink()
+                    reverted.append(path)
+            except OSError as exc:
+                log.warning("Could not remove agent-created file %s: %s", path, exc)
+            continue
+
+        restore = subprocess.run(
+            ["git", "checkout", "--", path],
+            cwd=str(project_dir),
+            capture_output=True,
+            text=True,
+        )
+        if restore.returncode == 0:
+            reverted.append(path)
+        else:
+            log.warning("Could not revert %s: %s", path, restore.stderr.strip())
+
+    if reverted:
+        log.warning("Rolled back %d partial change(s) from this run: %s", len(reverted), reverted)
+    return reverted
+
+
 def refine_project(
     project_dir: Path,
     config: ProjectConfig,
@@ -1050,7 +1115,12 @@ def refine_project(
     from azure.ai.agents import AgentsClient
     from azure.identity import DefaultAzureCredential
 
-    from agent.foundry_agent import build_refine_task, create_agent, run_agent
+    from agent.foundry_agent import (
+        FoundryRunIncompleteError,
+        build_refine_task,
+        create_agent,
+        run_agent,
+    )
     from agent.tools.github_tools import (
         commit_and_push,
         create_branch,
@@ -1080,7 +1150,15 @@ def refine_project(
 
     try:
         task = build_refine_task(plan, config)
-        run_agent(client, agent_id, project_dir, config, task)
+        # Refine writes into the live worktree, so an aborted run must not leave
+        # half-applied edits behind for a later run to commit.
+        baseline = _worktree_snapshot(project_dir)
+        try:
+            run_agent(client, agent_id, project_dir, config, task)
+        except FoundryRunIncompleteError as exc:
+            log.error("Refine run ended incomplete (%s) — rolling back partial changes.", exc.reason)
+            _rollback_agent_changes(project_dir, baseline)
+            return False
 
         # Check if agent made any changes
         status = subprocess.run(
