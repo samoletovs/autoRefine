@@ -75,6 +75,21 @@ jobs:
           echo "--- health-scan output ---"
           cat /tmp/autorefine-health.json
 
+      # Free ride. The PR-approval sweep is a few seconds of GitHub API calls, but as
+      # its own scheduled workflow every run pays a whole billed minute — 230 runs cost
+      # 230 minutes. This job has already paid for its checkout, its Python and its
+      # dependencies, so running the sweep here costs nothing measurable and lets
+      # pr-ready-cards.yml drop to a single scheduled sweep a day without doubling the
+      # wait for a card. `always()` so a failed scan above still gets the PRs carded.
+      - name: Sweep and card ready Copilot PRs
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          python -m agent.main \
+            --manifest .github-gov/config/workspace-manifest.json \
+            --mode pr-cards
+
       - name: Failure notification
         if: failure()
         run: |
@@ -85,5 +100,5 @@ jobs:
           curl -sf -X POST "https://api.telegram.org/bot${NAURO_BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${NAURO_CHAT_ID}" \
             --data-urlencode "parse_mode=HTML" \
-            --data-urlencode "text=❌ <b>autoRefine health-scan</b> failed — see GitHub Actions log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --data-urlencode "text=❌ <b>autoRefine daily scan</b> failed (health-scan or PR-card sweep) — see GitHub Actions log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             || echo "::warning::Telegram failure notification did not send"

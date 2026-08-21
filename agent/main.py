@@ -1,6 +1,7 @@
 """autoRefine entry point — orchestrates the evaluate → plan → execute cycle."""
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -82,6 +83,166 @@ WIKI_CONTEXT_MAX_PAGES = 6
 WIKI_CONTEXT_MAX_CHARS = 2400
 WIKI_CONTEXT_RECENT_DAYS = 60
 WIKI_CONTEXT_OTHER_CAP = 2
+
+# ── Activity gate ────────────────────────────────────────────────────────────
+# The sweep's expense is almost entirely the two Foundry planning runs per project
+# (technical + functional), not the deterministic evaluation around them. A plan run
+# is ~78 tool rounds, and every round re-sends the accumulated thread, so one run is
+# on the order of 850k input tokens. At ~23 active projects that is the 400M
+# cached-input tokens a month showing up on the gpt-4o-mini meter.
+#
+# Most of those runs answer a question nothing changed the answer to. A project whose
+# default branch has not moved since the previous sweep gets re-read, re-analysed and
+# re-planned to produce the ideas it produced yesterday. Skipping the planning for an
+# unchanged project is the one lever here with no quality cost at all.
+#
+# Two rules decide it, and a project is planned if either holds:
+#   1. its default branch has a commit inside the lookback window, or
+#   2. its deterministic rotation slot comes up.
+#
+# Rule 2 is the staleness floor and the reason no state file is needed: the slot is a
+# pure function of the repo name and the date, so every project is planned at least
+# once every AUTOREFINE_ROTATION_DAYS whatever its commit history, and the projects
+# are spread evenly across the days rather than all landing on one.
+DEFAULT_ACTIVITY_LOOKBACK_HOURS = 26
+# The sweep is daily; 26h covers the previous run plus a two-hour margin for a late
+# or retried schedule, so a commit cannot fall between two windows and be missed.
+DEFAULT_ROTATION_DAYS = 7
+
+# Paths the lab's own cross-repo housekeeping rewrites in every project on the same
+# day: a licence sweep, a synced security script, a governance workflow update. On
+# 2026-08-21 three such sweeps had touched 22 of 24 projects inside 28 hours, so a
+# gate that counted any commit as activity would have skipped two projects and
+# planned everything else — a saving on paper and none in the bill. None of these can
+# change what an improvement plan says, so they do not count as activity.
+HOUSEKEEPING_PATHSPECS = (
+    ":(exclude)LICENSE",
+    ":(exclude)LICENSE.*",
+    ":(exclude)NOTICE",
+    ":(exclude).gitignore",
+    ":(exclude).gitattributes",
+    ":(exclude).github/**",
+    ":(exclude)scripts/audit-leaks.ps1",
+    ":(exclude)scripts/can-auto-merge.py",
+)
+
+
+def _hours_since_last_commit(project_dir: Path, now: datetime) -> float | None:
+    """Age in hours of the newest substantive commit, or None if it can't be read.
+
+    Commits touching only :data:`HOUSEKEEPING_PATHSPECS` are ignored. ``None`` means
+    "unknown", which callers must treat as activity: guessing "idle" from a git
+    failure would silently switch ideation off for every project at once.
+    ``inf`` is different — git succeeded and reported no substantive commit at all.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "log", "-1", "--format=%cI", "--", ".", *HOUSEKEEPING_PATHSPECS],
+            cwd=str(project_dir),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        log.warning("git log failed in %s — treating as active", project_dir)
+        return None
+
+    if result.returncode != 0:
+        log.warning("git log failed in %s — treating as active", project_dir)
+        return None
+
+    stamp = result.stdout.strip()
+    if not stamp:
+        # git worked and found nothing: every commit here is housekeeping.
+        return float("inf")
+
+    try:
+        committed = datetime.fromisoformat(stamp)
+    except ValueError:
+        log.warning("Unparseable commit date %r — treating as active", stamp)
+        return None
+
+    if committed.tzinfo is None:
+        committed = committed.replace(tzinfo=timezone.utc)
+    return (now - committed).total_seconds() / 3600.0
+
+
+def _rotation_slot_due(repo: str, now: datetime, rotation_days: int) -> bool:
+    """Whether today is this repo's guaranteed slot in the rotation.
+
+    Deterministic and stateless: a stable hash of the repo name picks one day in
+    every ``rotation_days``, so coverage does not depend on remembering when the
+    project was last looked at.
+    """
+    if rotation_days <= 1:
+        return True
+    digest = hashlib.sha256(repo.encode("utf-8")).digest()
+    slot = int.from_bytes(digest[:8], "big") % rotation_days
+    return now.date().toordinal() % rotation_days == slot
+
+
+def _activity_lookback_hours() -> float:
+    """Lookback window in hours. ``0`` disables the gate and plans everything."""
+    raw = os.environ.get("AUTOREFINE_ACTIVITY_LOOKBACK_HOURS", "").strip()
+    if not raw:
+        return float(DEFAULT_ACTIVITY_LOOKBACK_HOURS)
+    try:
+        hours = float(raw)
+    except ValueError:
+        log.warning(
+            "AUTOREFINE_ACTIVITY_LOOKBACK_HOURS=%r is not a number — using default %s",
+            raw,
+            DEFAULT_ACTIVITY_LOOKBACK_HOURS,
+        )
+        return float(DEFAULT_ACTIVITY_LOOKBACK_HOURS)
+    return max(hours, 0.0)
+
+
+def _rotation_days() -> int:
+    """Staleness floor in days. Every project is planned at least this often."""
+    raw = os.environ.get("AUTOREFINE_ROTATION_DAYS", "").strip()
+    if not raw:
+        return DEFAULT_ROTATION_DAYS
+    try:
+        days = int(raw)
+    except ValueError:
+        log.warning(
+            "AUTOREFINE_ROTATION_DAYS=%r is not an integer — using default %d",
+            raw,
+            DEFAULT_ROTATION_DAYS,
+        )
+        return DEFAULT_ROTATION_DAYS
+    return max(days, 1)
+
+
+def should_plan_repo(
+    repo: str,
+    project_dir: Path,
+    now: datetime | None = None,
+) -> tuple[bool, str]:
+    """Decide whether a swept project earns its Foundry planning runs this cycle.
+
+    Returns ``(should_plan, reason)``. Fails open: anything unknown counts as
+    activity, so the gate can only ever skip a project it positively established
+    was idle.
+    """
+    now = now or datetime.now(timezone.utc)
+    lookback = _activity_lookback_hours()
+    if lookback == 0:
+        return True, "activity gate disabled (AUTOREFINE_ACTIVITY_LOOKBACK_HOURS=0)"
+
+    age = _hours_since_last_commit(project_dir, now)
+    if age is None:
+        return True, "commit age unknown — planning rather than guessing"
+    if age <= lookback:
+        return True, f"changed {age:.1f}h ago (within {lookback:.0f}h)"
+
+    since = "no substantive commit ever" if age == float("inf") else f"idle {age:.1f}h"
+    rotation_days = _rotation_days()
+    if _rotation_slot_due(repo, now, rotation_days):
+        return True, f"{since} but rotation slot due (every {rotation_days}d)"
+
+    return False, f"{since}, housekeeping only, and not in today's rotation slot"
 
 
 def load_repos_from_manifest(manifest_path: Path) -> list[str]:
@@ -1331,13 +1492,16 @@ def main() -> None:
 
     # Resolve repo list
     repos: list[str] = []
+    swept_manifest = False
     if args.repo:
         repos = [args.repo]
     elif args.manifest:
         repos = load_repos_from_manifest(Path(args.manifest))
+        swept_manifest = True
     else:
         if MANIFEST_PATH.exists():
             repos = load_repos_from_manifest(MANIFEST_PATH)
+            swept_manifest = True
         else:
             log.error("No --repo or --manifest specified and no default manifest found.")
             sys.exit(1)
@@ -1375,6 +1539,7 @@ def main() -> None:
         model=args.model,
         dry_run=args.dry_run,
         workdir=Path(args.workdir),
+        gate_on_activity=swept_manifest,
     )
     config.workdir.mkdir(parents=True, exist_ok=True)
 
@@ -1457,6 +1622,17 @@ def _process_repo(repo: str, config: AutoRefineConfig) -> None:
 
     elif config.mode == "file-ideas":
         print(json.dumps(report, indent=2))
+
+        # The deterministic report above is printed for every project, so scores and
+        # the Telegram summary still cover the whole fleet. Only the Foundry planning
+        # below is gated, and only on a manifest sweep.
+        if config.gate_on_activity:
+            planning_due, reason = should_plan_repo(repo, project_dir)
+            if not planning_due:
+                log.info("Skipping Foundry planning for %s — %s", name, reason)
+                return
+            log.info("Planning %s — %s", name, reason)
+
         plan = plan_project(project_dir, project_config, report["findings"])
         if plan:
             filed_count = file_ideas_for_plan(repo, plan, dry_run=config.dry_run)

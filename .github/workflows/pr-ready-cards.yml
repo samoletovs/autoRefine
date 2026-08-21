@@ -12,22 +12,29 @@ name: "autoRefine — PR approval cards"
 
 on:
   schedule:
-    # Three sweeps a day (UTC): 07, 13, 19 — roughly morning, midday, evening.
-    # Most runs are no-ops; a card is only sent when a ready, green Copilot PR
-    # appears, and the PR janitor is what actually keeps merges moving. This
-    # sweep only decides how soon the card reaches the phone, so its cadence
-    # buys latency, not correctness.
+    # One sweep a day (UTC 19:00). A second, free sweep runs at ~06:00 as the last
+    # step of the daily health scan — see below.
     #
-    # It ran two-hourly (nine sweeps a day, 270 runs a month) and was invisible
-    # to the budget while it did: cronspec could not read a `6-22/2` range and
-    # returned None, which callers treat as "leave it alone", so the single
-    # largest scheduled line in this repo was priced at zero. Four-hourly removed
-    # 120 runs/month. Measured against real job billing it was still the largest
-    # line here at ~223 billed min/month — every sweep pays a whole minute for a
-    # few seconds of API calls, because GitHub rounds each job up. Three a day
-    # halves that again for at most an eight-hour wait on a notification that is
-    # already backed by the janitor's own Telegram alert.
-    - cron: '0 7,13,19 * * *'
+    # This cannot be event-driven, and that is not a cadence choice. The sweep reads
+    # open PRs across every project in the workspace manifest (agent/pr_cards.py takes
+    # a repo list), and GitHub delivers `pull_request` / `check_suite` events only to
+    # workflows living in the repo where the event happened. Making it event-driven
+    # would mean installing a `repository_dispatch` forwarder in all 23 other repos,
+    # which is both outside this repo and a net cost increase: every PR event would
+    # then fire a forwarder run *there* plus a sweep run here.
+    #
+    # So the only lever is run count, and run count is the whole bill: GitHub rounds
+    # each job up to a full minute, and this job's real work is a few seconds of API
+    # calls, so 230 runs cost 230 minutes. It has come down 9/day → 4/day → 3/day on
+    # that logic; this takes the scheduled part to 1/day and recovers the lost latency
+    # for free by appending the same sweep to the health-scan job, which is already
+    # running and already paid for.
+    #
+    # Latency is the only thing cadence buys here. Nothing waits on the card: the
+    # governance PR janitor sweeps every 6h and merges anything that passes the gates,
+    # and its stuck-PR watchdog escalates independently after 24h. The card is the
+    # one-tap convenience path, not the mechanism.
+    - cron: '0 19 * * *'
   workflow_dispatch:
 
 permissions:

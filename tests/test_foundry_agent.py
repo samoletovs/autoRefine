@@ -636,6 +636,147 @@ def test_default_max_prompt_tokens_is_a_runaway_guard_not_a_per_call_cap() -> No
     assert foundry_agent.DEFAULT_MAX_PROMPT_TOKENS >= 100_000
 
 
+def test_real_sdk_puts_the_prompt_budget_on_the_wire() -> None:
+    """The budget must reach Foundry, not merely reach ``runs.create``.
+
+    Every other prompt-budget test here drives a hand-written fake whose ``create``
+    is *defined* to accept these parameters, so all of them would still pass if the
+    real generated client accepted the kwargs and dropped them before serialising —
+    the exact silent-no-op this whole change exists to prevent. This one runs the
+    real ``AgentsClient`` against a transport that captures the outgoing request and
+    asserts on the actual JSON body.
+    """
+    from azure.ai.agents import AgentsClient
+    from azure.core.credentials import AccessToken
+    from azure.core.pipeline.transport import HttpTransport
+
+    captured: dict[str, object] = {}
+    run_payload = {
+        "id": "run_1",
+        "object": "thread.run",
+        "status": "queued",
+        "thread_id": "t1",
+        "assistant_id": "a1",
+        "created_at": 0,
+        "model": "gpt-4o-mini",
+        "instructions": "",
+        "tools": [],
+    }
+
+    class StubCredential:
+        def get_token(self, *_scopes: str, **_kwargs: object) -> AccessToken:
+            return AccessToken("stub", 9_999_999_999)
+
+        def close(self) -> None: ...
+
+    class CapturingResponse:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+        reason = "OK"
+        content_type = "application/json"
+        request = None
+
+        @property
+        def content(self) -> bytes:
+            return json.dumps(run_payload).encode()
+
+        def text(self, encoding: str | None = None) -> str:
+            return json.dumps(run_payload)
+
+        def body(self) -> bytes:
+            return self.content
+
+        def read(self) -> bytes:
+            return self.content
+
+        def json(self) -> dict:
+            return run_payload
+
+    class CapturingTransport(HttpTransport):
+        def send(self, request, **_kwargs):  # type: ignore[no-untyped-def]
+            captured["body"] = request.body
+            return CapturingResponse()
+
+        def open(self) -> None: ...
+
+        def close(self) -> None: ...
+
+        def __enter__(self) -> CapturingTransport:
+            return self
+
+        def __exit__(self, *_args: object) -> None: ...
+
+    client = AgentsClient(
+        endpoint="https://stub.services.ai.azure.com/api/projects/p",
+        credential=StubCredential(),
+        transport=CapturingTransport(),
+    )
+    client.runs.create(
+        thread_id="t1",
+        agent_id="a1",
+        **foundry_agent._prompt_budget_kwargs(client.runs.create),
+    )
+
+    body = json.loads(captured["body"])  # type: ignore[arg-type]
+    assert body["max_prompt_tokens"] == foundry_agent.DEFAULT_MAX_PROMPT_TOKENS
+    assert body["truncation_strategy"] == {
+        "type": "last_messages",
+        "last_messages": foundry_agent.DEFAULT_TRUNCATION_LAST_MESSAGES,
+    }
+
+
+def _billed_input_tokens(rounds: int, window: int | None) -> int:
+    """Input tokens Foundry bills for one run, in uncached-equivalent units.
+
+    Models what the service does with ``truncation_strategy`` so the saving can be
+    measured rather than asserted. On turn *k* the prompt is the system prompt plus
+    the thread so far, capped to the last ``window`` messages. Azure prompt caching
+    bills a prefix shared with the previous turn at half rate, so a turn whose
+    prefix still grows monotonically is mostly cached, while a turn whose window has
+    started sliding shares only the system prompt.
+    """
+    system = 591  # measured size of agent/prompts/system.md
+    per_message = 262  # measured: 411M input tokens over the observed traffic
+    billed = 0.0
+    for turn in range(1, rounds + 1):
+        history = turn if window is None else min(turn, window)
+        prompt = system + history * per_message
+        sliding = window is not None and turn > window
+        cached = system if sliding else prompt - per_message
+        billed += 0.5 * cached + (prompt - cached)
+    return int(billed)
+
+
+def test_truncation_window_bounds_per_turn_prompt_growth() -> None:
+    """A bounded window must turn a run's input cost from quadratic into linear.
+
+    Without truncation the prompt on turn k contains every earlier turn, so a run's
+    input tokens grow as O(rounds^2) — the shape that produced 400M cached-input
+    tokens a month. The window is read back out of the kwargs actually built for the
+    real SDK signature rather than from a constant, so deleting ``truncation_strategy``
+    from the run fails this test instead of quietly leaving the constant behind.
+    """
+    from azure.ai.agents.operations import RunsOperations
+
+    budget = foundry_agent._prompt_budget_kwargs(RunsOperations.create)
+    assert budget["max_prompt_tokens"] > 0
+    strategy = budget["truncation_strategy"].as_dict()
+    assert strategy["type"] == "last_messages", "per-turn history is not being bounded"
+    window = strategy["last_messages"]
+
+    rounds = 78  # measured rounds per plan run
+    unbounded = _billed_input_tokens(rounds, None)
+    bounded = _billed_input_tokens(rounds, window)
+
+    assert bounded < unbounded * 0.7, (
+        f"windowed run bills {bounded} vs {unbounded} unbounded — "
+        "truncation is not bounding per-turn prompt growth"
+    )
+    # Doubling the rounds must not quadruple the bill: cost has to stay linear.
+    assert _billed_input_tokens(rounds * 2, window) < 2.2 * bounded
+    assert _billed_input_tokens(rounds * 2, None) > 3.0 * unbounded
+
+
 def _budget_run_client(run_status: str, incomplete_reason: str | None = None):
     recorded: dict = {}
     incomplete_details = (

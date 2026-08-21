@@ -92,3 +92,8 @@ class AutoRefineConfig:
     model: str = "gpt-4o-mini"
     dry_run: bool = False
     workdir: Path = field(default_factory=lambda: Path("/tmp/autorefine"))
+    # True only for a manifest-driven sweep of every project. Such a sweep re-plans
+    # projects that have not changed since the last one, which is the bulk of the
+    # Foundry bill; see should_plan_repo in main.py. An explicit --repo is a human
+    # asking for this project now, so it is never gated.
+    gate_on_activity: bool = False
