@@ -9,6 +9,14 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  # Required by `checks.listForRef` in the readiness poll below. A top-level
+  # `permissions:` block sets every unlisted scope to `none`, so omitting this
+  # is not a default-read - it is an explicit denial, and the call 403s with
+  # "Resource not accessible by integration". Latent since 2026-07-06, when the
+  # poll was added without widening the block; it surfaced on 2026-08-21 only
+  # because enabling Dependabot alerts produced the fleet's first Dependabot PRs
+  # in weeks. Read-only: this workflow reads check conclusions, never writes them.
+  checks: read
 
 concurrency:
   group: dependabot-auto-merge-${{ github.event.pull_request.number || github.event.check_suite.head_branch }}
