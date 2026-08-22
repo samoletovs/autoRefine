@@ -522,3 +522,74 @@ def test_fetch_workspace_manifest_raises_on_non_200(tmp_path: Path) -> None:
             health_scan.fetch_workspace_manifest(
                 url="https://example.com/manifest.json", cache_path=cache_file
             )
+
+
+# ── Shipped vs not-shipped classification ───────────────────────────────────────
+# Added 2026-08-22. `_improvement_status` returned "completed" for every closed
+# issue that merely lacked a `declined` label, so GitHub's `not_planned` close -
+# the won't-fix/duplicate state - was reported as delivered work.
+#
+# Measured on real data: in a five-issue sample from era-legacy, #54
+# (not_planned, labelled `duplicate`) and #52 (not_planned, labelled `rejected`)
+# were both counted as shipped. The lab judges its own self-improvement loop by
+# this number, and a loop cannot be improved against an inflated success metric.
+#
+# These pin the REQUIREMENT - "only work that was actually built counts as
+# shipped" - rather than the shape of the implementation.
+
+
+def _issue(state="closed", reason=None, labels=(), assignees=()):
+    return {
+        "state": state,
+        "state_reason": reason,
+        "labels": [{"name": n} for n in labels],
+        "assignees": [{"login": a} for a in assignees],
+    }
+
+
+def test_not_planned_is_not_shipped() -> None:
+    """The exact shape of era-legacy#54: closed not_planned, no `declined` label."""
+    assert health_scan._improvement_status(
+        _issue(reason="not_planned", labels=["idea", "duplicate", "approved"])
+    ) == "declined"
+
+
+def test_not_planned_without_any_label_is_still_not_shipped() -> None:
+    # The close reason alone must be enough. Relying on a label means anyone who
+    # closes an issue the ordinary way silently inflates the shipped count.
+    assert health_scan._improvement_status(_issue(reason="not_planned")) == "declined"
+
+
+def test_completed_close_is_shipped() -> None:
+    assert health_scan._improvement_status(
+        _issue(reason="completed", labels=["idea", "approved"])
+    ) == "completed"
+
+
+def test_missing_state_reason_is_treated_as_completed() -> None:
+    """Older issues predate state_reason. GitHub back-fills them as completed, so
+    inventing a third state here would rewrite history rather than measure it."""
+    assert health_scan._improvement_status(_issue(reason=None, labels=["idea"])) == "completed"
+
+
+@pytest.mark.parametrize("label", ["declined", "duplicate", "rejected", "wontfix", "invalid"])
+def test_not_shipped_labels_override_a_completed_reason(label) -> None:
+    """A closer who used the label but left the default reason is still saying it
+    was not built. era-legacy#52 was labelled `rejected`; #54 `duplicate`."""
+    assert health_scan._improvement_status(
+        _issue(reason="completed", labels=["idea", label])
+    ) == "declined"
+
+
+def test_label_casing_is_ignored() -> None:
+    assert health_scan._improvement_status(
+        _issue(reason="completed", labels=["idea", "Duplicate"])
+    ) == "declined"
+
+
+def test_open_issue_states_are_unchanged() -> None:
+    # The fix must not disturb the three open states.
+    assert health_scan._improvement_status(_issue(state="open", labels=["needs-approval"])) == "awaiting approval"
+    assert health_scan._improvement_status(_issue(state="open", labels=["approved"])) == "in progress"
+    assert health_scan._improvement_status(_issue(state="open", assignees=["copilot-swe-agent"])) == "in progress"
+    assert health_scan._improvement_status(_issue(state="open", labels=["idea"])) == "proposed"

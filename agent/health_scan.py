@@ -133,14 +133,41 @@ def _is_autorefine_idea(issue: dict[str, Any]) -> bool:
     return "autopilot" in labels or ("source" in body and "autorefine" in body)
 
 
+# Labels that mean "this was not built", whatever the close reason says. GitHub's
+# state_reason is the primary signal, but a closer who used the label and left the
+# reason as the default `completed` is still telling us it was not shipped.
+_NOT_SHIPPED_LABELS = frozenset({"declined", "duplicate", "rejected", "wontfix", "won't fix", "invalid"})
+
+
 def _improvement_status(issue: dict[str, Any]) -> str:
-    """Map a tracked idea issue to a concise dashboard status."""
+    """Map a tracked idea issue to a concise dashboard status.
+
+    A closed issue only counts as shipped when it was closed as *completed*. Until
+    2026-08-22 this returned "completed" for every closed issue that merely lacked a
+    `declined` label, which silently counted GitHub's `not_planned` state - the
+    won't-fix/duplicate close - as delivered work.
+
+    That is not a rounding error. In a five-issue sample from `era-legacy`, two were
+    miscounted: #54 (`not_planned`, labelled `duplicate`) and #52 (`not_planned`,
+    labelled `rejected`). Both were reported to the dashboard as shipped. The
+    published figure of "125 shipped, 204 declined" is therefore an overstatement of
+    unknown size, and it is the number the lab uses to judge whether its own
+    self-improvement loop is working.
+
+    A loop cannot be improved against an inflated success metric, so the close
+    reason is now read directly.
+    """
     labels = _label_names(issue)
     assignees = _assignee_logins(issue)
     state = str(issue.get("state", "")).lower()
 
     if state == "closed":
-        return "declined" if "declined" in labels else "completed"
+        # `state_reason` is absent on older issues; treat that as completed, which
+        # is what GitHub itself back-fills, rather than inventing a third state.
+        reason = str(issue.get("state_reason") or "completed").lower()
+        if reason == "not_planned" or labels & _NOT_SHIPPED_LABELS:
+            return "declined"
+        return "completed"
     if "needs-approval" in labels:
         return "awaiting approval"
     if "approved" in labels or any("copilot" in login for login in assignees):
