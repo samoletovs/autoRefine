@@ -396,6 +396,32 @@ def is_unreviewable_description(body: str | None) -> bool:
     return len(text) < MIN_DESCRIPTION_CHARS
 
 
+def declares_itself_incomplete(title: str) -> bool:
+    """Does the PR's own title say it is not finished, or that it did nothing?
+
+    Measured from the weekly reflection ledger on 2026-08-22: of 131 merged PRs,
+    **19 were titled `[WIP]` or announced they had changed nothing** - and they
+    were merged into default branches unattended. Real examples:
+
+        era#31        [WIP] Add enhanced invoice recognition capabilities using AI
+        agentMode#41  [WIP] Fix issues with Copilot integration
+        agentMode#23  No-op: session reset command already implemented
+
+    A builder that labels its own output work-in-progress is the cheapest possible
+    signal, and nothing was reading it. `no-op ... already implemented` is worse
+    than churn: it is the proposer having filed an idea for work that was already
+    done, then the builder confirming it, then the gate merging the confirmation.
+
+    Draft status does not catch these - `pr-janitor` un-drafts Copilot PRs by
+    design - so the title is the signal that survives.
+    """
+    return bool(re.search(
+        r"\[wip\]|\bwip\b|\bno-?op\b|already (implemented|done|exists)|"
+        r"\bdo not merge\b|\bdon'?t merge\b|\bplaceholder\b|\bstub only\b",
+        title or "", re.IGNORECASE,
+    ))
+
+
 def is_major_dependency_bump(title: str) -> bool:
     """Does this PR title describe a major version bump?
 
@@ -528,6 +554,28 @@ def evaluate(repo: str, pr_number: int) -> GateResult:
             merged_today_org=merged_today_org,
             files_count=0,
             risky_labels_found=risky_labels_found,
+        )
+    if declares_itself_incomplete(pr_obj.get("title") or ""):
+        return GateResult(
+            can_merge=False,
+            gate_failed="self-declared-incomplete",
+            reason=(
+                "the PR title says it is unfinished or changed nothing — a builder "
+                "that labels its own output [WIP] or 'no-op, already implemented' "
+                "is the cheapest signal there is, and 19 such PRs were merged "
+                "unattended before this gate existed"
+            ),
+            low_risk_only=low_risk_only,
+            has_risky_label=False,
+            under_daily_cap=under_daily_cap,
+            under_org_daily_cap=under_org_daily_cap,
+            needs_deep_review=needs_deep_review,
+            merged_today=merged_today,
+            merged_today_org=merged_today_org,
+            files_count=len(filenames),
+            risky_labels_found=risky_labels_found,
+            high_risk_files=high_risk,
+            non_low_risk_files=non_low_risk,
         )
     # An undescribed PR is checked before anything that costs an API call: it is
     # a property of the PR as submitted, and no amount of green CI makes a merge
