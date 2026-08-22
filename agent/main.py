@@ -576,7 +576,104 @@ regressions existing current flow flows feature features functionality
 change changes update updates ensure ensures make makes should must will can
 no not any all and or but with without for from into the a an of to in on at
 by is are be been being was were do does done p0 p1 p2 p3
+enhance enhanced enhancing enhancement improve improved improving improvement
+better optimize optimized optimizing optimization support new
 """.split())
+
+
+def _stem(word: str) -> str:
+    """Crude suffix stripping, enough to see one idea behind two spellings.
+
+    The proposer produces "Enhance Educational Features" one week and "Enhanced
+    Educational Features" the next; without this they share only "educational" and
+    read as distinct. Deliberately not a real stemmer - a dependency and a
+    linguistics problem to compare two short English noun phrases would be a poor
+    trade, and over-stemming only ever costs a false duplicate, which is logged with
+    its match and is therefore visible.
+    """
+    for suffix in ("ements", "ement", "ances", "ance", "ences", "ence", "ings", "ing",
+                   "ions", "ion", "ers", "er", "ed", "es", "s"):
+        if len(word) - len(suffix) >= 4 and word.endswith(suffix):
+            word = word[: -len(suffix)]
+            break
+    # Then drop a trailing "e", so "enhance" and "enhanced" (-> "enhanc") agree.
+    # Without this the single most common pair the proposer produces still reads as
+    # two distinct ideas.
+    if len(word) >= 5 and word.endswith("e"):
+        word = word[:-1]
+    return word
+
+
+def _normalize_title(title: str) -> frozenset[str]:
+    """The meaningful, stemmed words of a title, for near-duplicate comparison.
+
+    Compared as a word set rather than a string because the proposer rarely repeats
+    a title verbatim. Filler is dropped so two titles are not judged similar merely
+    for both containing "add" and "the".
+    """
+    words = re.sub(r"[^0-9a-zA-Z]+", " ", title).lower().split()
+    return frozenset(_stem(w) for w in words if w not in _FILLER_WORDS)
+
+
+def _is_near_duplicate(title: str, existing: list[str], threshold: float = 0.5) -> str | None:
+    """The title of an open idea this one substantially repeats, or None.
+
+    Returns the match so the caller can name it in the log - "skipped, duplicates
+    #54" is actionable where a bare "skipped" invites someone to disable the check.
+
+    The threshold is set from the cost asymmetry, not tuned until examples pass.
+    Two real pairs sit at exactly the same lexical distance - one shared meaningful
+    word out of two:
+
+        "Enhance README documentation"  vs  "Enhance onboarding documentation"
+        "Improve invoice recognition"   vs  "Improve receipt recognition"
+
+    A human judged the first pair the same work and closed one by hand; the second
+    pair is arguably two different features. No word-overlap threshold can tell them
+    apart, because the difference is semantic. So the choice is which error to make,
+    and the errors are not equally expensive:
+
+      false positive - the idea is skipped and logged with the title it matched.
+                       One idea waits a cycle, visibly, and a human can override.
+      false negative - a second 10-30 minute Copilot run is bought for work already
+                       in flight, plus a duplicate in the approval queue, plus
+                       somebody's time closing it.
+
+    The cheap error is the one to prefer, so this leans toward catching duplicates.
+    """
+    new = _normalize_title(title)
+    if not new:
+        return None
+    for other in existing:
+        old = _normalize_title(other)
+        if not old:
+            continue
+        overlap = len(new & old) / min(len(new), len(old))
+        if overlap >= threshold:
+            return other
+    return None
+
+
+def _open_idea_titles(repo: str) -> list[str]:
+    """Titles of idea issues already open on `repo`.
+
+    Failure returns an empty list rather than raising: a GitHub hiccup must not stop
+    the run filing legitimate ideas. The cost of the fail-open is one duplicate; the
+    cost of failing closed is a silent halt to the whole proposer.
+    """
+    try:
+        out = subprocess.run(
+            ["gh", "issue", "list", "--repo", repo, "--label", "idea", "--state", "open",
+             "--limit", "100", "--json", "title", "--jq", ".[].title"],
+            capture_output=True, text=True, timeout=60,
+        )
+        if out.returncode != 0:
+            log.warning("Could not read open ideas for %s: %s", repo, out.stderr.strip()[:200])
+            return []
+        return [line.strip() for line in out.stdout.splitlines() if line.strip()]
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.warning("Could not read open ideas for %s: %s", repo, exc)
+        return []
 
 
 def _build_file_idea_command(
@@ -678,7 +775,15 @@ def file_ideas_for_plan(
     filed = 0
     considered = 0
     unspecified = 0
+    duplicates = 0
     seen_titles: set[str] = set()
+    # Read once per repo, not per improvement. Ideas already open here are the ones
+    # a new proposal can repeat: autoRefine deduplicated only WITHIN a single plan,
+    # so the same idea reappeared every run until somebody closed it by hand. The
+    # 2026-08-15 triage of the approval queue found 6 duplicate pairs among 81
+    # issues, and each duplicate that gets approved buys a second 10-30 minute
+    # Copilot run for work already in flight.
+    already_open = [] if dry_run else _open_idea_titles(repo)
 
     for improvement in plan.get("improvements", []):
         priority = str(improvement.get("priority", "P2")).upper()
@@ -707,10 +812,24 @@ def file_ideas_for_plan(
             )
             continue
 
+        match = _is_near_duplicate(title, already_open)
+        if match:
+            duplicates += 1
+            log.info(
+                "Skipping duplicate idea for %s: %r substantially repeats the open "
+                "issue %r — filing it would buy a second Copilot run for work "
+                "already queued.",
+                repo, title, match,
+            )
+            continue
+
         cmd = _build_file_idea_command(script_path, repo, improvement, references, dry_run=dry_run)
         run = subprocess.run(cmd, capture_output=True, text=True)
         if run.returncode == 0:
             filed += 1
+            # Count it as open so two near-duplicates inside one plan cannot both
+            # pass - the in-run `seen_titles` check is exact-match only.
+            already_open.append(title)
             log.info("Filed idea for %s: %s", repo, title)
         else:
             log.warning(
