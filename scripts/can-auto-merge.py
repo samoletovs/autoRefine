@@ -446,21 +446,131 @@ def is_major_dependency_bump(title: str) -> bool:
     return bool(match) and match.group(1) != match.group(2)
 
 
+def _gh_json_soft(args: list[str]) -> tuple[object, bool]:
+    """Like _gh_json, but reports failure instead of exiting the process.
+
+    Returns (parsed, ok). Callers that can degrade to a second source need to
+    tell "the query failed" from "the answer is empty" — a distinction the hard
+    variant destroys by exiting, and which fetch_check_rollup destroyed by
+    returning [] for both.
+    """
+    try:
+        proc = subprocess.run(
+            ["gh", *args], check=True, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None, False
+    try:
+        return json.loads(proc.stdout), True
+    except json.JSONDecodeError:
+        return None, False
+
+
+def resolve_checks(repo: str, pr_number: int,
+                   head_sha: str | None = None) -> tuple[list[dict], str]:
+    """(nodes, source) — the PR's checks, read however this token can read them.
+
+    `source` is "rollup" or "actions-api", and callers must surface it: a verdict
+    reached from a substitute source must not be indistinguishable from one
+    reached normally.
+
+    Why a substitute exists at all. GH_PAT is fine-grained and carries neither
+    `Checks` nor `Commit statuses`, so `gh pr view --json statusCheckRollup` — the
+    query those two permissions gate — returns "Resource not accessible by
+    personal access token" for every PR in the fleet. Both callers then fail
+    closed, correctly, and escalate everything: every daily card has read "0
+    merged automatically, 1 waiting on you". The janitor was blind, not stuck,
+    and the report could not tell the difference.
+
+    The Actions API *is* readable, and in this fleet it is equivalent evidence:
+    every check here is a GitHub Actions workflow, so it sees the same runs. It
+    would NOT be equivalent anywhere an external provider posts commit statuses
+    without a workflow run — which is why an empty result stays blocking rather
+    than reading as clean.
+    """
+    nodes, readable = fetch_check_rollup_status(repo, pr_number)
+    if readable:
+        return nodes, "rollup"
+    sha = head_sha or _head_sha(repo, pr_number)
+    return (fetch_actions_checks(repo, sha) if sha else []), "actions-api"
+
+
+def _head_sha(repo: str, pr_number: int) -> str:
+    pr, ok = _gh_json_soft(["pr", "view", str(pr_number), "--repo", repo,
+                            "--json", "headRefOid"])
+    if not ok or not isinstance(pr, dict):
+        return ""
+    return pr.get("headRefOid") or ""
+
+
+def annotate_substitute_source(reason: str, source: str) -> str:
+    """Mark a verdict that was reached without the real check rollup."""
+    if source != "rollup":
+        return (f"{reason} [via the Actions API — this token cannot read the "
+                f"check rollup; see nauroLabs-github#211]")
+    return reason
+
+
 def fetch_check_rollup(repo: str, pr_number: int) -> list[dict]:
     """statusCheckRollup nodes for a PR's head commit.
 
     Returns [] both when there are genuinely no checks and when the query
     fails; classify_checks() treats an empty list as blocking unless the repo
     is on the documented exemption list, so the ambiguity fails closed.
+
+    Prefer fetch_check_rollup_status() where the difference matters.
     """
-    out = _gh_json([
+    nodes, _ = fetch_check_rollup_status(repo, pr_number)
+    return nodes
+
+
+def fetch_check_rollup_status(repo: str, pr_number: int) -> tuple[list[dict], bool]:
+    """(nodes, readable). One call, so the caller can tell empty from denied.
+
+    GH_PAT is fine-grained and, as of 2026-08-23, carries neither `Checks` nor
+    `Commit statuses`. `gh pr view --json statusCheckRollup` is exactly the query
+    those two permissions gate, so the janitor could not read a single check
+    result and correctly refused to merge what it could not verify — which is why
+    every daily card read "0 merged automatically, 1 waiting on you". Blind, not
+    stuck, and indistinguishable from stuck in the report it produced.
+    """
+    out, ok = _gh_json_soft([
         "pr", "view", str(pr_number), "--repo", repo,
         "--json", "statusCheckRollup",
     ])
-    if not isinstance(out, dict):
-        return []
+    if not ok or not isinstance(out, dict):
+        return [], False
     nodes = out.get("statusCheckRollup")
-    return nodes if isinstance(nodes, list) else []
+    return (nodes if isinstance(nodes, list) else []), True
+
+
+def fetch_actions_checks(repo: str, head_sha: str) -> list[dict]:
+    """Completed workflow runs for a commit, shaped like rollup CheckRun nodes.
+
+    A fallback for when the rollup is unreadable. It is equivalent evidence
+    *here* and only here: every check in this fleet is a GitHub Actions workflow,
+    so the Actions API sees the same runs the Checks API would report. It is NOT
+    equivalent in general — an external CI provider posts a commit status and no
+    workflow run, and would be invisible to this. That is why the caller refuses
+    to merge when this returns nothing rather than reading empty as clean.
+
+    `action_required` runs are deliberately preserved rather than dropped: they
+    never started, and a run that never started is not a run that passed.
+    """
+    runs, ok = _gh_json_soft(["api", f"/repos/{repo}/actions/runs?head_sha={head_sha}"])
+    if not ok or not isinstance(runs, dict):
+        return []
+    nodes: list[dict] = []
+    for run in runs.get("workflow_runs", []):
+        if not isinstance(run, dict):
+            continue
+        nodes.append({
+            "name": run.get("name") or "unnamed",
+            "status": run.get("status") or "",
+            "conclusion": run.get("conclusion") or "",
+        })
+    return nodes
 
 
 def runs_awaiting_approval(repo: str, pr_number: int) -> list[str]:
@@ -603,10 +713,12 @@ def evaluate(repo: str, pr_number: int) -> GateResult:
         )
     # Checks first among the content gates: a PR nothing verified must not
     # merge however low-risk its files look.
-    rollup = fetch_check_rollup(repo, pr_number)
+    rollup, checks_source = resolve_checks(
+        repo, pr_number, head_sha=(pr_obj.get("head") or {}).get("sha"))
     checks_ok, checks_reason = classify_checks(
         rollup, repo=repo,
         awaiting_approval=runs_awaiting_approval(repo, pr_number) if not rollup else None)
+    checks_reason = annotate_substitute_source(checks_reason, checks_source)
     if not checks_ok:
         return GateResult(
             can_merge=False,
