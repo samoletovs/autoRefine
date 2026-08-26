@@ -26,3 +26,6 @@ azure-monitor-opentelemetry>=1.6.0
 pytest>=8.3.0
 pytest-asyncio>=0.24.0
 ruff>=0.7.0
+# Measures the agent instructions against Azure's 1,024-token prompt-cache
+# floor (tests/test_prompt_cache_prefix.py). Tests skip cleanly without it.
+tiktoken>=0.7.0

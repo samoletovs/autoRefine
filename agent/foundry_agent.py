@@ -62,6 +62,14 @@ ORPHAN_AGENT_MAX_AGE = timedelta(hours=6)
 DEPLOYMENT = DEFAULT_DEPLOYMENT
 
 SYSTEM_PROMPT = (Path(__file__).parent / "prompts" / "system.md").read_text(encoding="utf-8")
+# Keep system.md at or above ~1,150 tokens. Azure prompt caching only engages on
+# a prefix of at least 1,024 identical tokens, so instructions shorter than that
+# cache nothing and every tool round of every run pays full input rate. The run
+# object exposes no cached-token count (RunCompletionUsage carries only
+# prompt/completion/total), so falling under the cliff is invisible until the
+# bill arrives — tests/test_prompt_cache_prefix.py is what makes it visible.
+# Append durable guidance; never reorder or templatize, which would break the
+# byte-identical prefix the cache matches on.
 
 # ── Prompt budget ────────────────────────────────────────────────────────────
 # Two distinct levers, easy to conflate:
