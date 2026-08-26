@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -34,6 +33,7 @@ from agent.tools.quality_tools import (
     SKIP_NOT_DECLARED,
     SKIP_TOOLING_UNAVAILABLE,
     QualityCoverage,
+    RepoContext,
     check_ci_cd,
     check_tests,
     measure_dependencies,
@@ -127,13 +127,15 @@ class TestDeclarationAsymmetry:
         assert reasons["tests"] == SKIP_NOT_DECLARED
         assert reasons["ci-cd"] == SKIP_NOT_DECLARED
         assert reasons["i18n"] == SKIP_NOT_DECLARED
-        assert reasons["deps"] == SKIP_NOT_APPLICABLE
         assert reasons["security"] == SKIP_NOT_APPLICABLE
         assert reasons["metadata"] is None
+        # deps needs GitHub identity it was not given here, which is a third
+        # thing again: not the project's silence, and not an inapplicable stack.
+        assert reasons["deps"] == SKIP_TOOLING_UNAVAILABLE
 
         details = {r.dimension: r.detail for r in coverage.results}
         assert "project.yaml" in details["tests"]
-        assert "package.json" in details["deps"]
+        assert "repo identity" in details["deps"]
 
 
 # ── Skipped is not passed ──────────────────────────────────────────────────
@@ -170,32 +172,29 @@ class TestSkippedIsNotPassed:
         for result in coverage.results:
             assert result.measured == (result.skip_reason is None)
 
-    def test_npm_missing_reads_as_unmeasured_not_as_a_clean_tree(
+    def test_no_token_reads_as_unmeasured_not_as_a_clean_tree(
         self, tmp_path: Path
     ) -> None:
-        """A runner without npm audited nothing; that is not a clean dependency tree."""
+        """Without a token nothing was audited; that is not a clean dependency tree."""
         project = _write_python_app(tmp_path, quality=[])
-        (project / "package.json").write_text('{"name": "x"}', encoding="utf-8")
 
-        with patch(
-            "agent.tools.quality_tools.subprocess.run",
-            side_effect=FileNotFoundError("npm"),
-        ):
-            result = measure_dependencies(project, _config(project))
+        result = measure_dependencies(
+            project, _config(project), RepoContext(slug="owner/name", token="")
+        )
 
         assert result.findings == []
         assert result.measured is False
         assert result.skip_reason == SKIP_TOOLING_UNAVAILABLE
 
-    def test_a_successful_audit_counts_as_measured(self, tmp_path: Path) -> None:
+    def test_a_successful_read_counts_as_measured(self, tmp_path: Path) -> None:
         project = _write_python_app(tmp_path, quality=[])
-        (project / "package.json").write_text('{"name": "x"}', encoding="utf-8")
-        clean_audit = SimpleNamespace(
-            stdout=json.dumps({"metadata": {"vulnerabilities": {"critical": 0, "high": 0}}})
-        )
 
-        with patch("agent.tools.quality_tools.subprocess.run", return_value=clean_audit):
-            result = measure_dependencies(project, _config(project))
+        with patch(
+            "agent.tools.quality_tools.fetch_dependabot_alerts", return_value=[]
+        ):
+            result = measure_dependencies(
+                project, _config(project), RepoContext(slug="owner/name", token="t")
+            )
 
         assert result.measured is True
         assert result.findings == []

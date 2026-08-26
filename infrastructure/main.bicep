@@ -88,6 +88,10 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
         {
           name: 'autorefine'
           // Public image, and the full (non-slim) tag because the agent shells out to git.
+          // No node here, and none needed: the dependency check reads Dependabot alerts
+          // over the API rather than shelling out to `npm audit`. Adding node to "fix"
+          // that check would be re-solving a problem that no longer exists — see
+          // AGENTS.md, "The dependency check".
           image: 'python:3.12'
           resources: {
             // The run is I/O-bound — it waits on Foundry far more than it computes — so the
