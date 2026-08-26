@@ -12,6 +12,12 @@ name: Tests
 # No cron here — this adds nothing to the schedule ceiling in
 # nauroLabs-github/config/schedule-budget.json. Path-filtered because the repo
 # is private and its minutes come out of the monthly allowance.
+#
+# The filter covers ".github/workflows/**", not just this file: nine branches
+# once carried an autorefine-evaluate.yml that GitHub could not parse, and each
+# push to them produced a jobless run marked "failure" with nothing to read.
+# tests/test_workflow_yaml.py catches that class of break, but only if a
+# workflow edit is an event this workflow reacts to.
 
 on:
   push:
@@ -22,7 +28,7 @@ on:
       - "tests/**"
       - "config/**"
       - "requirements.txt"
-      - ".github/workflows/tests.yml"
+      - ".github/workflows/**"
   pull_request:
     paths:
       - "agent/**"
@@ -30,7 +36,7 @@ on:
       - "tests/**"
       - "config/**"
       - "requirements.txt"
-      - ".github/workflows/tests.yml"
+      - ".github/workflows/**"
   workflow_dispatch:
 
 permissions:
