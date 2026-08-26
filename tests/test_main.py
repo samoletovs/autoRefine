@@ -132,7 +132,7 @@ def test_main_rejects_invalid_mode() -> None:
 def test_evaluate_project_adds_feature_suggestions_from_project_yaml(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(
         "agent.main.run_quality_checks_with_coverage",
-        lambda _p, _c: ([], QualityCoverage()),
+        lambda _p, _c, _r=None: ([], QualityCoverage()),
     )
     config = ProjectConfig(
         name="demo",
@@ -155,7 +155,7 @@ def test_evaluate_project_adds_feature_suggestions_from_project_yaml(monkeypatch
 def test_evaluate_project_returns_empty_feature_suggestions_without_inputs(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(
         "agent.main.run_quality_checks_with_coverage",
-        lambda _p, _c: ([], QualityCoverage()),
+        lambda _p, _c, _r=None: ([], QualityCoverage()),
     )
     config = ProjectConfig(
         name="demo",

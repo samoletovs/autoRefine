@@ -194,7 +194,7 @@ class TestReportToPromptChain:
         ]
         monkeypatch.setattr(
             "agent.main.run_quality_checks_with_coverage",
-            lambda _p, _c: (findings, QualityCoverage()),
+            lambda _p, _c, _r=None: (findings, QualityCoverage()),
         )
         return evaluate_project(tmp_path, config)
 
