@@ -375,7 +375,7 @@ class TestNoFailureLooksClean:
         ):
             report = evaluate_project(project, _config(project), REPO)
 
-        assert report["coverage"]["total"] == 6
+        assert report["coverage"]["total"] == 7
         assert "metadata" in [
             d["dimension"] for d in report["coverage"]["dimensions"] if d["measured"]
         ]

@@ -168,6 +168,18 @@ history — the drop is the mechanism working.
 `not-applicable` and leaves the denominator. It is never advisory-with-weight.
 Never penalise a project for something it cannot buy.
 
+The first and so far only producer is `measure_branch_protection`. Measured on
+2026-08-26: **31 of 31 non-archived repositories have no classic protection and
+zero rulesets**, so it fires everywhere and every scored project drops 10 points
+at once. That drop is the mechanism working, not a regression.
+
+It checks classic protection **and** rulesets, and that is load-bearing rather
+than thorough: rulesets are the modern way to protect a branch, so a check blind
+to them would keep reporting a repo that had just been fixed. A finding that
+cannot clear is a permanent penalty, which is what the paragraph above says never
+to weight. Archived repositories and repositories with no default branch are
+`not-applicable`.
+
 ### The dependency check
 
 `measure_dependencies` reads **Dependabot alerts over the API**. It used to shell
@@ -195,6 +207,8 @@ Two rules it must keep:
 `AUTOREFINE_SKIP_DEPENDABOT=1` stops the network call entirely, degrading to
 `tooling-unavailable`. It exists because this is the first thing in a previously
 offline module to call out to the network, fleet-wide, twice a day.
+`AUTOREFINE_SKIP_BRANCH_PROTECTION=1` does the same for the other network check —
+separate switches, so an emergency in one cannot silently take the other with it.
 
 Cost is not a concern here: one or two calls per repo per sweep against a
 15,000/hr core budget. Measured 2026-08-26 — 30 non-archived repos, 0 with open
