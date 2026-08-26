@@ -1394,27 +1394,72 @@ def handle_functional_ideas(
     return []
 
 
-def _worktree_snapshot(project_dir: Path) -> set[str]:
-    """Porcelain status lines, identifying files dirty *before* the agent runs.
+def _worktree_status(project_dir: Path) -> dict[str, str]:
+    """Map every dirty path to its two-letter porcelain status code.
 
-    Used to distinguish pre-existing user changes (which must never be
-    discarded) from files the agent touched during a run.
+    This is the single status parser. It uses ``-z`` because the default
+    porcelain output quotes *and* C-escapes any path that is not plain ASCII::
+
+        $ git status --porcelain
+        ?? "caf\\303\\251.py"
+
+        $ git status --porcelain -z      # NUL-separated, verbatim bytes
+        ?? café.py
+
+    Stripping the quotes off the first form yields the literal string
+    ``caf\\303\\251.py``, which matches no file on disk — so the path could be
+    neither stat'd nor handed back to git (``fatal: pathspec ... did not match
+    any files``). Under ``-z`` paths are emitted verbatim and need no unescaping.
+
+    Renames are encoded differently under ``-z``, which is the other trap: the
+    default form is one field, ``R  old.py -> new.py``, whereas ``-z`` emits the
+    *new* path in the record and the original in the following NUL-separated
+    field::
+
+        R  new.py\\0old.py\\0
+
+    A parser that treats every field as a record therefore invents a phantom
+    entry from that trailing origin path, so rename records consume two fields.
+
+    ``encoding`` is pinned to UTF-8 rather than left to ``text=True``, which
+    decodes with the locale codepage — cp1252 on a Windows runner. Git emits
+    path bytes as UTF-8, so the locale default turned ``café.py`` into
+    ``cafÃ©.py``, which stats and matches no better than the escaped form did.
+    ``-z`` alone does not fix this; the two defects stack.
     """
-    status = subprocess.run(
-        ["git", "status", "--porcelain"],
+    result = subprocess.run(
+        ["git", "status", "--porcelain", "-z"],
         cwd=str(project_dir),
         capture_output=True,
-        text=True,
+        encoding="utf-8",
+        errors="surrogateescape",
     )
-    return {line for line in status.stdout.splitlines() if line.strip()}
+
+    entries: dict[str, str] = {}
+    fields = result.stdout.split("\0")
+    i = 0
+    while i < len(fields):
+        field = fields[i]
+        if len(field) < 4:  # "XY p" is the shortest possible record
+            i += 1
+            continue
+        code, path = field[:2], field[3:]
+        entries[path] = code
+        # git only reports rename/copy detection in the index column.
+        i += 2 if code[0] in ("R", "C") else 1
+    return entries
 
 
-def _status_path(line: str) -> str:
-    """Extract the path from a porcelain status line, handling renames."""
-    path = line[3:].strip() if len(line) > 3 else line.strip()
-    if " -> " in path:
-        path = path.split(" -> ", 1)[1]
-    return path.strip('"')
+def _worktree_snapshot(project_dir: Path) -> set[str]:
+    """Paths that are dirty *before* the agent runs.
+
+    Returns paths rather than raw status lines on purpose: a file can move from
+    ``" M foo.py"`` to ``"M  foo.py"`` when something stages it mid-run, which
+    changes the line but not the file. Comparing lines would then read a
+    pre-existing user edit as an agent edit. Keeping the identity in the type
+    means no caller has to remember that.
+    """
+    return set(_worktree_status(project_dir))
 
 
 def _rollback_agent_changes(project_dir: Path, baseline: set[str]) -> list[str]:
@@ -1424,16 +1469,13 @@ def _rollback_agent_changes(project_dir: Path, baseline: set[str]) -> list[str]:
     so partial edits can be sitting in the worktree. Left there, a later run
     would sweep them into a commit as if they were a finished improvement.
     """
-    baseline_paths = {_status_path(line) for line in baseline}
-    current = _worktree_snapshot(project_dir)
     reverted: list[str] = []
 
-    for line in current:
-        path = _status_path(line)
-        if path in baseline_paths:
+    for path, code in _worktree_status(project_dir).items():
+        if path in baseline:
             continue  # pre-existing user change — never touch it
 
-        if line.startswith("??"):
+        if code == "??":
             target = project_dir / path
             try:
                 if target.is_file():
@@ -1521,18 +1563,10 @@ def refine_project(
             _rollback_agent_changes(project_dir, baseline)
             return False
 
-        # Check if agent made any changes
-        status = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=str(project_dir),
-            capture_output=True,
-            text=True,
-        )
-        changed_files = [
-            line.strip().split(maxsplit=1)[-1]
-            for line in status.stdout.strip().splitlines()
-            if line.strip()
-        ]
+        # Check if agent made any changes. Uses the same parser as the rollback
+        # path; the ad-hoc split this replaced turned a rename into the literal
+        # string "old.py -> new.py" and kept git's quoting on any non-ASCII path.
+        changed_files = sorted(_worktree_status(project_dir))
 
         if not changed_files:
             log.info("No files changed — nothing to commit.")
