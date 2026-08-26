@@ -45,6 +45,7 @@ from tenacity import (
 )
 
 from agent.config import ProjectConfig
+from agent.tools.quality_tools import plannable_findings
 
 log = logging.getLogger(__name__)
 
@@ -1223,11 +1224,29 @@ def _parse_plan_from_text(text: str) -> dict | None:
 
 
 def build_plan_task(findings: list[dict], config: ProjectConfig) -> str:
-    """Build the task prompt for plan mode."""
+    """Build the task prompt for plan mode.
+
+    Advisory findings are dropped here rather than at the call sites. This is the
+    single point at which a finding becomes prompt text, so it is the only place
+    the exclusion can be *enforced* rather than merely observed: a future caller
+    that forgets to filter still cannot leak one, because there is nowhere else
+    for a finding to enter a prompt.
+    """
+    plannable = plannable_findings(findings)
+
+    withheld = len(findings) - len(plannable)
+    if withheld:
+        log.info(
+            "Withholding %d advisory finding(s) from the plan prompt for %s — no "
+            "pull request can repair them, so an idea filed from one would buy a "
+            "coding-agent run that cannot succeed",
+            withheld, config.name,
+        )
+
     findings_text = ""
-    if findings:
+    if plannable:
         findings_text = "\n## Quality check findings\n"
-        for f in findings:
+        for f in plannable:
             findings_text += f"- [{f['priority']}] {f['category']}: {f['description']}\n"
 
     similar_text = ""
