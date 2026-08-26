@@ -1043,37 +1043,41 @@ def create_github_issues(
 
 # ── Telegram summary ───────────────────────────────────────────────────────
 def build_telegram_summary(
-    report: str,
+    analysis: dict[str, Any],
     report_path: str | None,
     created_issues: list[str],
     cost_data: dict[str, Any] | None = None,
-    analysis: dict[str, Any] | None = None,
 ) -> str:
-    """Compose a short Telegram message from the full report.
+    """Compose a short Telegram message from the analysis results.
+
+    Alerts and the focus project are read from *analysis* directly. They used
+    to be recovered by scraping the rendered markdown for lines starting with
+    ``"- "``, which is how the Azure cost bullets ended up in the alert slot:
+    the summary was reconstructing structure from a rendering of that same
+    structure, so anything shaped like a bullet qualified. The structured data
+    was always available; the report text is no longer an input at all, which
+    is what makes the bug unreintroducible rather than merely fixed.
 
     When *cost_data* is provided (and not an error), a one-line Azure
-    cost/budget summary is included so the Telegram recipient can see
-    spending without opening the full report.
+    cost/budget summary is included so the recipient can see spending without
+    opening the full report. It is labelled and rendered as a single line, so
+    it cannot be mistaken for a finding.
 
-    When *analysis* carries an error, the failure is stated on the second
-    line. This message is the only part a human reliably reads, so a failed
-    scan that looked identical to a quiet one could go unnoticed for days.
+    Three outcomes must stay visibly distinct here, because this message is the
+    only part a human reliably reads: the analysis failed, the analysis ran and
+    found nothing, and the analysis ran and found alerts.
     """
-    lines = report.split("\n")
-    alerts = [line for line in lines if line.startswith("- ") and "🚨" not in line][:3]
-    focus_line = next((line for line in lines if line.startswith("## 🎯")), "")
-
     parts: list[str] = ["🤖 <b>NauroLabs Health Report</b>"]
 
-    failed = analysis is not None and analysis_failed(analysis)
+    failed = analysis_failed(analysis)
     if failed:
         parts.append("⚠️ <b>AI analysis FAILED — report is incomplete</b>")
-        error = str(analysis.get("error", "unknown error")) if analysis else ""
-        parts.append(f"<i>{error[:180]}</i>")
+        parts.append(f"<i>{str(analysis.get('error', 'unknown error'))[:180]}</i>")
         parts.append("No scores, no alerts, no issues filed this run.")
 
-    if focus_line:
-        parts.append(focus_line.replace("## ", "").replace("🎯 ", "🎯 "))
+    focus = analysis.get("focus_project", "")
+    if focus and not failed:
+        parts.append(f"🎯 This Week: {focus}")
 
     if cost_data and cost_data.get("total", -1) >= 0:
         total = cost_data["total"]
@@ -1091,8 +1095,18 @@ def build_telegram_summary(
             cost_line += " — <b>⚠️ OVER BUDGET</b>"
         parts.append(cost_line)
 
-    if alerts and not failed:
-        parts.extend(alerts[:3])
+    if not failed:
+        alerts = analysis.get("alerts", []) or []
+        if alerts:
+            parts.append(f"🚨 <b>{len(alerts)} alert(s)</b>")
+            # Each alert is prefixed, so an alert can never be confused with
+            # the cost line above or with any other bullet in the message.
+            parts.extend(f"🚨 {a}" for a in alerts[:3])
+            if len(alerts) > 3:
+                parts.append(f"…and {len(alerts) - 3} more — see the full report")
+        else:
+            parts.append("✅ No alerts")
+
     if created_issues:
         parts.append(f"📋 Created {len(created_issues)} tech-debt issue(s)")
     if report_path:
@@ -1160,7 +1174,7 @@ def run_health_scan(repos: list[str], assign_copilot: bool = True) -> dict[str, 
     )
 
     summary = build_telegram_summary(
-        report, report_path, created_issues, cost_data=cost_data, analysis=analysis
+        analysis, report_path, created_issues, cost_data=cost_data
     )
     send_telegram(summary, parse_mode="HTML")
 
