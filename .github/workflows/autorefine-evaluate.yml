@@ -3,8 +3,18 @@ name: "autoRefine — Evaluate All Projects"
 on:
   # The daily 06:00 UTC schedule moved to the Azure Container Apps job `job-autorefine`
   # (infrastructure/main.bicep). This workflow averaged 43 min/run — ~1,744 Actions minutes
-  # a month, by far the largest consumer across every repo. Kept dispatch-only so a run can
-  # still be triggered by hand from the GitHub UI.
+  # a month, by far the largest consumer across every repo.
+  #
+  # Kept dispatch-only so a run can be triggered by hand from the GitHub UI — but note
+  # that this path does NOT currently work: the "Azure login" step below reads a
+  # repository secret named AZURE_CREDENTIALS which does not exist, so every dispatch
+  # fails there with "Ensure 'client-id' and 'tenant-id' are supplied" and the agent
+  # never starts. Making it work needs an auth decision a human has to take — either
+  # recreating that service-principal secret, or moving to OIDC federated credentials
+  # (client-id/tenant-id/subscription-id plus `permissions: id-token: write`).
+  #
+  # The scheduled Container Apps job is unaffected: it authenticates with a
+  # system-assigned managed identity and needs no secret at all.
   workflow_dispatch:
     inputs:
       mode:
