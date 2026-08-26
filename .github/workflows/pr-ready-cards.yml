@@ -43,6 +43,11 @@ permissions:
 jobs:
   pr-cards:
     runs-on: ubuntu-latest
+    # The comment above is explicit that run count is the whole bill here because the
+    # real work is seconds of API calls — observed runs finish in 0.2-0.6 min. That makes
+    # the inherited 6-hour default absurd: one wedged API call could cost more billed
+    # minutes than a year of scheduled sweeps. 10 min is ~16x the slowest run seen.
+    timeout-minutes: 10
     # Skip scheduled runs when the budget tier is "critical" (manual dispatch still works).
     if: vars.AUTOREFINE_TIER != 'critical' || github.event_name == 'workflow_dispatch'
     env:

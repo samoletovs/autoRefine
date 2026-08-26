@@ -28,14 +28,23 @@ import yaml
 
 WORKFLOW_DIR = Path(__file__).resolve().parent.parent / ".github" / "workflows"
 
-# The job that spends the money. Named explicitly rather than asserting these
-# properties fleet-wide: the cheap event-driven workflows finish in seconds, and
-# a blanket rule here would be noise rather than a guard.
+# The jobs that must not be able to run for GitHub's 6-hour default.
+#
+# Listed, not derived from "runs the agent". autorefine-health-scan.yml runs the
+# agent too and is deliberately absent: every one of its runs has been skipped
+# since AUTOREFINE_TIER went to 'critical', so there is no observed duration to
+# size a ceiling from, and a guessed one would risk killing a legitimate scan.
+# That is a known gap awaiting data, not an oversight — add it here once a real
+# run records a duration.
+TIME_BOUNDED_WORKFLOWS = ("autorefine-evaluate.yml", "pr-ready-cards.yml")
+
+# The one that holds a Foundry agent open for the whole run, so the one where two
+# at once is two bills for one answer.
 EVALUATE_WORKFLOW = WORKFLOW_DIR / "autorefine-evaluate.yml"
 
-# A normal sweep is ~43 min (AGENTS.md). Anything far above that is not a slow
-# day, it is a hang — and a hang is also how a Foundry agent gets orphaned, since
-# a hard kill never reaches main.py's `finally`.
+# The evaluate sweep is ~43 min (AGENTS.md); nothing here should approach this.
+# Above it is not a slow day, it is a hang — and a hang is also how a Foundry
+# agent gets orphaned, since a hard kill never reaches main.py's `finally`.
 MAX_REASONABLE_TIMEOUT_MINUTES = 180
 
 # Contexts an outsider (or a mistyped dispatch input) can put arbitrary text
@@ -95,15 +104,17 @@ def test_untrusted_input_is_never_interpolated_into_a_run_block(path: Path) -> N
     )
 
 
-def test_evaluate_job_is_time_bounded() -> None:
+@pytest.mark.parametrize("workflow_name", TIME_BOUNDED_WORKFLOWS)
+def test_job_is_time_bounded(workflow_name: str) -> None:
     """Without this the ceiling is GitHub's 6-hour default, not anything chosen."""
-    jobs = _load(EVALUATE_WORKFLOW)["jobs"]
+    path = WORKFLOW_DIR / workflow_name
+    jobs = _load(path)["jobs"]
 
     for job_name, job in jobs.items():
         timeout = job.get("timeout-minutes")
         assert timeout is not None, (
-            f"job '{job_name}' in {EVALUATE_WORKFLOW.name} has no 'timeout-minutes', "
-            "so a hung Foundry call burns the 6-hour default before GitHub steps in."
+            f"job '{job_name}' in {workflow_name} has no 'timeout-minutes', "
+            "so a hung call burns the 6-hour default before GitHub steps in."
         )
         assert isinstance(timeout, int) and 0 < timeout <= MAX_REASONABLE_TIMEOUT_MINUTES, (
             f"job '{job_name}' timeout of {timeout!r} is not a sane bound "
