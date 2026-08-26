@@ -25,10 +25,30 @@ permissions:
   contents: read
   issues: write
 
+# One sweep at a time. A run holds a Foundry agent open for ~43 min (AGENTS.md)
+# and re-reads every project in the manifest, so two dispatches at once buy two
+# full bills for one answer.
+#
+# cancel-in-progress is deliberately false. agent/main.py deletes its ephemeral
+# Foundry agent in a `finally` block, and a cancelled job is a hard kill that
+# never reaches it — cancelling would save an Actions minute and leak an agent
+# that then survives until the next run's sweep_orphaned_agents clears it.
+concurrency:
+  group: autorefine-evaluate
+  cancel-in-progress: false
+
 jobs:
   evaluate:
     runs-on: ubuntu-latest
-    # Skip scheduled runs when budget tier is "critical" (manual still works).
+    # This job's failure mode is hanging on a Foundry call, not crashing, and the
+    # default ceiling is GitHub's 6 hours — eight normal runs' worth of minutes on
+    # the workflow AGENTS.md already names as the fleet's largest consumer. A sweep
+    # averages ~43 min, so 90 absorbs a slow day and still stops a hang dead.
+    timeout-minutes: 90
+    # Inert while this workflow is dispatch-only: github.event_name can only be
+    # 'workflow_dispatch' here, so the right-hand side is always true and the tier
+    # never gates anything. Kept rather than deleted so the budget gate is already
+    # correct on the day the 06:00 schedule comes back to Actions.
     if: vars.AUTOREFINE_TIER != 'critical' || github.event_name == 'workflow_dispatch'
     env:
       FOUNDRY_PROJECT_ENDPOINT: ${{ secrets.FOUNDRY_PROJECT_ENDPOINT }}
@@ -71,16 +91,21 @@ jobs:
           # Observe-first: propose functional ideas (log + Telegram, file NOTHING) until a
           # human sets repo variable AUTOREFINE_FUNCTIONAL_MODE=file. See EVOLUTION.md §6.
           AUTOREFINE_FUNCTIONAL_MODE: ${{ vars.AUTOREFINE_FUNCTIONAL_MODE || 'propose' }}
+          # Dispatch inputs arrive as env vars, not as inline ${{ }} inside the script.
+          # Actions substitutes an expression textually before bash parses the line, so
+          # an inline `repo` would be spliced in as shell *syntax* — quoting at the call
+          # site cannot help, because the quotes are written after the payload is. As env
+          # vars they are only ever data. pr-merged-notify.yml uses the same pattern.
+          MODE: ${{ github.event.inputs.mode || 'file-ideas' }}
+          REPO_INPUT: ${{ github.event.inputs.repo }}
         run: |
-          MODE="${{ github.event.inputs.mode || 'file-ideas' }}"
-          REPO_FLAG=""
-          if [ -n "${{ github.event.inputs.repo }}" ]; then
-            REPO_FLAG="--repo samoletovs/${{ github.event.inputs.repo }}"
+          if [ -n "$REPO_INPUT" ]; then
+            set -- --repo "samoletovs/$REPO_INPUT"
           else
-            REPO_FLAG="--manifest .github-gov/config/workspace-manifest.json"
+            set -- --manifest .github-gov/config/workspace-manifest.json
           fi
 
-          python -m agent.main $REPO_FLAG --mode $MODE \
+          python -m agent.main "$@" --mode "$MODE" \
             --workdir /tmp/autorefine \
             > /tmp/autorefine-report.json 2>/tmp/autorefine-logs.txt || true
 
@@ -89,31 +114,17 @@ jobs:
           echo "--- report ---"
           cat /tmp/autorefine-report.json
 
+      # Writes scores/total/avg to $GITHUB_OUTPUT, or exits 1 when the report holds no
+      # score objects. continue-on-error keeps `outcome` truthful (that is the signal the
+      # steps below branch on) while letting the notifier and issue-filer still run.
+      #
+      # The arithmetic lives in Python because it was wrong for as long as it lived in a
+      # jq pipeline here: `total` was measured after `head -20` truncated the list, so a
+      # 25-project manifest reported "20 projects" beside an average over all 25.
       - name: Parse scores
         id: parse-scores
         continue-on-error: true
-        run: |
-          report_file="/tmp/autorefine-report.json"
-
-          REPORT_OBJECTS=$(python3 agent/parse_scores.py "$report_file")
-
-          if [ -z "$REPORT_OBJECTS" ]; then
-            echo "::warning::No score found in $report_file"
-            echo "status=failure" >> "$GITHUB_OUTPUT"
-            exit 1
-          fi
-
-          SCORES=$(echo "$REPORT_OBJECTS" | jq -r '"\(.project): \(.score)/100"' | head -20)
-          TOTAL=$(echo "$SCORES" | wc -l)
-          AVG=$(echo "$REPORT_OBJECTS" | jq -rs '[.[].score] | add / length | floor | tostring')
-
-          {
-            printf 'scores<<EOF\n%s\nEOF\n' "$SCORES"
-            printf 'total=%s\n' "$TOTAL"
-            printf 'avg=%s\n' "$AVG"
-            printf 'score=%s\n' "$AVG"
-            printf 'status=success\n'
-          } >> "$GITHUB_OUTPUT"
+        run: python3 -m agent.score_summary /tmp/autorefine-report.json
 
       - name: Create or update failure issue
         id: failure-issue
@@ -131,7 +142,7 @@ jobs:
           REPORT_HEAD=$(head -c 4000 /tmp/autorefine-report.json 2>/dev/null || echo "(no report)")
 
           BODY=$(cat <<EOF
-          The scheduled \`autoRefine — Evaluate All Projects\` workflow failed: no score
+          The \`autoRefine — Evaluate All Projects\` workflow failed: no score
           objects were parsed from the report.
 
           - Mode: \`${MODE}\`
@@ -149,7 +160,8 @@ jobs:
           \`\`\`
 
           ### What to investigate
-          1. Why does \`agent/parse_scores.py\` find no objects with both \`project\` and \`score\`?
+          1. Why does \`agent/parse_scores.py\` find no objects with both \`project\` and \`score\`
+             in the report that \`agent/score_summary.py\` read?
           2. Does the current \`${MODE}\` mode actually emit \`score\` fields? If not, either
              update the mode to emit them, or change the workflow's "Notify Telegram" / issue
              logic so this mode isn't expected to produce scores.
