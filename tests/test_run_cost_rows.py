@@ -16,8 +16,8 @@ Two properties matter more than the contents, and both are pinned here:
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -90,15 +90,10 @@ def test_row_records_mode_rounds_and_tokens(
     log_path = tmp_path / "cost" / "rows.jsonl"
     monkeypatch.setenv("AUTOREFINE_COST_LOG", str(log_path))
 
-    class Recorder:
-        def create_agent(self, **_kwargs: Any) -> SimpleNamespace:
-            return SimpleNamespace(id="agent-refine")
-
-    # create_agent is what knows the mode; run_agent only ever sees an agent id.
-    foundry_agent.create_agent(Recorder(), mode="refine")
-
     client = _ToolLoopClient(_plan_script)
-    foundry_agent.run_agent(client, "agent-refine", tmp_path, _config("payArc"), "task")
+    foundry_agent.run_agent(
+        client, "agent-1", tmp_path, _config("payArc"), "task", mode="refine"
+    )
 
     rows = _rows(log_path)
     assert len(rows) == 1
@@ -116,16 +111,38 @@ def test_row_records_mode_rounds_and_tokens(
     assert row["ts"].endswith("+00:00")
 
 
-def test_unknown_mode_when_the_agent_was_not_created_here(
+def test_mode_describes_the_run_not_the_agents_tool_set(
     loop_dummies: None,  # noqa: F811
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An id we never saw is reported honestly, not guessed at."""
+    """Functional ideation builds a plan-mode agent but is the daily sweep.
+
+    ``main.py``'s ``plan_functional`` calls ``create_agent(mode="plan")`` and
+    then labels the run ``file-ideas``. Those two must be tellable apart in the
+    data, because one is the fleet-wide daily cost and the other is a one-off.
+    """
     log_path = tmp_path / "rows.jsonl"
     monkeypatch.setenv("AUTOREFINE_COST_LOG", str(log_path))
 
-    foundry_agent.run_agent(_ToolLoopClient(_plan_script), "never-seen", tmp_path, _config(), "t")
+    for mode in ("plan", "file-ideas"):
+        foundry_agent.run_agent(
+            _ToolLoopClient(_plan_script), "agent-1", tmp_path, _config(), "task", mode=mode
+        )
+
+    assert [row["mode"] for row in _rows(log_path)] == ["plan", "file-ideas"]
+
+
+def test_mode_defaults_to_unknown_rather_than_a_guess(
+    loop_dummies: None,  # noqa: F811
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller that says nothing is visible as such, not silently mislabelled."""
+    log_path = tmp_path / "rows.jsonl"
+    monkeypatch.setenv("AUTOREFINE_COST_LOG", str(log_path))
+
+    foundry_agent.run_agent(_ToolLoopClient(_plan_script), "a1", tmp_path, _config(), "t")
 
     assert _rows(log_path)[0]["mode"] == "unknown"
 
@@ -213,16 +230,21 @@ def test_append_helper_swallows_a_hostile_run_object(tmp_path: Path, monkeypatch
     )  # must not raise
 
 
-# ── Mode registry ────────────────────────────────────────────────────────────
+# ── Call-site coverage ───────────────────────────────────────────────────────
 
 
-def test_agent_mode_registry_is_bounded() -> None:
-    """A cache, not a ledger — it must not grow without limit in a long-lived host."""
-    for index in range(foundry_agent._MAX_TRACKED_AGENT_MODES + 20):
-        foundry_agent._remember_agent_mode(f"agent-{index}", "plan")
+def test_every_run_agent_call_site_names_its_mode() -> None:
+    """The default exists for safety, not for production to rely on.
 
-    assert len(foundry_agent._AGENT_MODES) <= foundry_agent._MAX_TRACKED_AGENT_MODES
-    # The most recent survives; the oldest is what gets evicted.
-    newest = f"agent-{foundry_agent._MAX_TRACKED_AGENT_MODES + 19}"
-    assert foundry_agent._AGENT_MODES[newest] == "plan"
-    assert "agent-0" not in foundry_agent._AGENT_MODES
+    An unlabelled row is a row that cannot answer the question the file was
+    added for, so a new call site that forgets ``mode=`` should fail here
+    rather than quietly emit ``"unknown"`` for a fortnight.
+    """
+    source = (Path(__file__).resolve().parents[1] / "agent" / "main.py").read_text(
+        encoding="utf-8"
+    )
+    calls = re.findall(r"run_agent\((?:[^()]|\([^()]*\))*\)", source)
+
+    assert calls, "expected agent/main.py to call run_agent"
+    unlabelled = [call for call in calls if "mode=" not in call]
+    assert not unlabelled, f"run_agent call(s) without an explicit mode: {unlabelled}"

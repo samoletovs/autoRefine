@@ -457,7 +457,7 @@ def plan_project(
 
     try:
         task = build_plan_task(findings, config)
-        plan = run_agent(client, agent_id, project_dir, config, task)
+        plan = run_agent(client, agent_id, project_dir, config, task, mode="plan")
 
         if plan:
             log.info(
@@ -1064,7 +1064,10 @@ def plan_functional(
         # Foundry runs fail transiently (server_error / rate_limit); each run_agent uses
         # a fresh thread, so a retry with the same agent recovers a one-off blip.
         for attempt in range(1, FUNCTIONAL_PLAN_ATTEMPTS + 1):
-            plan = run_agent(client, agent_id, project_dir, config, task)
+            # "file-ideas", not "plan": the agent is built with the plan tool set, but
+            # this is the daily sweep, and its cost rows are the ones worth telling
+            # apart from an on-demand plan.
+            plan = run_agent(client, agent_id, project_dir, config, task, mode="file-ideas")
             if plan:
                 return plan
             if attempt < FUNCTIONAL_PLAN_ATTEMPTS:
@@ -1557,7 +1560,7 @@ def refine_project(
         # half-applied edits behind for a later run to commit.
         baseline = _worktree_snapshot(project_dir)
         try:
-            run_agent(client, agent_id, project_dir, config, task)
+            run_agent(client, agent_id, project_dir, config, task, mode="refine")
         except FoundryRunIncompleteError as exc:
             log.error("Refine run ended incomplete (%s) — rolling back partial changes.", exc.reason)
             _rollback_agent_changes(project_dir, baseline)
