@@ -42,6 +42,12 @@ echo "==> [4/5] evaluating all projects"
 # re-clones governance once per project. The retired workflow used a .github-gov checkout;
 # here it is already on disk.
 export NAURO_GOVERNANCE_PATH=/gov
+# One JSON row per Foundry run: mode, rounds, tokens, whether a cost guard fired. The
+# run_cost log line carries the same numbers to stderr, but console ingestion drops lines
+# (see above), so a distribution cannot be built from it. This file is committed once
+# below, into the channel this script already treats as data.
+COST_LOG=/tmp/autorefine-cost.jsonl
+export AUTOREFINE_COST_LOG="${COST_LOG}"
 # Mirrors the retired workflow: manifest-driven, file-ideas mode. Never fail the job on a
 # single project's error — the agent already logs per-project failures and the report is
 # written regardless. stderr stays on the console so progress is visible live; stdout is
@@ -57,4 +63,26 @@ echo "==> [5/5] report"
 # measure of how many projects were actually processed.
 echo "==> projects in report: $(grep -c '^  \"project\":' /tmp/autorefine-report.json || echo 0)"
 tail -c 4000 /tmp/autorefine-report.json || true
+
+# Persist the cost rows: one PUT, inside a job that has already run for ~2h, so this adds
+# no scheduled run and no billed minute. A new file per sweep (same naming idea as the
+# health report) means no read-modify-write and nothing to conflict on.
+#
+# Every step here is best-effort and the whole block is `|| true`. `set -e` is on, and a
+# non-zero exit would let replicaRetryLimit re-run the entire 116-minute sweep — paying
+# for a second pass because telemetry failed would invert the point of measuring cost.
+if [ -s "${COST_LOG}" ]; then
+  echo "==> committing $(wc -l < "${COST_LOG}") cost row(s)"
+  {
+    COST_FILE="reports/cost/run-$(date -u +%Y-%m-%d-%H%M).jsonl"
+    gh api -X PUT "repos/samoletovs/nauroLabs-github/contents/${COST_FILE}" \
+      -f message="chore(autorefine): run cost rows $(date -u +%Y-%m-%d)" \
+      -f branch=master \
+      -f content="$(base64 -w0 "${COST_LOG}")" \
+      --silent && echo "==> cost rows committed: ${COST_FILE}"
+  } || echo "!!! could not commit cost rows — continuing"
+else
+  echo "==> no cost rows to commit"
+fi
+
 echo "==> done"

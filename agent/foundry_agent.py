@@ -17,8 +17,9 @@ import logging
 import os
 import re
 import subprocess
+import time
 from collections.abc import Callable, Sequence
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, NoReturn, TypeVar
 
@@ -230,6 +231,18 @@ def resolve_stuck_repeats() -> int:
         DEFAULT_STUCK_REPEATS,
         MIN_STUCK_REPEATS,
     )
+
+
+def resolve_cost_log_path() -> Path | None:
+    """Where to append per-run cost rows, or ``None`` when disabled.
+
+    Unset means off. Override: ``AUTOREFINE_COST_LOG``. CI, the test suite and
+    a developer's laptop therefore write nothing unless they ask for it; only
+    the scheduled sweep sets it, and it is the sweep's entrypoint that commits
+    the file afterwards.
+    """
+    raw = os.environ.get("AUTOREFINE_COST_LOG", "").strip()
+    return Path(raw) if raw else None
 
 
 class FoundryPromptBudgetUnsupportedError(RuntimeError):
@@ -773,7 +786,79 @@ def create_agent(
         temperature=0.3,
     )
     log.info("Created agent: %s (mode=%s, model=%s)", agent.id, mode, deployment)
+    _remember_agent_mode(agent.id, mode)
     return agent.id
+
+
+# Mode is chosen at create_agent time but the cost row is written at run time,
+# and run_agent is only given an agent_id. Keying the mode by that id carries it
+# across without widening run_agent's signature, which main.py owns and calls.
+# Bounded because this is a cache, not a ledger: a sweep creates one agent per
+# project and the process then exits, so the cap is only a guard against an
+# unbounded map in some future long-lived host.
+_AGENT_MODES: dict[str, str] = {}
+_MAX_TRACKED_AGENT_MODES = 64
+
+
+def _remember_agent_mode(agent_id: str, mode: str) -> None:
+    """Record which mode an agent was built for, evicting the oldest entry."""
+    if len(_AGENT_MODES) >= _MAX_TRACKED_AGENT_MODES:
+        _AGENT_MODES.pop(next(iter(_AGENT_MODES)), None)
+    _AGENT_MODES[agent_id] = mode
+
+
+def _append_cost_row(
+    run: Any,
+    *,
+    project: str,
+    mode: str,
+    rounds: int,
+    tool_calls: int,
+    guard: str | None,
+    plan_captured: bool,
+    duration_s: float,
+) -> None:
+    """Append one JSON line describing what this run cost. Never raises.
+
+    The ``run_cost`` log line goes to stderr, and the sweep's own entrypoint
+    documents that channel as unreliable — "Console-log ingestion drops lines,
+    so counting the report objects is the only trustworthy measure"
+    (``infrastructure/run-autorefine.sh``). A dropped line is fine for a human
+    watching a run and useless for building a distribution, so the measurement
+    goes to a file that the entrypoint commits once at the end of the sweep.
+
+    ``mode`` is the field the file exists for: the round ceiling was chosen
+    against a plan-run figure with no refine equivalent, and a row that cannot
+    say which mode produced it cannot close that gap.
+
+    Fails open, like ``sweep_orphaned_agents``. Telemetry is strictly less
+    important than the work it measures, and a bad path or a full disk must
+    never cost a 116-minute sweep.
+    """
+    path = resolve_cost_log_path()
+    if path is None:
+        return
+
+    try:
+        status = getattr(run, "status", None)
+        row = {
+            "ts": datetime.now(UTC).isoformat(),
+            "project": project,
+            "mode": mode,
+            "run_id": getattr(run, "id", None),
+            "status": str(status) if status is not None else None,
+            "rounds": rounds,
+            "tool_calls": tool_calls,
+            "guard": guard,
+            "plan_captured": plan_captured,
+            "duration_s": round(duration_s, 1),
+            **_run_token_usage(run),
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+    except Exception:  # cost telemetry must never fail the run it measures
+        log.warning("Could not append a cost row to %s", path, exc_info=True)
 
 
 def _tool_call_signature(tool_calls: Sequence[Any]) -> str:
@@ -907,6 +992,7 @@ def run_agent(
     """
     max_tool_rounds = resolve_max_tool_rounds()
     stuck_repeats = resolve_stuck_repeats()
+    started = time.monotonic()
 
     # Create a thread
     thread = client.threads.create()
@@ -1017,7 +1103,6 @@ def run_agent(
                 continue
 
             # Poll
-            import time
             time.sleep(1)
             run = _call_foundry_with_retry(
                 "client.runs.get",
@@ -1066,6 +1151,16 @@ def run_agent(
             tool_calls=tool_calls,
             guard=guard_fired,
             plan_captured=plan_result is not None,
+        )
+        _append_cost_row(
+            run,
+            project=config.name,
+            mode=_AGENT_MODES.get(agent_id, "unknown"),
+            rounds=rounds,
+            tool_calls=tool_calls,
+            guard=guard_fired,
+            plan_captured=plan_result is not None,
+            duration_s=time.monotonic() - started,
         )
 
 
