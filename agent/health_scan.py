@@ -742,6 +742,18 @@ Do NOT create issues for: subjective improvements, architecture decisions, or is
 
 
 # ── Report Generator ───────────────────────────────────────────────────────
+def analysis_failed(analysis: dict[str, Any]) -> bool:
+    """True when the AI analysis did not produce a usable answer.
+
+    ``analyze_with_ai`` degrades to ``{"error": ...}`` on any failure. Without
+    checking that, a failed analysis is indistinguishable from a clean one:
+    both render empty alerts, no recommendations and ``?`` scores. Those two
+    states demand opposite responses from whoever reads the report, so they
+    must not look alike.
+    """
+    return bool(analysis.get("error"))
+
+
 def generate_report(
     github_data: dict[str, Any],
     cost_data: dict[str, Any],
@@ -755,12 +767,29 @@ def generate_report(
         f"# NauroLabs Health Report — {now.strftime('%Y-%m-%d %H:%M UTC')}\n"
     ]
 
+    failed = analysis_failed(analysis)
+    if failed:
+        # Immediately under the title, before anything that looks like data.
+        # No "- " bullets here: build_telegram_summary scrapes those as alerts.
+        report.append("## ⚠️ AI ANALYSIS FAILED — THIS REPORT IS INCOMPLETE\n")
+        report.append(
+            "The model call did not return a usable answer, so health scores, "
+            "alerts, recommendations and the focus project are **missing** — "
+            "not empty. Scores below render as `?` for that reason. The scanned "
+            "GitHub, cost and URL data is still accurate.\n"
+        )
+        report.append(f"> `{analysis.get('error', 'unknown error')}`\n")
+        report.append("No issues were filed this run.\n")
+
     alerts = analysis.get("alerts", [])
     if alerts:
         report.append("## 🚨 Alerts\n")
         for a in alerts:
             report.append(f"- {a}")
         report.append("")
+    elif not failed:
+        # Say the healthy case out loud, so silence is never the only evidence.
+        report.append("## ✅ No alerts — analysis ran and found nothing critical\n")
 
     focus = analysis.get("focus_project", "")
     if focus:
@@ -1018,18 +1047,31 @@ def build_telegram_summary(
     report_path: str | None,
     created_issues: list[str],
     cost_data: dict[str, Any] | None = None,
+    analysis: dict[str, Any] | None = None,
 ) -> str:
     """Compose a short Telegram message from the full report.
 
     When *cost_data* is provided (and not an error), a one-line Azure
     cost/budget summary is included so the Telegram recipient can see
     spending without opening the full report.
+
+    When *analysis* carries an error, the failure is stated on the second
+    line. This message is the only part a human reliably reads, so a failed
+    scan that looked identical to a quiet one could go unnoticed for days.
     """
     lines = report.split("\n")
     alerts = [line for line in lines if line.startswith("- ") and "🚨" not in line][:3]
     focus_line = next((line for line in lines if line.startswith("## 🎯")), "")
 
     parts: list[str] = ["🤖 <b>NauroLabs Health Report</b>"]
+
+    failed = analysis is not None and analysis_failed(analysis)
+    if failed:
+        parts.append("⚠️ <b>AI analysis FAILED — report is incomplete</b>")
+        error = str(analysis.get("error", "unknown error")) if analysis else ""
+        parts.append(f"<i>{error[:180]}</i>")
+        parts.append("No scores, no alerts, no issues filed this run.")
+
     if focus_line:
         parts.append(focus_line.replace("## ", "").replace("🎯 ", "🎯 "))
 
@@ -1049,7 +1091,7 @@ def build_telegram_summary(
             cost_line += " — <b>⚠️ OVER BUDGET</b>"
         parts.append(cost_line)
 
-    if alerts:
+    if alerts and not failed:
         parts.extend(alerts[:3])
     if created_issues:
         parts.append(f"📋 Created {len(created_issues)} tech-debt issue(s)")
@@ -1091,7 +1133,14 @@ def run_health_scan(repos: list[str], assign_copilot: bool = True) -> dict[str, 
     log.info("URL health check complete: %d URLs", len(url_health_data))
 
     analysis = analyze_with_ai(github_data, cost_data, app_insights_data, url_health_data)
-    log.info("AI analysis complete")
+    if analysis_failed(analysis):
+        log.error(
+            "AI analysis failed — the report will be marked incomplete and no "
+            "issues will be filed: %s",
+            analysis.get("error"),
+        )
+    else:
+        log.info("AI analysis complete")
 
     report = generate_report(
         github_data, cost_data, analysis, app_insights_data, url_health_data
@@ -1110,7 +1159,9 @@ def run_health_scan(repos: list[str], assign_copilot: bool = True) -> dict[str, 
         assign_copilot=assign_copilot,
     )
 
-    summary = build_telegram_summary(report, report_path, created_issues, cost_data=cost_data)
+    summary = build_telegram_summary(
+        report, report_path, created_issues, cost_data=cost_data, analysis=analysis
+    )
     send_telegram(summary, parse_mode="HTML")
 
     log.info(
@@ -1125,4 +1176,5 @@ def run_health_scan(repos: list[str], assign_copilot: bool = True) -> dict[str, 
         "github_repos_scanned": len(github_data),
         "urls_checked": len(url_health_data),
         "telegram_summary": summary,
+        "analysis_failed": analysis_failed(analysis),
     }
