@@ -75,6 +75,51 @@ Note the endpoint reads `…/api/projects/{proj}/assistants`. That is **Foundry 
 agents**, *not* the retired Azure OpenAI Assistants API — see
 [PLATFORM.md §15.2](../.github/PLATFORM.md).
 
+## What the score actually measures
+
+The 0-100 score is **not a quality measure — it is a coverage-weighted one**, and
+it is easy to misread as the former because that is how it is labelled everywhere
+it appears.
+
+Nearly every check in `agent/tools/quality_tools.py` is gated. `check_tests`,
+`check_ci_cd` and `check_i18n` early-return unless the project's own
+`project.yaml` `quality:` list names the trait; `check_security_headers` and
+`check_dependencies` early-return unless the stack carries
+`staticwebapp.config.json` or `package.json`. Only `check_project_yaml` always
+runs. An early return deducts nothing, so **a project that declares nothing
+scores 100/100.** Two byte-identical Python apps with no tests and no CI score
+100 and 70 depending purely on whether they were honest about their own
+standards. The score rewards silence.
+
+`run_quality_checks_with_coverage()` therefore returns a `QualityCoverage`
+alongside the findings, and `evaluate_project` puts it in the report as
+`coverage`. `DimensionResult.measured` is derived from `skip_reason`, so a check
+that did not run can never be mistaken for one that passed:
+
+| `skip_reason` | Means |
+|---------------|-------|
+| `not-declared` | the trait is absent from `project.yaml` `quality:` — a choice the project made |
+| `not-applicable` | the stack has no such artefact (no `package.json`, no SWA config) |
+| `tooling-unavailable` | the check ran and could not finish (npm missing, audit timed out) |
+
+The coverage rides along to Telegram (`agent/score_summary.py` renders
+`100/100 (1/6 measured)`) and to the dashboard's Score Coverage section. The
+dashboard clones nothing, so it cannot re-derive the scores: pass the
+evaluate-mode report to it with
+`--mode dashboard --report /tmp/autorefine-report.json`, or the section renders
+empty rather than guessing.
+
+**Do not "fix" this by making the checks unconditional.** That is a fleet-wide
+behaviour change: scores drop across ~25 repos at once and `file-ideas` emits a
+burst of P0 "no tests" ideas, each approvable into a 10-30 minute Copilot Coding
+Agent run, against the €5/month cap above. The gap is deliberately visible and
+unclosed. Closing it is a separate, budgeted decision — and if it is ever taken,
+take it per-project, not fleet-wide.
+
+`run_quality_checks()` keeps its findings-only contract; nothing about weights,
+priorities or ordering changed, and `tests/test_score_coverage.py` pins the
+scores so it stays that way.
+
 ## Build & run
 
 ```bash

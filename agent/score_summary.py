@@ -39,17 +39,48 @@ class Summary:
     avg: int
 
 
+def _coverage_suffix(obj: dict) -> str:
+    """Render ``" (2/6 measured)"`` for one project, or ``""`` when unknown.
+
+    A score is a numerator; ``coverage`` is its denominator. Most quality checks
+    only run when the project's own ``project.yaml`` declares the trait, so a
+    project that declares nothing scores 100/100 having been measured on one
+    dimension out of six. Printing the score alone reads as praise for that.
+
+    Absent or malformed coverage renders as nothing rather than as ``0/0``:
+    reports predating this field, and the tests that build objects by hand, must
+    keep summarising cleanly.
+    """
+    coverage = obj.get("coverage")
+    if not isinstance(coverage, dict):
+        return ""
+    measured, total = coverage.get("measured"), coverage.get("total")
+    # `bool` is an `int` in Python, and " (True/6 measured)" is not a message
+    # worth sending anyone.
+    if isinstance(measured, bool) or isinstance(total, bool):
+        return ""
+    if not isinstance(measured, int) or not isinstance(total, int) or total <= 0:
+        return ""
+    return f" ({measured}/{total} measured)"
+
+
 def summarise(objects: list[dict], max_listed: int = MAX_LISTED) -> Summary:
     """Build the score summary from every evaluated project.
 
     ``total`` and ``avg`` are both computed over ``objects`` — the full list.
     Only ``scores`` is truncated, and when it is, it says so rather than
     silently dropping projects off the end.
+
+    Each line carries its coverage, so "100/100" cannot be read as a clean bill
+    of health when only two of six dimensions were ever inspected.
     """
     if not objects:
         raise ValueError("no score objects to summarise")
 
-    lines = [f"{obj['project']}: {obj['score']}/100" for obj in objects]
+    lines = [
+        f"{obj['project']}: {obj['score']}/100{_coverage_suffix(obj)}"
+        for obj in objects
+    ]
     total = len(objects)
 
     shown = lines[:max_listed]

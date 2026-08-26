@@ -88,6 +88,74 @@ class TestSummarise:
             summarise([])
 
 
+class TestCoverageSuffix:
+    """A score is a numerator. These lines now carry the denominator too.
+
+    Nearly every quality check only runs when the project's own ``project.yaml``
+    declares the trait, so a project that declares nothing is measured on one
+    dimension out of six and scores 100/100 for it. Printed alone in Telegram,
+    that reads as a clean bill of health.
+    """
+
+    def _with_coverage(self, name: str, score: int, measured: int, total: int) -> dict:
+        obj = _obj(name, score)
+        obj["coverage"] = {
+            "measured": measured,
+            "total": total,
+            "summary": f"{measured}/{total} measured",
+        }
+        return obj
+
+    def test_score_line_carries_its_coverage(self) -> None:
+        objects = [self._with_coverage("silent", 100, 1, 6)]
+        assert summarise(objects).scores == "silent: 100/100 (1/6 measured)"
+
+    def test_the_hollow_100_reads_differently_from_the_earned_one(self) -> None:
+        """Same number, different claim — and now the message says so."""
+        lines = summarise(
+            [
+                self._with_coverage("silent", 100, 1, 6),
+                self._with_coverage("honest", 100, 6, 6),
+            ]
+        ).scores.splitlines()
+
+        assert lines == [
+            "silent: 100/100 (1/6 measured)",
+            "honest: 100/100 (6/6 measured)",
+        ]
+
+    def test_line_without_coverage_is_unchanged(self) -> None:
+        """Reports predating the field must still summarise cleanly."""
+        assert summarise([_obj("legacy", 90)]).scores == "legacy: 90/100"
+
+    @pytest.mark.parametrize(
+        "coverage",
+        [
+            None,
+            "2/6",
+            {},
+            {"measured": 2},
+            {"measured": 2, "total": 0},
+            {"measured": "two", "total": 6},
+            {"measured": True, "total": 6},  # bool is an int; do not render it
+        ],
+    )
+    def test_malformed_coverage_is_dropped_rather_than_rendered(self, coverage) -> None:
+        obj = _obj("odd", 88)
+        obj["coverage"] = coverage
+        assert summarise([obj]).scores == "odd: 88/100"
+
+    def test_coverage_does_not_touch_the_average_or_the_count(self) -> None:
+        objects = [
+            self._with_coverage("a", 100, 1, 6),
+            self._with_coverage("b", 80, 6, 6),
+        ]
+        summary = summarise(objects)
+
+        assert summary.total == 2
+        assert summary.avg == 90
+
+
 class TestRenderGithubOutput:
     def test_emits_every_key_the_workflow_reads(self) -> None:
         rendered = render_github_output(summarise(_fleet(2)))
