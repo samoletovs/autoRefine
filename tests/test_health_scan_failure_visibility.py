@@ -113,9 +113,10 @@ def test_real_alerts_still_render_and_suppress_the_clean_banner() -> None:
 
 
 def test_failure_banner_uses_no_bullet_lines() -> None:
-    """``build_telegram_summary`` scrapes ``- `` lines as alerts.
+    """The banner must not read as a list of findings.
 
-    A bulleted banner would be re-published as if it were a finding.
+    Kept after the scraper was removed: a bulleted banner would still look
+    like a set of alerts to a human skimming the report.
     """
     report = health_scan.generate_report(GITHUB_DATA, COST_DATA, FAILED)
     banner = report.split("## Project Health")[0]
@@ -125,9 +126,7 @@ def test_failure_banner_uses_no_bullet_lines() -> None:
 
 # ── the Telegram message says so ───────────────────────────────────────────
 def test_telegram_summary_reports_the_failure() -> None:
-    msg = health_scan.build_telegram_summary(
-        "# NauroLabs Health Report\n", None, [], analysis=FAILED
-    )
+    msg = health_scan.build_telegram_summary(FAILED, None, [])
 
     assert "FAILED" in msg
     assert "model returned list" in msg
@@ -136,11 +135,7 @@ def test_telegram_summary_reports_the_failure() -> None:
 
 def test_telegram_failure_notice_is_near_the_top() -> None:
     msg = health_scan.build_telegram_summary(
-        "# NauroLabs Health Report\n",
-        None,
-        [],
-        cost_data={"total": 42.5, "budget": 150.0},
-        analysis=FAILED,
+        FAILED, None, [], cost_data={"total": 42.5, "budget": 150.0}
     )
     lines = msg.split("\n")
 
@@ -150,52 +145,41 @@ def test_telegram_failure_notice_is_near_the_top() -> None:
 
 
 def test_telegram_summary_stays_quiet_on_a_clean_analysis() -> None:
-    msg = health_scan.build_telegram_summary(
-        "# NauroLabs Health Report\n", None, [], analysis=CLEAN
-    )
+    msg = health_scan.build_telegram_summary(CLEAN, None, [])
 
     assert "FAILED" not in msg
 
 
-def test_failed_summary_does_not_republish_bullets_as_alerts() -> None:
-    """"No alerts" must not be followed by lines that look like alerts.
-
-    The scraper takes any ``- `` line from the report, and the cost section
-    emits bullets, so a failed run would otherwise print "no alerts" and then
-    three bullet lines directly beneath it. There are no alerts to show when
-    the analysis never produced any.
-    """
-    report = (
-        "# NauroLabs Health Report\n"
-        "## Azure Costs\n"
-        "- **Month-to-date:** $5\n"
-        "- **Projected:** $?\n"
-        "- **Budget:** $150\n"
+def test_failed_summary_shows_no_alerts_at_all() -> None:
+    """A failed analysis produced no alerts, so none may be shown."""
+    msg = health_scan.build_telegram_summary(
+        FAILED, None, [], cost_data={"total": 5, "budget": 150}
     )
 
-    failed_msg = health_scan.build_telegram_summary(report, None, [], analysis=FAILED)
-    clean_msg = health_scan.build_telegram_summary(report, None, [], analysis=NOISY)
-
-    assert "Month-to-date" not in failed_msg
-    assert "No scores, no alerts, no issues filed this run." in failed_msg
-    # Unchanged on the paths that did produce an analysis.
-    assert "Month-to-date" in clean_msg
+    assert "🚨" not in msg
+    assert "✅ No alerts" not in msg  # that would claim the analysis ran
+    assert "No scores, no alerts, no issues filed this run." in msg
 
 
-def test_telegram_summary_without_analysis_is_unchanged() -> None:
-    """The parameter is optional; existing callers must be unaffected."""
-    report = "# NauroLabs Health Report\n\n## 🎯 This Week: focus on era\n"
+def test_telegram_summary_is_three_distinct_messages() -> None:
+    """Failed, ran-and-clean, and ran-with-alerts must never look alike."""
+    cost: dict[str, Any] = {"total": 5, "budget": 150}
+    failed = health_scan.build_telegram_summary(FAILED, None, [], cost_data=cost)
+    clean = health_scan.build_telegram_summary(CLEAN, None, [], cost_data=cost)
+    noisy = health_scan.build_telegram_summary(NOISY, None, [], cost_data=cost)
 
-    assert health_scan.build_telegram_summary(
-        report, None, []
-    ) == health_scan.build_telegram_summary(report, None, [], analysis=None)
+    assert failed != clean
+    assert clean != noisy
+    assert failed != noisy
+    assert "FAILED" in failed
+    assert "✅ No alerts" in clean and "🚨" not in clean
+    assert "🚨 era: CI red for 3 runs" in noisy
+    assert "✅ No alerts" not in noisy and "FAILED" not in noisy
 
 
 def test_telegram_error_text_is_truncated() -> None:
     """A stack trace in the error must not become the whole message."""
-    msg = health_scan.build_telegram_summary(
-        "# Report\n", None, [], analysis={"error": "x" * 900}
-    )
+    msg = health_scan.build_telegram_summary({"error": "x" * 900}, None, [])
 
     assert len(msg) < 500
 
