@@ -33,7 +33,7 @@ from azure.ai.agents.models import (
     TruncationObject,
     TruncationStrategy,
 )
-from azure.core.exceptions import HttpResponseError
+from azure.core.exceptions import AzureError, HttpResponseError
 from tenacity import (
     RetryCallState,
     retry,
@@ -576,6 +576,29 @@ TOOL_HANDLERS = {
 
 # ── Agent orchestration ──────────────────────────────────────────────────────
 
+def _is_sweepable_orphan(agent: Any, cutoff: datetime) -> bool:
+    """Whether one listed agent is an autoRefine orphan old enough to delete.
+
+    Total by construction: the client is generated and ``created_at`` is whatever
+    the service put on the wire, so a single odd record must not be able to abort
+    the sweep. A naive timestamp is read as UTC — Foundry sends UTC — because
+    comparing it against the aware cutoff would otherwise raise ``TypeError`` and
+    take the whole run down with it. ``_hours_since_last_commit`` normalises the
+    same way for the same reason.
+    """
+    if getattr(agent, "name", None) != AGENT_NAME:
+        return False
+
+    created = getattr(agent, "created_at", None)
+    if created is None:
+        return False
+
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=cutoff.tzinfo)
+
+    return created < cutoff
+
+
 def sweep_orphaned_agents(
     client: AgentsClient,
     max_age: timedelta = ORPHAN_AGENT_MAX_AGE,
@@ -590,17 +613,21 @@ def sweep_orphaned_agents(
     Agents younger than ``max_age`` are left alone so a run happening in
     parallel never has its live agent deleted out from under it.
 
+    Fails open, like the activity gate: this is cleanup, and cleanup that cannot
+    reach the service must never destroy the work the run came to do. Note the
+    catch is ``AzureError``, not ``HttpResponseError`` — a connection reset or a
+    read timeout raises ``ServiceRequestError``/``ServiceResponseError``, which
+    are *siblings* of ``HttpResponseError`` under ``AzureError``, not subclasses
+    of it. Catching only the narrower type let a transient network blip during
+    housekeeping abort agent creation and fail the entire sweep.
+
     :return: number of orphans deleted.
     """
     cutoff = datetime.now(timezone.utc) - max_age
 
     try:
-        orphans = [
-            agent
-            for agent in client.list_agents()
-            if agent.name == AGENT_NAME and agent.created_at and agent.created_at < cutoff
-        ]
-    except HttpResponseError as exc:
+        orphans = [agent for agent in client.list_agents() if _is_sweepable_orphan(agent, cutoff)]
+    except AzureError as exc:
         log.warning("Could not list agents to sweep orphans: %s", exc)
         return 0
 
@@ -608,7 +635,7 @@ def sweep_orphaned_agents(
     for agent in orphans:
         try:
             client.delete_agent(agent.id)
-        except HttpResponseError as exc:
+        except AzureError as exc:
             log.warning("Could not delete orphaned agent %s: %s", agent.id, exc)
             continue
         swept += 1
@@ -632,9 +659,15 @@ def create_agent(
         ``gpt-5`` (deep reasoning) — the CLI ``--model`` arg threads
         through to here so callers can pick per-run.
     """
-    # Housekeeping only — never allowed to block agent creation.
+    # Housekeeping only — never allowed to block agent creation. sweep_orphaned_agents
+    # already swallows AzureError, so this catches what is left: a generated client can
+    # raise anything on a malformed response, and losing the run to a failed *cleanup*
+    # would invert the point of the sweep.
     if hasattr(client, "list_agents"):
-        sweep_orphaned_agents(client)
+        try:
+            sweep_orphaned_agents(client)
+        except Exception as exc:  # noqa: BLE001 - cleanup must never fail the run
+            log.warning("Orphan sweep failed, continuing: %s", exc)
 
     tool_functions = {
         read_project_file,
