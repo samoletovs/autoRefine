@@ -368,6 +368,89 @@ def _skipped(dimension: str, reason: str, detail: str) -> DimensionResult:
     return DimensionResult(dimension=dimension, skip_reason=reason, detail=detail)
 
 
+# Test detection.
+#
+# The old rule looked only at four directories at the repository *root*, and it
+# was wrong for half the fleet the moment it was used in anger. Measured across
+# the 24 live manifest projects on 2026-08-26, widening the gate would have filed
+# six P0 "no tests" findings, of which three were false:
+#
+#   courier    -> app/tests/test_feedback.py        + a tests.yml workflow
+#   mindMe     -> harness/tests/test_*.py           + a tests.yml workflow
+#   foundryLab -> agents/labMemoryAgent/src/smoke_test.py
+#
+# Filing "no test directory found" against a repo whose CI is running its suite
+# is a demonstrably wrong statement handed to a coding agent at 10-30 minutes a
+# go. So detection now covers nested directories and file-naming conventions.
+#
+# The other direction is the real hazard: a detector too permissive to fail turns
+# this into another check that can never fire, which is the disease the rest of
+# this file exists to cure. Hence three guards — vendor trees are pruned, a test
+# file must carry a code suffix (`test_plan.md` proves nothing), and a runner
+# config alone is not evidence (`pytest.ini` with no tests runs no tests).
+LEGACY_TEST_DIRS = ("tests", "test", "__tests__", "src/__tests__")
+TEST_DIR_NAMES = frozenset({"tests", "test", "__tests__", "spec", "specs"})
+TEST_FILE_SUFFIXES = frozenset({
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+    ".go", ".rb", ".rs", ".java", ".cs", ".php",
+})
+# Where a permissive glob finds its false comfort.
+VENDOR_DIRS = frozenset({
+    "node_modules", "site-packages", "vendor", "dist", "build",
+    "venv", "env", "target", "out", "coverage", "__pycache__",
+})
+
+
+def _is_test_file(name: str) -> bool:
+    """True for a file whose name follows a test convention *and* is code."""
+    lower = name.lower()
+    if not any(lower.endswith(suffix) for suffix in TEST_FILE_SUFFIXES):
+        return False
+    if lower == "conftest.py":
+        return True
+    if lower.startswith(("test_", "test.")):
+        return True
+    return any(marker in lower for marker in ("_test.", ".test.", "_spec.", ".spec."))
+
+
+def _walk_source(project_dir: Path) -> Iterable[tuple[Path, list[str], list[str]]]:
+    """Walk the tree, pruning vendor and dot directories in place.
+
+    Pruning rather than filtering afterwards: it is what keeps this fast on a
+    repo with a populated ``node_modules``, and it is also what stops a vendored
+    test suite certifying a project that has none of its own.
+    """
+    for dirpath, dirnames, filenames in os.walk(project_dir):
+        dirnames[:] = [
+            d for d in dirnames
+            if d.lower() not in VENDOR_DIRS and not d.startswith(".")
+        ]
+        yield Path(dirpath), dirnames, filenames
+
+
+def _has_tests(project_dir: Path) -> bool:
+    """Whether the project has anything that looks like a test suite.
+
+    Deliberately structured as "the old rule, then additions". Every path the old
+    rule accepted is still accepted first and unchanged, so this can only ever
+    *remove* a finding, never create one — which is what makes it a contained
+    change rather than a fleet-wide behaviour change needing a budget decision.
+    """
+    for relative in LEGACY_TEST_DIRS:
+        candidate = project_dir / relative
+        if candidate.exists() and any(candidate.iterdir()):
+            return True
+
+    for dirpath, dirnames, filenames in _walk_source(project_dir):
+        is_test_dir = dirpath != project_dir and dirpath.name.lower() in TEST_DIR_NAMES
+        if is_test_dir and (filenames or dirnames):
+            return True
+        if any(_is_test_file(name) for name in filenames):
+            return True
+
+    return False
+
+
 def measure_tests(
     project_dir: Path, config: ProjectConfig, _repo: RepoContext | None = None,
 ) -> DimensionResult:
@@ -381,19 +464,13 @@ def measure_tests(
             "'tests' not listed in project.yaml quality:",
         )
 
-    test_dirs = [
-        project_dir / "tests",
-        project_dir / "test",
-        project_dir / "__tests__",
-        project_dir / "src" / "__tests__",
-    ]
-
-    has_tests = any(d.exists() and any(d.iterdir()) for d in test_dirs)
-
-    if not has_tests:
+    if not _has_tests(project_dir):
         findings.append(QualityFinding(
             category="tests",
-            description="No test directory found despite 'tests' in quality traits",
+            description=(
+                "No tests found despite 'tests' in quality traits — no test "
+                "directory and no test-named source files"
+            ),
             priority="P0",
             weight=20,
         ))
@@ -420,7 +497,13 @@ def measure_ci_cd(
         )
 
     workflows = project_dir / ".github" / "workflows"
-    if not workflows.exists() or not list(workflows.glob("*.yml")):
+    # Both extensions. Actions accepts either, and globbing only `*.yml` was the
+    # same bug as the root-only test detection one field over: no repo in the
+    # fleet trips it today, which is exactly why it would have sat there.
+    has_workflow = workflows.exists() and (
+        any(workflows.glob("*.yml")) or any(workflows.glob("*.yaml"))
+    )
+    if not has_workflow:
         findings.append(QualityFinding(
             category="ci-cd",
             description="No GitHub Actions workflows found despite 'ci-cd' in quality traits",
