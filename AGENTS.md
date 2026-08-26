@@ -100,7 +100,7 @@ that did not run can never be mistaken for one that passed:
 |---------------|-------|
 | `not-declared` | the trait is absent from `project.yaml` `quality:` — a choice the project made |
 | `not-applicable` | the stack has no such artefact (no `package.json`, no SWA config) |
-| `tooling-unavailable` | the check ran and could not finish (npm missing, audit timed out) |
+| `tooling-unavailable` | the check ran and could not finish (no token, 403, timeout) |
 
 The coverage rides along to Telegram (`agent/score_summary.py` renders
 `100/100 (1/6 measured)`) and to the dashboard's Score Coverage section. The
@@ -149,9 +149,58 @@ Three things about that are load-bearing:
   model of nearly every finding it sees today.
 
 `advisory` governs the prompt only. Whether such a finding should also deduct
-score is a separate decision, deliberately left to whoever adds the first one:
-a weighted advisory finding moves the whole fleet's average for something no
-project can act on.
+score was left open when the flag landed; it is now decided. **Weight it, but
+only where it is actionable.** The score exists to tell a human something true,
+and a fleet where 0 of 25 repos have branch protection — while rule 1 above says
+"never push directly to main/master" and enforcement lives in a workflow a direct
+push bypasses — is a fleet with a real weakness. Omitting it repeats the failure
+that the coverage work above was about.
+
+The deduction is uniform, so it shifts every score by a constant and does nothing
+for ranking. That is fine, because it is **self-resolving**: a one-time drop that
+recovers the moment someone changes 25 settings, which is minutes of work or a
+single org-level ruleset. A score that drops, prompts a cheap fix and recovers has
+done its whole job. Do not zero the weight when you see the fleet-wide drop in the
+history — the drop is the mechanism working.
+
+"Only where actionable" is the other half and it is not optional. A project that
+*cannot* buy the fix — a plan that does not offer the setting — is
+`not-applicable` and leaves the denominator. It is never advisory-with-weight.
+Never penalise a project for something it cannot buy.
+
+### The dependency check
+
+`measure_dependencies` reads **Dependabot alerts over the API**. It used to shell
+out to `npm audit`, and that check had never produced a finding in production:
+the job image is `python:3.12` with no node (`infrastructure/main.bicep`), so
+every run raised `FileNotFoundError`, which the old code swallowed and returned
+no findings for — indistinguishable from a clean tree. Someone once debugged that
+as an OOM. It was also gated on `package.json`, so it never looked at a Python
+project at all.
+
+Two rules it must keep:
+
+- **No failure may look clean.** Absent token, absent slug, 403, 404, timeout,
+  malformed body, kill switch — every one is `tooling-unavailable`.
+  `fetch_dependabot_alerts` raises rather than returning `[]`, because `[]` is a
+  real answer meaning "no open critical or high alerts" and the entire bug being
+  fixed was those two being indistinguishable. `TestNoFailureLooksClean` walks
+  every failure mode there is.
+- **It paginates by cursor, not by page.** Sending `page` earns
+  `HTTP 400 — Pagination using the `page` parameter is not supported.` from the
+  live API, which fails closed but makes the check dead on every repo. Follow the
+  `Link` header. Mocked responses cannot catch this; only running it against the
+  real API did.
+
+`AUTOREFINE_SKIP_DEPENDABOT=1` stops the network call entirely, degrading to
+`tooling-unavailable`. It exists because this is the first thing in a previously
+offline module to call out to the network, fleet-wide, twice a day.
+
+Cost is not a concern here: one or two calls per repo per sweep against a
+15,000/hr core budget. Measured 2026-08-26 — 30 non-archived repos, 0 with open
+critical or high alerts, so the check currently produces no findings at all.
+`samoletovs/.github` answers 403 with alerts disabled; that is the one repo where
+the dimension is unmeasured rather than clean.
 
 ## Build & run
 
