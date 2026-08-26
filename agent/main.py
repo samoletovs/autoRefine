@@ -345,7 +345,15 @@ def evaluate_project(project_dir: Path, config: ProjectConfig) -> dict:
         "project": config.name,
         "stage": config.stage,
         "findings": [
-            {"category": f.category, "description": f.description, "priority": f.priority}
+            {
+                "category": f.category,
+                "description": f.description,
+                "priority": f.priority,
+                # Carried into the report because this dict is what reaches
+                # build_plan_task, which is where advisory findings are withheld
+                # from the model. Dropping the key here would reopen that path.
+                "advisory": f.advisory,
+            }
             for f in findings
         ],
         "score": max(0, 100 - sum(f.weight for f in findings)),
