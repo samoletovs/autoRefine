@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 from agent.config import AutoRefineConfig, ProjectConfig
 from agent.tools.github_tools import clone_repo, read_project_yaml
-from agent.tools.quality_tools import run_quality_checks
+from agent.tools.quality_tools import run_quality_checks_with_coverage
 
 load_dotenv()
 logging.basicConfig(
@@ -338,7 +338,7 @@ def evaluate_project(project_dir: Path, config: ProjectConfig) -> dict:
     log.info("Evaluating: %s (%s)", config.name, config.stage)
 
     # Technical quality checks (deterministic)
-    findings = run_quality_checks(str(project_dir), config)
+    findings, coverage = run_quality_checks_with_coverage(str(project_dir), config)
     feature_suggestions = suggest_feature_improvements(config)
 
     report = {
@@ -349,14 +349,24 @@ def evaluate_project(project_dir: Path, config: ProjectConfig) -> dict:
             for f in findings
         ],
         "score": max(0, 100 - sum(f.weight for f in findings)),
+        # The score's denominator. Most checks only run when the project
+        # declares the trait, so 100/100 over two dimensions and 100/100 over
+        # six are very different claims. Reported so the number never travels
+        # without it.
+        "coverage": coverage.as_dict(),
         "feature_suggestions": feature_suggestions,
     }
 
     log.info(
-        "Evaluation complete: %s — score %d/100, %d findings, %d feature suggestions",
-        config.name, report["score"], len(findings),
+        "Evaluation complete: %s — score %d/100 (%s), %d findings, %d feature suggestions",
+        config.name, report["score"], coverage.summary(), len(findings),
         len(feature_suggestions),
     )
+    if coverage.skipped:
+        log.info(
+            "%s — dimensions not measured: %s",
+            config.name, ", ".join(coverage.skipped),
+        )
     return report
 
 
@@ -1595,11 +1605,44 @@ def run_health_scan_mode(repos: list[str], assign_copilot: bool = True) -> None:
     print(json.dumps(summary, indent=2))
 
 
-def run_dashboard_mode(repos: list[str], output: str = "dashboard.html") -> None:
+def load_quality_coverage(report_path: str) -> list[dict]:
+    """Read evaluation reports so the dashboard can show each score's denominator.
+
+    Dashboard mode scans GitHub metadata and clones nothing, so it cannot re-run
+    the quality checks — cloning ~25 repos to redraw a page is not a trade this
+    lab makes. The scores already exist in the evaluate-mode report, and reading
+    that file is free.
+
+    Returns ``[]`` on any read or parse problem: a missing report costs the page
+    one section, never the whole render.
+    """
+    from agent.parse_scores import extract_score_objects
+
+    try:
+        objects = extract_score_objects(report_path)
+    except OSError as exc:
+        log.warning(
+            "Cannot read evaluation report %s: %s — dashboard omits score coverage",
+            report_path, exc,
+        )
+        return []
+
+    log.info("Loaded %d evaluation report(s) from %s", len(objects), report_path)
+    return objects
+
+
+def run_dashboard_mode(
+    repos: list[str], output: str = "dashboard.html", report_path: str | None = None,
+) -> None:
     """Run the health-scan pipeline and write an HTML dashboard to *output*.
 
     The dashboard renders the same data as the Markdown health report but as a
     browser-ready HTML file with colour-coded health scores and cost indicators.
+
+    *report_path* is an optional evaluate-mode JSON report. When given, each
+    project's 0-100 score is shown beside the number of quality dimensions it
+    was actually measured on — see AGENTS.md, "What the score actually
+    measures". Without it that section renders empty rather than guessing.
     """
     from agent.dashboard import render_html_dashboard
     from agent.health_scan import (
@@ -1624,6 +1667,9 @@ def run_dashboard_mode(repos: list[str], output: str = "dashboard.html") -> None
     app_insights_data = scan_app_insights()
     url_health_data = check_deployed_urls()
     analysis = analyze_with_ai(github_data, cost_data, app_insights_data, url_health_data)
+
+    if report_path:
+        analysis["quality_coverage"] = load_quality_coverage(report_path)
 
     html = render_html_dashboard(
         github_data, cost_data, analysis, app_insights_data, url_health_data
@@ -1668,6 +1714,16 @@ def main() -> None:
         default="dashboard.html",
         help="Output file path for dashboard mode (default: dashboard.html)",
     )
+    parser.add_argument(
+        "--report",
+        default=None,
+        help=(
+            "Path to an evaluate-mode JSON report. Dashboard mode reads the 0-100 "
+            "scores and their coverage from it (the CI workflow writes "
+            "/tmp/autorefine-report.json). Omitted, the Score Coverage section is "
+            "empty — dashboard mode clones nothing, so it cannot derive them itself."
+        ),
+    )
     args = parser.parse_args()
     if args.repo is not None and not _is_valid_repo_slug(args.repo):
         parser.error("--repo must be in the format owner/name")
@@ -1709,7 +1765,7 @@ def main() -> None:
     # dashboard mode: run health-scan pipeline then emit an HTML dashboard file.
     if args.mode == "dashboard":
         log.info("autoRefine starting — mode=dashboard, %d repos", len(repos))
-        run_dashboard_mode(repos, output=args.output)
+        run_dashboard_mode(repos, output=args.output, report_path=args.report)
         log.info("autoRefine complete.")
         return
     if args.mode == "refine":

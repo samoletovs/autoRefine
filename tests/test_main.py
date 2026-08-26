@@ -11,6 +11,7 @@ import pytest
 
 from agent.config import ProjectConfig
 from agent.main import evaluate_project, load_config, load_repos_from_manifest, main
+from agent.tools.quality_tools import QualityCoverage
 
 
 @pytest.fixture
@@ -129,7 +130,10 @@ def test_main_rejects_invalid_mode() -> None:
 
 
 def test_evaluate_project_adds_feature_suggestions_from_project_yaml(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setattr("agent.main.run_quality_checks", lambda _p, _c: [])
+    monkeypatch.setattr(
+        "agent.main.run_quality_checks_with_coverage",
+        lambda _p, _c: ([], QualityCoverage()),
+    )
     config = ProjectConfig(
         name="demo",
         purpose="Test",
@@ -149,7 +153,10 @@ def test_evaluate_project_adds_feature_suggestions_from_project_yaml(monkeypatch
 
 
 def test_evaluate_project_returns_empty_feature_suggestions_without_inputs(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setattr("agent.main.run_quality_checks", lambda _p, _c: [])
+    monkeypatch.setattr(
+        "agent.main.run_quality_checks_with_coverage",
+        lambda _p, _c: ([], QualityCoverage()),
+    )
     config = ProjectConfig(
         name="demo",
         purpose="Test",
