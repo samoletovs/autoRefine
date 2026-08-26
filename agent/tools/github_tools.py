@@ -92,9 +92,15 @@ def create_pr(
     title: str,
     body: str,
     branch: str,
-    base: str = "main",
+    base: str,
 ) -> bool:
-    """Create a pull request via gh CLI and enable auto-merge."""
+    """Create a pull request via gh CLI and enable auto-merge.
+
+    *base* is deliberately required. Half the projects in this lab — including
+    autoRefine itself — default to ``master``, so a ``"main"`` default would
+    silently target a branch that does not exist. Callers must resolve the
+    default branch and pass it.
+    """
     result = subprocess.run(
         [
             "gh", "pr", "create",
