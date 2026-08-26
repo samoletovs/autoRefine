@@ -116,6 +116,17 @@ Agent run, against the €5/month cap above. The gap is deliberately visible and
 unclosed. Closing it is a separate, budgeted decision — and if it is ever taken,
 take it per-project, not fleet-wide.
 
+**Any number attached to that decision expires.** Widening the gate was priced on
+2026-08-26 at 4 new findings across 3 repos (`folio`, `payArc`, `foundryLab`),
+down from 8 across 6 before the detector was fixed. That figure describes the
+fleet as it stood that day: a repo that grows a test file next week drops off it.
+Re-run the measurement rather than quoting it — clone the manifest, run the real
+`run_quality_checks_with_coverage()` twice per project (once as-is, once with
+`tests`/`ci-cd` added to a copy of the config), and diff. The method survives;
+the number does not. There is deliberately no committed script for this, because
+a committed measurement becomes a number people trust without re-running, which
+is the failure it exists to prevent.
+
 `run_quality_checks()` keeps its findings-only contract; nothing about weights,
 priorities or ordering changed, and `tests/test_score_coverage.py` pins the
 scores so it stays that way.
