@@ -16,15 +16,32 @@ this makes the gap measurable, it does not close it.
 
 import json
 import logging
-import subprocess
+import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from agent.config import ProjectConfig
 
 log = logging.getLogger(__name__)
+
+GITHUB_API = "https://api.github.com"
+
+# Dependabot alert reads. One or two calls per repo per sweep, against a 15,000/hr
+# core budget — three orders of magnitude of headroom, measured 2026-08-26.
+DEPENDABOT_PAGE_SIZE = 100
+DEPENDABOT_MAX_PAGES = 10
+DEPENDABOT_TIMEOUT_SECONDS = 20
+
+# Set to "1" to stop the deps check making any network call. It then reports
+# `tooling-unavailable` — never "clean" — so disabling it costs coverage rather
+# than quietly manufacturing assurance. This exists because the check is the
+# first thing in a previously offline module to call out to the network, twice a
+# day across the fleet, and the alternative to a switch is an emergency PR.
+DEPENDABOT_DISABLED_ENV = "AUTOREFINE_SKIP_DEPENDABOT"
 
 REQUIRED_SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
@@ -172,6 +189,153 @@ def plannable_findings(findings: Iterable[Mapping[str, Any]]) -> list[Mapping[st
     return [f for f in findings if not is_advisory(f)]
 
 
+@dataclass(frozen=True)
+class RepoContext:
+    """Who this project is on GitHub, for checks that must ask GitHub.
+
+    Optional throughout. A local run — ``scripts/eval_all.py`` walking sibling
+    directories, or a test — has no slug and no token, and every check that needs
+    one then reports ``tooling-unavailable`` rather than inventing an answer.
+    """
+
+    slug: str | None = None  # "owner/name"
+    token: str | None = None
+
+    @property
+    def can_query_github(self) -> bool:
+        return bool(self.slug) and bool(self.token)
+
+
+class DependabotUnavailable(Exception):
+    """Open alerts could not be read.
+
+    Deliberately an exception rather than an empty list. ``[]`` is a real answer
+    meaning "no open critical or high alerts", and the entire reason this check
+    was rewritten is that its predecessor could not tell that apart from "npm was
+    never installed on the runner" — which is the state the production job has
+    always been in. A caller cannot accidentally treat this as a clean bill of
+    health, because there is no value here to mistake for one.
+    """
+
+
+def _describe_http_failure(resp: httpx.Response) -> str:
+    """Status plus GitHub's own message, which is usually the actual diagnosis.
+
+    A repo with the feature switched off answers 403 "Dependabot alerts are
+    disabled for this repository." — worth repeating verbatim rather than
+    flattening to "403".
+    """
+    detail = ""
+    try:
+        body = resp.json()
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
+        body = None
+    if isinstance(body, dict):
+        detail = str(body.get("message", "")).strip()
+    return f"HTTP {resp.status_code}" + (f" — {detail}" if detail else "")
+
+
+def _next_link(resp: httpx.Response) -> str | None:
+    """The ``rel="next"`` URL from the Link header, if there is one."""
+    links = getattr(resp, "links", None)
+    if not isinstance(links, Mapping):
+        return None
+    nxt = links.get("next")
+    if not isinstance(nxt, Mapping):
+        return None
+    url = nxt.get("url")
+    return str(url) if url else None
+
+
+def fetch_dependabot_alerts(slug: str, token: str) -> list[dict]:
+    """Open critical/high Dependabot alerts for *slug*.
+
+    Raises :class:`DependabotUnavailable` on every path that is not a successful
+    read. Only a 200 carrying a JSON list returns, and only then may the result
+    be empty.
+
+    Pagination follows the ``Link`` header. This endpoint paginates by **cursor**,
+    not by page number, and passing ``page`` earns a flat rejection from the live
+    API::
+
+        HTTP 400 — Pagination using the `page` parameter is not supported.
+
+    That fails closed rather than silently, so it would not have manufactured a
+    clean bill of health — but it would have made the check dead on every repo,
+    which is the state it is being rescued from. Mocked responses cannot catch
+    this; it was found by running against the real API.
+
+    Severity is filtered server-side *and* recounted locally: the query narrows
+    the payload, and the recount means a silently ignored filter parameter cannot
+    inflate the numbers.
+    """
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    alerts: list[dict] = []
+    url = f"{GITHUB_API}/repos/{slug}/dependabot/alerts"
+    params: dict[str, Any] | None = {
+        "state": "open",
+        "severity": "critical,high",
+        "per_page": DEPENDABOT_PAGE_SIZE,
+    }
+
+    try:
+        with httpx.Client(headers=headers, timeout=DEPENDABOT_TIMEOUT_SECONDS) as client:
+            for _ in range(DEPENDABOT_MAX_PAGES):
+                resp = client.get(url, params=params)
+                if resp.status_code != 200:
+                    raise DependabotUnavailable(_describe_http_failure(resp))
+
+                batch = resp.json()
+                if not isinstance(batch, list):
+                    raise DependabotUnavailable("response body was not a list of alerts")
+
+                alerts.extend(batch)
+
+                next_url = _next_link(resp)
+                if not next_url:
+                    return alerts
+                # The cursor is already encoded in the next URL; re-sending the
+                # original params would overwrite it.
+                url, params = next_url, None
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError) as exc:
+        # ValueError covers both json.JSONDecodeError and UnicodeDecodeError —
+        # `resp.json()` decodes raw bytes, and a body that is not valid UTF-8
+        # raises the latter, which is neither a JSON error nor an httpx one.
+        # httpx.InvalidURL is likewise not an httpx.HTTPError and is reachable
+        # from a malformed slug or a malformed Link cursor.
+        raise DependabotUnavailable(f"{type(exc).__name__}: {exc}") from exc
+
+    # Ran out of pages with a cursor still pointing onwards. The read is
+    # incomplete, and an incomplete read reported as a complete one is the exact
+    # bug this check was rewritten to remove: if `severity` were ever ignored
+    # server-side, a thousand low-severity alerts would fill the cap and the
+    # critical ones beyond it would vanish into a measured-clean dimension.
+    raise DependabotUnavailable(
+        f"more than {DEPENDABOT_MAX_PAGES} pages of alerts — read is incomplete"
+    )
+
+
+def _count_severities(alerts: Iterable[Any]) -> tuple[int, int]:
+    """``(critical, high)``, tolerating anything unexpected in the payload."""
+    critical = high = 0
+    for alert in alerts:
+        if not isinstance(alert, Mapping):
+            continue
+        advisory = alert.get("security_advisory")
+        severity = ""
+        if isinstance(advisory, Mapping):
+            severity = str(advisory.get("severity", "")).strip().lower()
+        if severity == "critical":
+            critical += 1
+        elif severity == "high":
+            high += 1
+    return critical, high
+
+
 def _measured(dimension: str, findings: list[QualityFinding]) -> DimensionResult:
     """A dimension that ran. An empty list here genuinely means "clean"."""
     return DimensionResult(dimension=dimension, findings=findings)
@@ -182,7 +346,9 @@ def _skipped(dimension: str, reason: str, detail: str) -> DimensionResult:
     return DimensionResult(dimension=dimension, skip_reason=reason, detail=detail)
 
 
-def measure_tests(project_dir: Path, config: ProjectConfig) -> DimensionResult:
+def measure_tests(
+    project_dir: Path, config: ProjectConfig, _repo: RepoContext | None = None,
+) -> DimensionResult:
     """Check if the project has tests — only where it claims to have them."""
     findings: list[QualityFinding] = []
 
@@ -218,7 +384,9 @@ def check_tests(project_dir: Path, config: ProjectConfig) -> list[QualityFinding
     return measure_tests(project_dir, config).findings
 
 
-def measure_ci_cd(project_dir: Path, config: ProjectConfig) -> DimensionResult:
+def measure_ci_cd(
+    project_dir: Path, config: ProjectConfig, _repo: RepoContext | None = None,
+) -> DimensionResult:
     """Check CI/CD pipeline presence."""
     findings: list[QualityFinding] = []
 
@@ -246,7 +414,9 @@ def check_ci_cd(project_dir: Path, config: ProjectConfig) -> list[QualityFinding
     return measure_ci_cd(project_dir, config).findings
 
 
-def measure_security_headers(project_dir: Path, _config: ProjectConfig) -> DimensionResult:
+def measure_security_headers(
+    project_dir: Path, _config: ProjectConfig, _repo: RepoContext | None = None,
+) -> DimensionResult:
     """Check SWA security headers."""
     findings: list[QualityFinding] = []
     swa_config = project_dir / "staticwebapp.config.json"
@@ -289,69 +459,103 @@ def check_security_headers(project_dir: Path, _config: ProjectConfig) -> list[Qu
     return measure_security_headers(project_dir, _config).findings
 
 
-def measure_dependencies(project_dir: Path, _config: ProjectConfig) -> DimensionResult:
-    """Check for outdated or vulnerable dependencies."""
-    findings: list[QualityFinding] = []
-    pkg_json = project_dir / "package.json"
+def measure_dependencies(
+    project_dir: Path, _config: ProjectConfig, repo: RepoContext | None = None,
+) -> DimensionResult:
+    """Check for vulnerable dependencies, via Dependabot's alerts.
 
-    if not pkg_json.exists():
-        return _skipped(
-            "deps",
-            SKIP_NOT_APPLICABLE,
-            "no package.json — nothing for npm audit to read",
-        )
+    This used to shell out to ``npm audit``. The production Container Apps job
+    runs ``image: 'python:3.12'`` (``infrastructure/main.bicep:91``) and installs
+    no node, so the check has **never produced a finding in production** — and
+    someone once burned a debugging session on an OOM theory that turned out to
+    be a missing npm (``main.bicep:96``). It was gated on ``package.json`` too, so
+    it never looked at a Python project's dependencies at all.
 
-    # Check for npm audit vulnerabilities
-    try:
-        result = subprocess.run(
-            ["npm", "audit", "--json"],
-            cwd=str(project_dir),
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        audit = json.loads(result.stdout)
-    except (json.JSONDecodeError, FileNotFoundError, subprocess.TimeoutExpired) as exc:
-        # npm missing from the runner, or the audit timed out. The old code
-        # swallowed this and returned no findings, which reads downstream as a
-        # clean dependency tree. It is not one — nothing was ever audited.
-        log.debug("npm audit did not complete in %s: %s", project_dir, exc)
+    Dependabot's alerts cover every ecosystem, need no local tooling, and are
+    already enabled fleet-wide. The cost is that this check now needs repo
+    identity and a token, which is why they are threaded down here.
+
+    Every failure — no token, no slug, 403, 404, timeout, malformed body — is
+    ``tooling-unavailable``. None of them is silence dressed as a clean tree.
+    """
+    if os.environ.get(DEPENDABOT_DISABLED_ENV) == "1":
         return _skipped(
             "deps",
             SKIP_TOOLING_UNAVAILABLE,
-            f"npm audit did not complete ({type(exc).__name__})",
+            f"disabled by {DEPENDABOT_DISABLED_ENV}=1",
         )
 
-    vulns = audit.get("metadata", {}).get("vulnerabilities", {})
-    critical = vulns.get("critical", 0)
-    high = vulns.get("high", 0)
+    repo = repo or RepoContext()
+    if not repo.slug:
+        return _skipped(
+            "deps",
+            SKIP_TOOLING_UNAVAILABLE,
+            "no repo identity — Dependabot alerts are per-repository",
+        )
+    if not repo.token:
+        return _skipped(
+            "deps",
+            SKIP_TOOLING_UNAVAILABLE,
+            "no GitHub token — cannot read Dependabot alerts",
+        )
+
+    try:
+        alerts = fetch_dependabot_alerts(repo.slug, repo.token)
+    except DependabotUnavailable as exc:
+        log.warning("Dependabot alerts unavailable for %s: %s", repo.slug, exc)
+        return _skipped("deps", SKIP_TOOLING_UNAVAILABLE, f"Dependabot alerts: {exc}")
+    except Exception as exc:
+        # Deliberately blind, and the same reasoning as the sweep loop in
+        # main.py: this is the only check that leaves the machine, and an
+        # unforeseen exception from the HTTP stack would otherwise propagate out
+        # of evaluate_project and cost the project its *entire* evaluation —
+        # every other dimension included — rather than just this one. Losing one
+        # dimension is the honest failure; losing the report is not.
+        log.exception("Unexpected failure reading Dependabot alerts for %s", repo.slug)
+        return _skipped(
+            "deps", SKIP_TOOLING_UNAVAILABLE, f"Dependabot alerts: {type(exc).__name__}",
+        )
+
+    critical, high = _count_severities(alerts)
+    findings: list[QualityFinding] = []
 
     if critical > 0:
         findings.append(QualityFinding(
             category="deps",
-            description=f"{critical} critical npm vulnerabilities",
+            description=(
+                f"{critical} open Dependabot alert(s) at critical severity — "
+                "upgrade the affected dependencies"
+            ),
             priority="P0",
             weight=20,
-            fixable=True,
         ))
     elif high > 0:
         findings.append(QualityFinding(
             category="deps",
-            description=f"{high} high npm vulnerabilities",
+            description=(
+                f"{high} open Dependabot alert(s) at high severity — "
+                "upgrade the affected dependencies"
+            ),
             priority="P1",
             weight=10,
-            fixable=True,
         ))
 
     return _measured("deps", findings)
 
 
 def check_dependencies(project_dir: Path, _config: ProjectConfig) -> list[QualityFinding]:
-    """Findings-only view of :func:`measure_dependencies`."""
+    """Findings-only view of :func:`measure_dependencies`.
+
+    Has no repo identity to give, so it always reports nothing. That is the same
+    empty list it has returned in production since the beginning — the difference
+    is that the coverage now says why.
+    """
     return measure_dependencies(project_dir, _config).findings
 
 
-def measure_project_yaml(project_dir: Path, _config: ProjectConfig) -> DimensionResult:
+def measure_project_yaml(
+    project_dir: Path, _config: ProjectConfig, _repo: RepoContext | None = None,
+) -> DimensionResult:
     """Check project.yaml completeness. The one check that always runs."""
     findings: list[QualityFinding] = []
     yaml_path = project_dir / "project.yaml"
@@ -397,7 +601,9 @@ def check_project_yaml(project_dir: Path, _config: ProjectConfig) -> list[Qualit
     return measure_project_yaml(project_dir, _config).findings
 
 
-def measure_i18n(project_dir: Path, config: ProjectConfig) -> DimensionResult:
+def measure_i18n(
+    project_dir: Path, config: ProjectConfig, _repo: RepoContext | None = None,
+) -> DimensionResult:
     """Check internationalization if declared."""
     findings: list[QualityFinding] = []
 
@@ -476,6 +682,11 @@ def check_i18n(project_dir: Path, config: ProjectConfig) -> list[QualityFinding]
 # is what puts it in the denominator; a check that is not listed is invisible to
 # both the findings and the coverage, which is the failure mode this whole file
 # now exists to make impossible.
+#
+# The uniform third parameter is what keeps this table trustworthy: every
+# measurer takes a RepoContext whether or not it uses one, so a check that needs
+# repo identity can be added without splitting the dispatch — and a check that
+# splits the dispatch is a check that can fall out of the denominator.
 _MEASURERS = (
     measure_project_yaml,
     measure_tests,
@@ -487,17 +698,19 @@ _MEASURERS = (
 
 
 def run_quality_checks_with_coverage(
-    project_dir: str, config: ProjectConfig
+    project_dir: str, config: ProjectConfig, repo: RepoContext | None = None,
 ) -> tuple[list[QualityFinding], QualityCoverage]:
     """Run all quality checks, returning findings *and* what they cover.
 
-    The findings half is byte-identical to what :func:`run_quality_checks` has
-    always returned — same checks, same order, same weights, same score. The
-    coverage half is new and purely descriptive: it says which of those checks
-    actually looked at anything.
+    The findings half keeps the contract :func:`run_quality_checks` has always
+    had — same checks, same order, same weights. The coverage half is purely
+    descriptive: it says which of those checks actually looked at anything.
+
+    *repo* is optional. Without it the checks that must ask GitHub report
+    ``tooling-unavailable``, which is what a local run or a test should see.
     """
     path = Path(project_dir)
-    results = [measure(path, config) for measure in _MEASURERS]
+    results = [measure(path, config, repo) for measure in _MEASURERS]
 
     findings = [f for result in results for f in result.findings]
 
@@ -509,12 +722,14 @@ def run_quality_checks_with_coverage(
     return findings, QualityCoverage(results=results)
 
 
-def run_quality_checks(project_dir: str, config: ProjectConfig) -> list[QualityFinding]:
+def run_quality_checks(
+    project_dir: str, config: ProjectConfig, repo: RepoContext | None = None,
+) -> list[QualityFinding]:
     """Run all quality checks on a project.
 
     Unchanged contract: priority-sorted findings, nothing else. Callers that
     want to know what the score covers should use
     :func:`run_quality_checks_with_coverage`.
     """
-    findings, _coverage = run_quality_checks_with_coverage(project_dir, config)
+    findings, _coverage = run_quality_checks_with_coverage(project_dir, config, repo)
     return findings

@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 from agent.config import AutoRefineConfig, ProjectConfig
 from agent.tools.github_tools import clone_repo, read_project_yaml
-from agent.tools.quality_tools import run_quality_checks_with_coverage
+from agent.tools.quality_tools import RepoContext, run_quality_checks_with_coverage
 
 load_dotenv()
 logging.basicConfig(
@@ -333,12 +333,30 @@ def load_priorities_from_manifest(manifest_path: Path) -> dict[str, str]:
     }
 
 
-def evaluate_project(project_dir: Path, config: ProjectConfig) -> dict:
-    """Run evaluation on a single project. Returns structured findings."""
+def github_token() -> str:
+    """The token autoRefine reads GitHub with, or "" when there is none.
+
+    ``GH_TOKEN`` first, matching what the workflows set (they pass
+    ``secrets.GH_PAT``, which can read the other 24 repos — the Actions-provided
+    ``GITHUB_TOKEN`` cannot, so a check that needs cross-repo reads must never
+    silently fall back to it and call the result clean).
+    """
+    return os.environ.get("GH_TOKEN", "") or os.environ.get("GITHUB_TOKEN", "")
+
+
+def evaluate_project(
+    project_dir: Path, config: ProjectConfig, repo: RepoContext | None = None,
+) -> dict:
+    """Run evaluation on a single project. Returns structured findings.
+
+    *repo* carries GitHub identity for the checks that must ask GitHub. It is
+    optional so a local evaluation still works; those checks then report
+    ``tooling-unavailable`` rather than a clean bill of health.
+    """
     log.info("Evaluating: %s (%s)", config.name, config.stage)
 
     # Technical quality checks (deterministic)
-    findings, coverage = run_quality_checks_with_coverage(str(project_dir), config)
+    findings, coverage = run_quality_checks_with_coverage(str(project_dir), config, repo)
     feature_suggestions = suggest_feature_improvements(config)
 
     report = {
@@ -1863,7 +1881,9 @@ def _process_repo(repo: str, config: AutoRefineConfig) -> None:
         return
 
     # Step 1: Always evaluate first (deterministic checks)
-    report = evaluate_project(project_dir, project_config)
+    report = evaluate_project(
+        project_dir, project_config, RepoContext(slug=repo, token=github_token()),
+    )
 
     if config.mode == "evaluate":
         print(json.dumps(report, indent=2))

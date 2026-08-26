@@ -216,7 +216,9 @@ def _sweep(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, repo: Path, **kw: ob
         "load_config",
         lambda _dir: SimpleNamespace(name="proj", stage="active", to_context=lambda: ""),
     )
-    monkeypatch.setattr(main, "evaluate_project", lambda _dir, _cfg: {"findings": [], "score": 50})
+    monkeypatch.setattr(
+        main, "evaluate_project", lambda _dir, _cfg, _repo=None: {"findings": [], "score": 50}
+    )
     monkeypatch.setattr(
         main, "plan_project", lambda *a, **k: calls.append("plan_project") or None
     )
