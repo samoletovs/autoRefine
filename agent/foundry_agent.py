@@ -10,16 +10,17 @@ Requires:
 """
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import logging
 import os
 import re
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, NoReturn, TypeVar
 
 import httpx
 from azure.ai.agents import AgentsClient
@@ -91,6 +92,38 @@ DEFAULT_TRUNCATION_LAST_MESSAGES = 12
 MIN_MAX_PROMPT_TOKENS = 20_000
 MIN_TRUNCATION_LAST_MESSAGES = 2
 
+# ── Tool-round budget ────────────────────────────────────────────────────────
+# Two *local* guards on the number of tool rounds, complementing the two
+# service-side prompt guards above. They exist because the loop in
+# ``run_agent`` is otherwise unbounded: nothing stops a model that keeps
+# asking for tool calls, and every round re-sends the thread, so a run that
+# has stopped making progress keeps billing for rounds that add no
+# information.
+#
+#   max_tool_rounds — hard ceiling on rounds. A measured plan run is ~74
+#                     rounds (AGENTS.md, "What the sweep actually costs"), so
+#                     200 is ~2.7x headroom. That margin is deliberate: refine
+#                     mode writes a file per round and legitimately runs
+#                     longer than a plan, and the cost of one wasted run is
+#                     far smaller than the cost of aborting healthy ones. This
+#                     catches a runaway, not a long run.
+#
+#   stuck_repeats   — consecutive rounds requesting an identical batch of tool
+#                     calls. Three in a row is not analysis, it is a loop: the
+#                     second repeat already got back exactly what the first
+#                     did, so the third cannot learn anything new. Kept
+#                     deliberately narrow — consecutive *and* identical —
+#                     because a false abort costs a whole project's ideation.
+DEFAULT_MAX_TOOL_ROUNDS = 200
+DEFAULT_STUCK_REPEATS = 3
+# Floors in the same spirit as MIN_MAX_PROMPT_TOKENS: reject a value that
+# would kill healthy runs rather than silently accept it. A ceiling at or
+# below the observed 74-78 round band would abort plans before submit_plan.
+MIN_MAX_TOOL_ROUNDS = 100
+# Two identical rounds running is the smallest thing that is even a repeat;
+# 1 would abort on the very first tool call.
+MIN_STUCK_REPEATS = 2
+
 T = TypeVar("T")
 
 
@@ -110,6 +143,29 @@ class FoundryRunIncompleteError(RuntimeError):
             "Raise AUTOREFINE_MAX_PROMPT_TOKENS / AUTOREFINE_TRUNCATION_LAST_MESSAGES "
             "or reduce tool output if this recurs."
         )
+
+
+class FoundryRunAbortedError(FoundryRunIncompleteError):
+    """A local cost guard stopped the loop before the service ended the run.
+
+    Deliberately a *subclass* of :class:`FoundryRunIncompleteError`. A run we
+    abandoned for spinning, or for exhausting its round budget, is in exactly
+    the state that error exists to describe — stopped early, with no plan we
+    are entitled to trust — and callers already handle it that way:
+    ``main.py``'s refine path catches ``FoundryRunIncompleteError`` to roll
+    back half-applied edits before they can be committed. A fresh, unrelated
+    exception type would slip past that handler and let a partial result reach
+    a PR.
+
+    ``reason`` is ``"max_tool_rounds"`` or ``"stuck_tool_loop"``.
+    """
+
+    def __init__(self, run_id: str, reason: str, detail: str) -> None:
+        self.run_id = run_id
+        self.reason = reason
+        # Bypasses the parent's message, which advises raising the
+        # prompt-token budget — useless advice for a loop going nowhere.
+        RuntimeError.__init__(self, f"Foundry run {run_id} aborted: {detail}")
 
 
 def _positive_int_from_env(name: str, default: int, minimum: int) -> int:
@@ -147,6 +203,24 @@ def resolve_truncation_last_messages() -> int:
         "AUTOREFINE_TRUNCATION_LAST_MESSAGES",
         DEFAULT_TRUNCATION_LAST_MESSAGES,
         MIN_TRUNCATION_LAST_MESSAGES,
+    )
+
+
+def resolve_max_tool_rounds() -> int:
+    """Tool-round ceiling for a run. Override: ``AUTOREFINE_MAX_TOOL_ROUNDS``."""
+    return _positive_int_from_env(
+        "AUTOREFINE_MAX_TOOL_ROUNDS",
+        DEFAULT_MAX_TOOL_ROUNDS,
+        MIN_MAX_TOOL_ROUNDS,
+    )
+
+
+def resolve_stuck_repeats() -> int:
+    """Identical rounds tolerated before abort. Override: ``AUTOREFINE_STUCK_REPEATS``."""
+    return _positive_int_from_env(
+        "AUTOREFINE_STUCK_REPEATS",
+        DEFAULT_STUCK_REPEATS,
+        MIN_STUCK_REPEATS,
     )
 
 
@@ -694,6 +768,119 @@ def create_agent(
     return agent.id
 
 
+def _tool_call_signature(tool_calls: Sequence[Any]) -> str:
+    """Fingerprint one round's requested tool calls, for stuck detection.
+
+    Covers every call in the round, not just the first: the service can
+    request several in parallel, and a round only repeats the previous one if
+    the whole batch matches. Reading three *different* files in one round is
+    progress; asking for the same three again is not.
+
+    Arguments are compared as the raw JSON string the service sent, so this
+    costs no parsing and cannot fail on a payload we could not decode. Hashing
+    keeps the retained state a fixed 64 bytes however large the arguments are
+    — ``write_project_file`` carries whole file bodies.
+    """
+    parts = []
+    for call in tool_calls:
+        function = getattr(call, "function", None)
+        name = getattr(function, "name", "") or ""
+        arguments = getattr(function, "arguments", "") or ""
+        parts.append(f"{name}\x1f{arguments}")
+
+    joined = "\x1e".join(sorted(parts))
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+
+
+def _run_token_usage(run: Any) -> dict[str, Any]:
+    """Best-effort token usage read off a run object.
+
+    ``usage`` is not guaranteed: it is absent while a run is in flight, absent
+    on a run we abandoned mid-flight, and shaped as either a model or a plain
+    dict depending on service version. Every field is therefore probed rather
+    than assumed, and a run without it reports ``None`` — this feeds a log
+    line in a ``finally`` block, so it must never raise and mask a real error.
+    """
+    usage = getattr(run, "usage", None)
+    if usage is None:
+        return dict.fromkeys(("prompt_tokens", "completion_tokens", "total_tokens"))
+
+    def field(key: str) -> Any:
+        if isinstance(usage, dict):
+            return usage.get(key)
+        return getattr(usage, key, None)
+
+    return {key: field(key) for key in ("prompt_tokens", "completion_tokens", "total_tokens")}
+
+
+def _log_run_cost(
+    run: Any,
+    *,
+    rounds: int,
+    tool_calls: int,
+    guard: str | None,
+    plan_captured: bool,
+) -> None:
+    """Emit the one structured cost line every run ends with.
+
+    A single greppable ``key=value`` line so a month of runs can be summed
+    from logs, instead of the by-hand Azure meter forensics AGENTS.md
+    describes. ``guard`` names the guard that fired, or ``none`` — which is
+    how a run cut short is told apart from one that finished.
+    """
+    try:
+        usage = _run_token_usage(run)
+        log.info(
+            "run_cost run_id=%s status=%s rounds=%d tool_calls=%d guard=%s "
+            "plan_captured=%s prompt_tokens=%s completion_tokens=%s total_tokens=%s",
+            getattr(run, "id", "unknown"),
+            getattr(run, "status", "unknown"),
+            rounds,
+            tool_calls,
+            guard or "none",
+            plan_captured,
+            usage["prompt_tokens"],
+            usage["completion_tokens"],
+            usage["total_tokens"],
+        )
+    except Exception:  # observability must never fail a run
+        log.warning("Could not emit the run cost line.", exc_info=True)
+
+
+def _abort_run(
+    client: AgentsClient,
+    thread_id: str,
+    run: Any,
+    reason: str,
+    detail: str,
+) -> NoReturn:
+    """Tear down a run a cost guard has given up on, then raise.
+
+    Cancelling first stops the service holding a run open waiting for tool
+    outputs that are never coming; deleting the thread mirrors the
+    ``incomplete`` path. Both are best-effort and swallow their own failures:
+    the caller needs to see *why* the run was abandoned, not a connection
+    error from the tidy-up. ``cancel`` is probed because the fakes in the test
+    suite — and older SDKs — do not expose it.
+    """
+    run_id = getattr(run, "id", "unknown")
+    log.error("Aborting Foundry run %s (%s): %s", run_id, reason, detail)
+
+    cancel = getattr(getattr(client, "runs", None), "cancel", None)
+    if callable(cancel):
+        try:
+            cancel(thread_id=thread_id, run_id=run_id)
+        except Exception as exc:  # noqa: BLE001 - cleanup must not mask the abort
+            log.warning("Could not cancel aborted run %s: %s", run_id, exc)
+
+    try:
+        _call_foundry_with_retry("client.threads.delete", client.threads.delete, thread_id)
+    except Exception as exc:  # noqa: BLE001 - cleanup must not mask the abort
+        log.warning("Could not delete thread %s after abort: %s", thread_id, exc)
+
+    raise FoundryRunAbortedError(run_id, reason, detail)
+
+
 def run_agent(
     client: AgentsClient,
     agent_id: str,
@@ -701,7 +888,18 @@ def run_agent(
     config: ProjectConfig,
     task: str,
 ) -> dict | None:
-    """Run the agent with a task message. Returns the parsed plan or None."""
+    """Run the agent with a task message. Returns the parsed plan or None.
+
+    Two local cost guards bound the tool-calling loop, which is otherwise
+    unbounded: a hard round ceiling (``AUTOREFINE_MAX_TOOL_ROUNDS``) and a
+    stuck detector (``AUTOREFINE_STUCK_REPEATS``). Either firing raises
+    :class:`FoundryRunAbortedError` rather than returning ``None`` — callers
+    read ``None`` as "the model declined to plan" and retry it, which would
+    pay for a spinning run two more times.
+    """
+    max_tool_rounds = resolve_max_tool_rounds()
+    stuck_repeats = resolve_stuck_repeats()
+
     # Create a thread
     thread = client.threads.create()
     log.info("Thread: %s", thread.id)
@@ -733,85 +931,134 @@ def run_agent(
 
     # Poll for completion, handling tool calls
     plan_result: dict | None = None
+    rounds = 0
+    tool_calls = 0
+    guard_fired: str | None = None
+    last_signature: str | None = None
+    repeat_streak = 0
 
-    while run.status in ("queued", "in_progress", "requires_action"):
-        if run.status == "requires_action":
-            action = run.required_action
-            if isinstance(action, SubmitToolOutputsAction):
-                tool_outputs = []
-                for tool_call in action.submit_tool_outputs.tool_calls:
-                    if isinstance(tool_call, RequiredFunctionToolCall):
-                        fn_name = tool_call.function.name
-                        fn_args = json.loads(tool_call.function.arguments)
-                        log.info("Tool call: %s(%s)", fn_name, fn_args)
+    try:
+        while run.status in ("queued", "in_progress", "requires_action"):
+            if run.status == "requires_action":
+                # Counted before the isinstance check below on purpose. A
+                # required action we cannot service falls through to
+                # `continue` without touching the service or sleeping, so
+                # without this the loop would spin on an unchanged run
+                # forever — the exact failure the ceiling exists to stop.
+                rounds += 1
+                if rounds > max_tool_rounds:
+                    guard_fired = "max_tool_rounds"
+                    _abort_run(
+                        client,
+                        thread.id,
+                        run,
+                        guard_fired,
+                        f"exhausted its {max_tool_rounds}-round tool budget without "
+                        "reaching submit_plan",
+                    )
 
-                        handler = TOOL_HANDLERS.get(fn_name)
-                        if handler:
-                            output = handler(project_dir, fn_args)
+                action = run.required_action
+                if isinstance(action, SubmitToolOutputsAction):
+                    batch = list(action.submit_tool_outputs.tool_calls)
 
-                            # Capture plan if this is submit_plan
-                            if fn_name == "submit_plan":
-                                plan_result = _normalize_plan_args(fn_args)
-                        else:
-                            output = json.dumps({"error": f"Unknown tool: {fn_name}"})
+                    signature = _tool_call_signature(batch)
+                    repeat_streak = repeat_streak + 1 if signature == last_signature else 1
+                    last_signature = signature
+                    if repeat_streak >= stuck_repeats:
+                        guard_fired = "stuck_tool_loop"
+                        _abort_run(
+                            client,
+                            thread.id,
+                            run,
+                            guard_fired,
+                            f"asked for an identical batch of tool calls {repeat_streak} "
+                            f"rounds running (round {rounds}) — it has stopped making "
+                            "progress",
+                        )
 
-                        tool_outputs.append(ToolOutput(
-                            tool_call_id=tool_call.id,
-                            output=output,
-                        ))
+                    tool_outputs = []
+                    for tool_call in batch:
+                        if isinstance(tool_call, RequiredFunctionToolCall):
+                            tool_calls += 1
+                            fn_name = tool_call.function.name
+                            fn_args = json.loads(tool_call.function.arguments)
+                            log.info("Tool call: %s(%s)", fn_name, fn_args)
 
-                run = _call_foundry_with_retry(
-                    "client.runs.submit_tool_outputs",
-                    client.runs.submit_tool_outputs,
-                    thread_id=thread.id,
-                    run_id=run.id,
-                    tool_outputs=tool_outputs,
-                )
-            continue
+                            handler = TOOL_HANDLERS.get(fn_name)
+                            if handler:
+                                output = handler(project_dir, fn_args)
 
-        # Poll
-        import time
-        time.sleep(1)
-        run = _call_foundry_with_retry(
-            "client.runs.get",
-            client.runs.get,
+                                # Capture plan if this is submit_plan
+                                if fn_name == "submit_plan":
+                                    plan_result = _normalize_plan_args(fn_args)
+                            else:
+                                output = json.dumps({"error": f"Unknown tool: {fn_name}"})
+
+                            tool_outputs.append(ToolOutput(
+                                tool_call_id=tool_call.id,
+                                output=output,
+                            ))
+
+                    run = _call_foundry_with_retry(
+                        "client.runs.submit_tool_outputs",
+                        client.runs.submit_tool_outputs,
+                        thread_id=thread.id,
+                        run_id=run.id,
+                        tool_outputs=tool_outputs,
+                    )
+                continue
+
+            # Poll
+            import time
+            time.sleep(1)
+            run = _call_foundry_with_retry(
+                "client.runs.get",
+                client.runs.get,
+                thread_id=thread.id,
+                run_id=run.id,
+            )
+
+        if run.status == "failed":
+            log.error("Run failed: %s", run.last_error)
+            return None
+
+        if run.status == "incomplete":
+            details = getattr(run, "incomplete_details", None)
+            reason = getattr(details, "reason", None)
+            log.error("Run %s incomplete (reason=%s)", run.id, reason)
+            _call_foundry_with_retry("client.threads.delete", client.threads.delete, thread.id)
+            raise FoundryRunIncompleteError(run.id, str(reason) if reason is not None else None)
+
+        # Get the final message
+        messages = client.messages.list(
             thread_id=thread.id,
-            run_id=run.id,
+            order=ListSortOrder.DESCENDING,
+            limit=1,
         )
+        for msg in messages:
+            if msg.role == MessageRole.AGENT:
+                for block in msg.text_messages:
+                    agent_text = block.text.value
+                    log.info("Agent response:\n%s", agent_text)
 
-    if run.status == "failed":
-        log.error("Run failed: %s", run.last_error)
-        return None
+                    # Fallback: if agent didn't call submit_plan, parse from text
+                    if plan_result is None and "Score:" in agent_text:
+                        plan_result = _parse_plan_from_text(agent_text)
+                        if plan_result:
+                            log.info("Parsed plan from text response (submit_plan not called)")
 
-    if run.status == "incomplete":
-        details = getattr(run, "incomplete_details", None)
-        reason = getattr(details, "reason", None)
-        log.error("Run %s incomplete (reason=%s)", run.id, reason)
+        # Clean up
         _call_foundry_with_retry("client.threads.delete", client.threads.delete, thread.id)
-        raise FoundryRunIncompleteError(run.id, str(reason) if reason is not None else None)
 
-    # Get the final message
-    messages = client.messages.list(
-        thread_id=thread.id,
-        order=ListSortOrder.DESCENDING,
-        limit=1,
-    )
-    for msg in messages:
-        if msg.role == MessageRole.AGENT:
-            for block in msg.text_messages:
-                agent_text = block.text.value
-                log.info("Agent response:\n%s", agent_text)
-
-                # Fallback: if agent didn't call submit_plan, parse from text
-                if plan_result is None and "Score:" in agent_text:
-                    plan_result = _parse_plan_from_text(agent_text)
-                    if plan_result:
-                        log.info("Parsed plan from text response (submit_plan not called)")
-
-    # Clean up
-    _call_foundry_with_retry("client.threads.delete", client.threads.delete, thread.id)
-
-    return plan_result
+        return plan_result
+    finally:
+        _log_run_cost(
+            run,
+            rounds=rounds,
+            tool_calls=tool_calls,
+            guard=guard_fired,
+            plan_captured=plan_result is not None,
+        )
 
 
 def _parse_plan_from_text(text: str) -> dict | None:
