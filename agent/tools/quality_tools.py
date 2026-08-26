@@ -43,6 +43,18 @@ DEPENDABOT_TIMEOUT_SECONDS = 20
 # day across the fleet, and the alternative to a switch is an emergency PR.
 DEPENDABOT_DISABLED_ENV = "AUTOREFINE_SKIP_DEPENDABOT"
 
+# Same idea for the branch-protection read. Its own switch rather than a shared
+# one, so an emergency here cannot silently take the dependency check with it.
+BRANCH_PROTECTION_DISABLED_ENV = "AUTOREFINE_SKIP_BRANCH_PROTECTION"
+
+# Failure types a GitHub read can raise that are *not* httpx.HTTPError, kept in
+# one place because missing one is how an exception escapes a check and costs a
+# project its entire evaluation rather than one dimension. `resp.json()` decodes
+# raw bytes, so a non-UTF-8 body raises UnicodeDecodeError — a ValueError, but
+# neither a JSON error nor an httpx one. httpx.InvalidURL is likewise not an
+# httpx.HTTPError and is reachable from a malformed slug or Link cursor.
+_GITHUB_READ_ERRORS = (httpx.HTTPError, httpx.InvalidURL, ValueError)
+
 REQUIRED_SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
@@ -206,7 +218,16 @@ class RepoContext:
         return bool(self.slug) and bool(self.token)
 
 
-class DependabotUnavailable(Exception):
+class GitHubUnavailable(Exception):
+    """A GitHub read did not complete.
+
+    Deliberately an exception rather than a falsy return. "No alerts" and "no
+    protection rule" are real answers; "we could not look" is not, and the whole
+    class of bug these checks exist to remove is the two being indistinguishable.
+    """
+
+
+class DependabotUnavailable(GitHubUnavailable):
     """Open alerts could not be read.
 
     Deliberately an exception rather than an empty list. ``[]`` is a real answer
@@ -216,6 +237,14 @@ class DependabotUnavailable(Exception):
     always been in. A caller cannot accidentally treat this as a clean bill of
     health, because there is no value here to mistake for one.
     """
+
+
+def _github_headers(token: str) -> dict[str, str]:
+    return {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
 
 
 def _describe_http_failure(resp: httpx.Response) -> str:
@@ -269,11 +298,7 @@ def fetch_dependabot_alerts(slug: str, token: str) -> list[dict]:
     the payload, and the recount means a silently ignored filter parameter cannot
     inflate the numbers.
     """
-    headers = {
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
+    headers = _github_headers(token)
     alerts: list[dict] = []
     url = f"{GITHUB_API}/repos/{slug}/dependabot/alerts"
     params: dict[str, Any] | None = {
@@ -301,12 +326,9 @@ def fetch_dependabot_alerts(slug: str, token: str) -> list[dict]:
                 # The cursor is already encoded in the next URL; re-sending the
                 # original params would overwrite it.
                 url, params = next_url, None
-    except (httpx.HTTPError, httpx.InvalidURL, ValueError) as exc:
-        # ValueError covers both json.JSONDecodeError and UnicodeDecodeError —
-        # `resp.json()` decodes raw bytes, and a body that is not valid UTF-8
-        # raises the latter, which is neither a JSON error nor an httpx one.
-        # httpx.InvalidURL is likewise not an httpx.HTTPError and is reachable
-        # from a malformed slug or a malformed Link cursor.
+    except _GITHUB_READ_ERRORS as exc:
+        # See _GITHUB_READ_ERRORS: ValueError covers json.JSONDecodeError and
+        # UnicodeDecodeError; httpx.InvalidURL is not an httpx.HTTPError.
         raise DependabotUnavailable(f"{type(exc).__name__}: {exc}") from exc
 
     # Ran out of pages with a cursor still pointing onwards. The read is
@@ -678,6 +700,179 @@ def check_i18n(project_dir: Path, config: ProjectConfig) -> list[QualityFinding]
     return measure_i18n(project_dir, config).findings
 
 
+@dataclass(frozen=True)
+class RepoFacts:
+    """The repository metadata a settings check needs before it can ask anything."""
+
+    default_branch: str
+    archived: bool
+
+
+def fetch_repo_facts(slug: str, token: str) -> RepoFacts:
+    """Read the default branch and archived flag.
+
+    The default branch is taken from the API rather than from the local clone.
+    The fleet is split between ``main`` and ``master``, so it cannot be assumed,
+    and reading it from a clone would make the answer depend on local tooling
+    state — which is the class of bug that left the dependency check dead for the
+    life of the project. One extra call per repo per sweep is not worth that.
+    """
+    try:
+        with httpx.Client(
+            headers=_github_headers(token), timeout=DEPENDABOT_TIMEOUT_SECONDS
+        ) as client:
+            resp = client.get(f"{GITHUB_API}/repos/{slug}")
+            if resp.status_code != 200:
+                raise GitHubUnavailable(_describe_http_failure(resp))
+            body = resp.json()
+    except _GITHUB_READ_ERRORS as exc:
+        raise GitHubUnavailable(f"{type(exc).__name__}: {exc}") from exc
+
+    if not isinstance(body, Mapping):
+        raise GitHubUnavailable("repository response was not an object")
+
+    return RepoFacts(
+        default_branch=str(body.get("default_branch") or ""),
+        archived=bool(body.get("archived", False)),
+    )
+
+
+def branch_is_protected(slug: str, branch: str, token: str) -> bool:
+    """True when *branch* is covered by classic protection **or** by a ruleset.
+
+    Both are checked, and that is load-bearing rather than thorough. The case for
+    scoring this finding at all is that it is self-resolving: it clears the moment
+    somebody changes the setting. Rulesets are the modern way to change it, so a
+    check blind to them would keep reporting a repo that had just been fixed —
+    and a finding that cannot clear is a permanent penalty, which is exactly what
+    AGENTS.md says never to weight.
+    """
+    try:
+        with httpx.Client(
+            headers=_github_headers(token), timeout=DEPENDABOT_TIMEOUT_SECONDS
+        ) as client:
+            classic = client.get(
+                f"{GITHUB_API}/repos/{slug}/branches/{branch}/protection"
+            )
+            if classic.status_code == 200:
+                return True
+            if classic.status_code != 404:
+                raise GitHubUnavailable(_describe_http_failure(classic))
+
+            # 404 here is ambiguous: GitHub says "Branch not protected" for an
+            # unprotected branch and also 404s a branch or repo it cannot see.
+            # Only the first is an answer. Anything else is treated as unreadable,
+            # which errs towards reporting nothing rather than towards a finding
+            # nobody can act on.
+            detail = _describe_http_failure(classic)
+            if "not protected" not in detail.lower():
+                raise GitHubUnavailable(detail)
+
+            rules = client.get(f"{GITHUB_API}/repos/{slug}/rules/branches/{branch}")
+            if rules.status_code != 200:
+                raise GitHubUnavailable(_describe_http_failure(rules))
+            active = rules.json()
+            if not isinstance(active, list):
+                raise GitHubUnavailable("branch rules response was not a list")
+            return bool(active)
+    except _GITHUB_READ_ERRORS as exc:
+        raise GitHubUnavailable(f"{type(exc).__name__}: {exc}") from exc
+
+
+def measure_branch_protection(
+    project_dir: Path, _config: ProjectConfig, repo: RepoContext | None = None,
+) -> DimensionResult:
+    """Check that the default branch cannot be pushed to directly.
+
+    AGENTS.md rule 1 is "never push directly to main/master", and the merge gate
+    that enforces review lives in a workflow a direct push simply goes around. A
+    convention enforced by nothing is a convention, not a control.
+
+    The finding is **advisory**: enabling protection is a repository setting, not
+    a commit, so no pull request can deliver it. It scores and it reports, but it
+    is withheld from the planner — an idea filed from it would buy a 10-30 minute
+    coding-agent run that cannot possibly succeed. See AGENTS.md, "Advisory
+    findings".
+    """
+    if os.environ.get(BRANCH_PROTECTION_DISABLED_ENV) == "1":
+        return _skipped(
+            "branch-protection",
+            SKIP_TOOLING_UNAVAILABLE,
+            f"disabled by {BRANCH_PROTECTION_DISABLED_ENV}=1",
+        )
+
+    repo = repo or RepoContext()
+    if not repo.slug:
+        return _skipped(
+            "branch-protection",
+            SKIP_TOOLING_UNAVAILABLE,
+            "no repo identity — protection is a per-repository setting",
+        )
+    if not repo.token:
+        return _skipped(
+            "branch-protection",
+            SKIP_TOOLING_UNAVAILABLE,
+            "no GitHub token — cannot read branch protection",
+        )
+
+    try:
+        facts = fetch_repo_facts(repo.slug, repo.token)
+
+        if facts.archived:
+            # Never penalise a project for something it cannot buy: an archived
+            # repository's settings are frozen.
+            return _skipped(
+                "branch-protection",
+                SKIP_NOT_APPLICABLE,
+                "repository is archived — its settings cannot be changed",
+            )
+        if not facts.default_branch:
+            return _skipped(
+                "branch-protection",
+                SKIP_NOT_APPLICABLE,
+                "repository has no default branch to protect",
+            )
+
+        protected = branch_is_protected(repo.slug, facts.default_branch, repo.token)
+    except GitHubUnavailable as exc:
+        log.warning("Branch protection unreadable for %s: %s", repo.slug, exc)
+        return _skipped(
+            "branch-protection", SKIP_TOOLING_UNAVAILABLE, f"branch protection: {exc}",
+        )
+    except Exception as exc:
+        # Deliberately blind, for the same reason as measure_dependencies: an
+        # unforeseen failure in the HTTP stack must cost this dimension, not the
+        # project's entire evaluation.
+        log.exception("Unexpected failure reading branch protection for %s", repo.slug)
+        return _skipped(
+            "branch-protection",
+            SKIP_TOOLING_UNAVAILABLE,
+            f"branch protection: {type(exc).__name__}",
+        )
+
+    findings: list[QualityFinding] = []
+    if not protected:
+        findings.append(QualityFinding(
+            category="branch-protection",
+            description=(
+                f"Default branch '{facts.default_branch}' has no protection rule or "
+                "ruleset — a direct push bypasses the review gate entirely"
+            ),
+            priority="P1",
+            weight=10,
+            advisory=True,
+        ))
+
+    return _measured("branch-protection", findings)
+
+
+def check_branch_protection(
+    project_dir: Path, _config: ProjectConfig
+) -> list[QualityFinding]:
+    """Findings-only view of :func:`measure_branch_protection`."""
+    return measure_branch_protection(project_dir, _config).findings
+
+
 # Every dimension the score is built from, in report order. Adding a check here
 # is what puts it in the denominator; a check that is not listed is invisible to
 # both the findings and the coverage, which is the failure mode this whole file
@@ -693,6 +888,7 @@ _MEASURERS = (
     measure_ci_cd,
     measure_security_headers,
     measure_dependencies,
+    measure_branch_protection,
     measure_i18n,
 )
 

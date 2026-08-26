@@ -45,7 +45,9 @@ from agent.tools.quality_tools import (
 
 # Every dimension the score is built from, in report order. Pinned here so a new
 # check cannot be added to the findings without also entering the denominator.
-ALL_DIMENSIONS = ["metadata", "tests", "ci-cd", "security", "deps", "i18n"]
+ALL_DIMENSIONS = [
+    "metadata", "tests", "ci-cd", "security", "deps", "branch-protection", "i18n",
+]
 
 
 def _write_python_app(root: Path, quality: list[str]) -> Path:
@@ -110,10 +112,10 @@ class TestDeclarationAsymmetry:
         _, honest_coverage = run_quality_checks_with_coverage(str(honest), _config(honest))
 
         assert silent_coverage.measured == ["metadata"]
-        assert silent_coverage.summary() == "1/6 measured"
+        assert silent_coverage.summary() == "1/7 measured"
 
         assert honest_coverage.measured == ["metadata", "tests", "ci-cd"]
-        assert honest_coverage.summary() == "3/6 measured"
+        assert honest_coverage.summary() == "3/7 measured"
 
         # The project that scored higher was inspected less. That is the finding.
         assert len(silent_coverage.measured) < len(honest_coverage.measured)
@@ -290,8 +292,8 @@ class TestCoverageShape:
 
         restored = json.loads(json.dumps(coverage.as_dict()))
         assert restored["measured"] == 2
-        assert restored["total"] == 6
-        assert restored["summary"] == "2/6 measured"
+        assert restored["total"] == 7
+        assert restored["summary"] == "2/7 measured"
         assert {d["dimension"] for d in restored["dimensions"]} == set(ALL_DIMENSIONS)
 
     def test_empty_coverage_does_not_divide_by_zero(self) -> None:
@@ -309,8 +311,8 @@ class TestEvaluateProjectReport:
 
         assert report["score"] == 100
         assert report["coverage"]["measured"] == 1
-        assert report["coverage"]["total"] == 6
-        assert report["coverage"]["summary"] == "1/6 measured"
+        assert report["coverage"]["total"] == 7
+        assert report["coverage"]["summary"] == "1/7 measured"
 
     def test_report_still_holds_everything_it_used_to(self, tmp_path: Path) -> None:
         project = _write_python_app(tmp_path, quality=["tests", "ci-cd"])
@@ -328,4 +330,4 @@ class TestEvaluateProjectReport:
         report = evaluate_project(project, _config(project))
 
         restored = json.loads(json.dumps(report, indent=2))
-        assert restored["coverage"]["summary"] == "2/6 measured"
+        assert restored["coverage"]["summary"] == "2/7 measured"
