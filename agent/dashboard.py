@@ -21,6 +21,11 @@ Interactive features
 * **Improvement suggestions** — a dedicated section renders feature suggestions
   passed in ``analysis["feature_suggestions"]``, surfacing goal-aligned and
   feature-parity ideas alongside the AI recommendations.
+* **Score coverage** — a section renders ``analysis["quality_coverage"]`` (the
+  evaluation reports from ``main.evaluate_project``), showing each 0-100 score
+  beside the number of quality dimensions it was actually measured on. Most
+  checks are gated on a project's self-declared ``quality:`` list, so an
+  unqualified 100/100 can mean "declared nothing" rather than "nothing wrong".
 * **Progress tracking** — recent autoRefine idea issues are shown with status,
   activity, and links when available from GitHub scanning.
 """
@@ -106,6 +111,81 @@ def _render_project_table(
         "<th>Project</th><th>Issues</th><th>Bugs</th><th>PRs</th>"
         "<th>Commits (7d)</th><th>CI</th>"
         "<th>R</th><th>L</th><th>M</th><th>Health</th>"
+        "</tr></thead>"
+        "<tbody>" + "".join(rows) + "</tbody>"
+        "</table>"
+    )
+
+
+def _coverage_colour(measured: int, total: int) -> str:
+    """Colour a coverage fraction. Full coverage is the only green."""
+    if total <= 0:
+        return "score-unknown"
+    if measured >= total:
+        return "score-green"
+    if measured * 2 >= total:
+        return "score-yellow"
+    return "score-red"
+
+
+def _render_quality_coverage(evaluations: list[Any]) -> str:
+    """Render each project's 0-100 score beside the dimensions it was built on.
+
+    The score deducts only for checks that ran, and most checks run only when
+    the project's own ``project.yaml`` declares the trait. So a project that
+    declares nothing scores 100/100 on one dimension out of six, and the number
+    on its own reads as a clean bill of health. This table is the denominator.
+
+    ``evaluations`` is the list of report dicts produced by
+    ``main.evaluate_project`` — ``project``, ``score`` and ``coverage``.
+    """
+    if not evaluations:
+        return (
+            "<p class=\"muted\">No evaluation coverage available — "
+            "run <code>--mode evaluate</code> to populate it.</p>"
+        )
+
+    rows = []
+    for item in evaluations:
+        if not isinstance(item, dict):
+            continue
+        coverage = item.get("coverage") or {}
+        if not isinstance(coverage, dict):
+            coverage = {}
+        measured = coverage.get("measured", 0)
+        total = coverage.get("total", 0)
+        measured = measured if isinstance(measured, int) and not isinstance(measured, bool) else 0
+        total = total if isinstance(total, int) and not isinstance(total, bool) else 0
+
+        skipped = [
+            f"{d.get('dimension', '?')} ({d.get('skip_reason', 'unknown')})"
+            for d in coverage.get("dimensions", [])
+            if isinstance(d, dict) and not d.get("measured", False)
+        ]
+        skipped_html = (
+            _esc(", ".join(skipped)) if skipped
+            else "<span class=\"muted\">none</span>"
+        )
+        colour = _coverage_colour(measured, total)
+        rows.append(
+            f"<tr>"
+            f"<td>{_esc(item.get('project', '?'))}</td>"
+            f"<td>{_esc(item.get('score', '?'))}/100</td>"
+            f"<td class=\"{colour}\">{_esc(measured)}/{_esc(total)}</td>"
+            f"<td>{skipped_html}</td>"
+            f"</tr>"
+        )
+
+    if not rows:
+        return "<p class=\"muted\">No evaluation coverage available.</p>"
+
+    return (
+        "<p class=\"muted\">A score only covers the dimensions that were actually "
+        "measured. Checks gated on a project's own <code>quality:</code> list do not "
+        "run when it declares nothing — and then deduct nothing.</p>"
+        "<table class=\"quality-coverage-table\">"
+        "<thead><tr>"
+        "<th>Project</th><th>Score</th><th>Measured</th><th>Not measured</th>"
         "</tr></thead>"
         "<tbody>" + "".join(rows) + "</tbody>"
         "</table>"
@@ -375,7 +455,10 @@ def render_html_dashboard(
     analysis:
         AI-generated analysis from ``health_scan.analyze_with_ai``.
         May also contain a ``feature_suggestions`` list (produced by
-        ``main.suggest_feature_improvements``).
+        ``main.suggest_feature_improvements``) and a ``quality_coverage``
+        list of evaluation reports (produced by ``main.evaluate_project``),
+        which is what lets the page show a 0-100 score beside the number of
+        dimensions it was actually measured on.
     app_insights_data:
         Optional Application Insights telemetry dict.
     url_health_data:
@@ -390,10 +473,12 @@ def render_html_dashboard(
     focus = analysis.get("focus_project", "")
     issues = analysis.get("issues_to_create", [])
     feature_suggestions = analysis.get("feature_suggestions", [])
+    quality_coverage = analysis.get("quality_coverage", [])
 
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     project_table = _render_project_table(github_data, scores)
+    coverage_section = _render_quality_coverage(quality_coverage)
     cost_section = _render_cost_section(cost_data)
     url_section = _render_url_health(url_health_data or {})
     telemetry_section = _render_telemetry(app_insights_data or {})
@@ -696,6 +781,11 @@ def render_html_dashboard(
     <h2>📊 Project Health</h2>
     <div class="filter-bar"><input id="project-filter" type="search" placeholder="Filter projects…" aria-label="Filter projects by name" autocomplete="off"></div>
     {project_table}
+  </section>
+
+  <section>
+    <h2>📐 Score Coverage</h2>
+    {coverage_section}
   </section>
 
   <section>
