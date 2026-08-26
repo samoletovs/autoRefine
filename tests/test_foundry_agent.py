@@ -11,7 +11,11 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
-from azure.core.exceptions import HttpResponseError
+from azure.core.exceptions import (
+    HttpResponseError,
+    ServiceRequestError,
+    ServiceResponseError,
+)
 
 from agent import foundry_agent
 from agent.config import ProjectConfig
@@ -239,6 +243,118 @@ def test_create_agent_still_works_when_client_cannot_list(
     monkeypatch.setattr(foundry_agent, "FunctionTool", FakeFunctionTool)
 
     assert foundry_agent.create_agent(FakeClient(), mode="plan") == "agent-1"
+
+
+class TestSweepFailsOpen:
+    """Cleanup must never destroy the work the run came to do.
+
+    ``ServiceRequestError`` and ``ServiceResponseError`` are what azure-core
+    raises for a connection reset, a DNS failure or a read timeout. They are
+    *siblings* of ``HttpResponseError`` under ``AzureError``, not subclasses, so
+    a sweep that caught only ``HttpResponseError`` let a transient network blip
+    during housekeeping abort agent creation and take the whole run with it.
+    """
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            ServiceRequestError("connection reset by peer"),
+            ServiceResponseError("read timed out"),
+            HttpResponseError("500 from the service"),
+        ],
+        ids=["connection-reset", "read-timeout", "http-error"],
+    )
+    def test_listing_failure_is_swallowed(self, error: Exception) -> None:
+        client = SimpleNamespace()
+        with patch.object(client, "list_agents", side_effect=error, create=True):
+            assert foundry_agent.sweep_orphaned_agents(client) == 0
+
+    @pytest.mark.parametrize(
+        "error",
+        [ServiceRequestError("connection reset"), ServiceResponseError("timeout")],
+        ids=["connection-reset", "read-timeout"],
+    )
+    def test_transient_network_error_does_not_block_agent_creation(
+        self, error: Exception, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The regression: the run must still get its agent."""
+        monkeypatch.setattr(foundry_agent, "FunctionTool", FakeFunctionTool)
+
+        client = FakeSweepClient([])
+        with patch.object(client, "list_agents", side_effect=error):
+            assert foundry_agent.create_agent(client, mode="plan") == "agent-new"
+
+    def test_delete_failure_is_swallowed_and_the_sweep_continues(self) -> None:
+        client = FakeSweepClient(
+            [
+                _agent("autorefine", "unreachable", timedelta(days=2)),
+                _agent("autorefine", "deletable", timedelta(days=2)),
+            ]
+        )
+        real_delete = client.delete_agent
+
+        def flaky(agent_id: str) -> None:
+            if agent_id == "unreachable":
+                raise ServiceRequestError("connection reset")
+            real_delete(agent_id)
+
+        with patch.object(client, "delete_agent", side_effect=flaky):
+            assert foundry_agent.sweep_orphaned_agents(client) == 1
+        assert client.deleted == ["deletable"]
+
+    def test_unexpected_error_still_does_not_block_agent_creation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The client is generated; a malformed response can raise anything."""
+        monkeypatch.setattr(foundry_agent, "FunctionTool", FakeFunctionTool)
+
+        client = FakeSweepClient([])
+        with patch.object(client, "list_agents", side_effect=RuntimeError("bad payload")):
+            assert foundry_agent.create_agent(client, mode="plan") == "agent-new"
+
+
+class TestSweepTimestampHandling:
+    """A single odd record must not abort the sweep or the run."""
+
+    @staticmethod
+    def _naive(name: str, agent_id: str, age: timedelta) -> SimpleNamespace:
+        """An agent whose ``created_at`` lost its tzinfo, as a generated client can."""
+        record = _agent(name, agent_id, age)
+        record.created_at = record.created_at.replace(tzinfo=None)
+        return record
+
+    def test_naive_created_at_is_read_as_utc_not_a_crash(self) -> None:
+        """Comparing naive against the aware cutoff used to raise TypeError."""
+        client = FakeSweepClient([self._naive("autorefine", "naive-stale", timedelta(days=2))])
+
+        assert foundry_agent.sweep_orphaned_agents(client) == 1
+        assert client.deleted == ["naive-stale"]
+
+    def test_naive_but_recent_agent_is_still_protected_by_the_age_gate(self) -> None:
+        """Normalising must not turn a live agent into a sweepable one."""
+        client = FakeSweepClient([self._naive("autorefine", "naive-live", timedelta(minutes=5))])
+
+        assert foundry_agent.sweep_orphaned_agents(client) == 0
+        assert client.deleted == []
+
+    def test_record_without_a_name_attribute_is_skipped(self) -> None:
+        client = FakeSweepClient([SimpleNamespace(id="nameless", created_at=None)])
+
+        assert foundry_agent.sweep_orphaned_agents(client) == 0
+        assert client.deleted == []
+
+    def test_age_gate_still_spares_other_projects_agents(self) -> None:
+        """AGENTS.md: atlas-* and lab-memory share the project and are persistent."""
+        client = FakeSweepClient(
+            [
+                _agent("atlas-teacher", "other", timedelta(days=90)),
+                _agent("lab-memory", "memory", timedelta(days=90)),
+                _agent("autorefine", "ours", timedelta(days=2)),
+            ]
+        )
+
+        assert foundry_agent.sweep_orphaned_agents(client) == 1
+        assert client.deleted == ["ours"]
 
 
 def test_tool_definition_stubs_return_empty_string() -> None:
