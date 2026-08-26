@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 from unittest.mock import patch
 
 import pytest
 
 from agent.dashboard import (
+    _coverage_colour,
     _health_colour,
     _render_cost_section,
     _render_feature_suggestions,
     _render_project_table,
+    _render_quality_coverage,
     _render_url_health,
     render_html_dashboard,
 )
@@ -83,6 +86,95 @@ def test_render_project_table_missing_score() -> None:
     html = _render_project_table(github_data, {})
     assert "unknown-repo" in html
     assert "score-unknown" in html
+
+
+# ── _render_quality_coverage ───────────────────────────────────────────────
+
+
+def _evaluation(project: str, score: int, measured: list[str], skipped: dict[str, str]) -> dict:
+    """One ``main.evaluate_project`` report, shaped as the dashboard receives it."""
+    dimensions = [{"dimension": d, "measured": True, "skip_reason": None, "detail": ""} for d in measured]
+    dimensions += [
+        {"dimension": d, "measured": False, "skip_reason": reason, "detail": ""}
+        for d, reason in skipped.items()
+    ]
+    return {
+        "project": project,
+        "score": score,
+        "coverage": {
+            "measured": len(measured),
+            "total": len(dimensions),
+            "summary": f"{len(measured)}/{len(dimensions)} measured",
+            "dimensions": dimensions,
+        },
+    }
+
+
+def test_render_quality_coverage_empty() -> None:
+    assert "No evaluation coverage" in _render_quality_coverage([])
+
+
+def test_render_quality_coverage_shows_the_denominator_beside_the_score() -> None:
+    """A 100/100 built on one dimension out of six must not read as clean."""
+    html = _render_quality_coverage(
+        [
+            _evaluation(
+                "silent",
+                100,
+                measured=["metadata"],
+                skipped={
+                    "tests": "not-declared",
+                    "ci-cd": "not-declared",
+                    "security": "not-applicable",
+                    "deps": "not-applicable",
+                    "i18n": "not-declared",
+                },
+            )
+        ]
+    )
+
+    assert "silent" in html
+    assert "100/100" in html
+    assert ">1/6<" in html
+    assert "tests (not-declared)" in html
+    assert "score-red" in html  # 1 of 6 is not a green
+
+
+def test_render_quality_coverage_full_coverage_is_green() -> None:
+    html = _render_quality_coverage(
+        [_evaluation("honest", 70, measured=["metadata", "tests", "ci-cd"], skipped={})]
+    )
+    assert "score-green" in html
+    assert ">3/3<" in html
+    assert "none" in html  # nothing skipped
+
+
+def test_render_quality_coverage_tolerates_missing_coverage_key() -> None:
+    """Older reports carry a score and no coverage; they must still render."""
+    html = _render_quality_coverage([{"project": "legacy", "score": 88}])
+    assert "legacy" in html
+    assert ">0/0<" in html
+    assert "score-unknown" in html
+
+
+def test_render_quality_coverage_skips_non_dict_entries() -> None:
+    html = _render_quality_coverage(["not a report", {"project": "ok", "score": 1}])
+    assert "ok" in html
+    assert "not a report" not in html
+
+
+def test_render_quality_coverage_escapes_project_names() -> None:
+    html = _render_quality_coverage([{"project": "<script>x</script>", "score": 50}])
+    assert "<script>" not in html
+    assert "&lt;script&gt;" in html
+
+
+@pytest.mark.parametrize(
+    "measured,total,expected",
+    [(6, 6, "score-green"), (3, 6, "score-yellow"), (1, 6, "score-red"), (0, 0, "score-unknown")],
+)
+def test_coverage_colour(measured: int, total: int, expected: str) -> None:
+    assert _coverage_colour(measured, total) == expected
 
 
 # ── _render_cost_section ───────────────────────────────────────────────────
@@ -462,6 +554,33 @@ def test_render_html_dashboard_improvement_suggestions_empty_by_default() -> Non
     assert "No improvement suggestions" in html
 
 
+def test_render_html_dashboard_includes_score_coverage_section() -> None:
+    analysis_with_coverage: dict[str, Any] = {
+        **_ANALYSIS,
+        "quality_coverage": [
+            _evaluation(
+                "silent",
+                100,
+                measured=["metadata"],
+                skipped={"tests": "not-declared", "deps": "not-applicable"},
+            )
+        ],
+    }
+    html = render_html_dashboard(_GITHUB_DATA, _COST_DATA, analysis_with_coverage)
+
+    assert "Score Coverage" in html
+    assert "100/100" in html
+    assert ">1/3<" in html
+    assert "tests (not-declared)" in html
+
+
+def test_render_html_dashboard_score_coverage_empty_by_default() -> None:
+    """No evaluation data must not crash the page — it says so instead."""
+    html = render_html_dashboard(_GITHUB_DATA, _COST_DATA, _ANALYSIS)
+    assert "Score Coverage" in html
+    assert "No evaluation coverage" in html
+
+
 def test_render_html_dashboard_meta_shows_refresh_interval() -> None:
     html = render_html_dashboard(_GITHUB_DATA, _COST_DATA, _ANALYSIS, refresh_seconds=120)
     assert "auto-refresh every 120s" in html
@@ -551,3 +670,109 @@ def test_run_dashboard_mode_writes_html_file(
     content = open(output_file, encoding="utf-8").read()
     assert "<!DOCTYPE html>" in content
     assert "NauroLabs" in content
+
+
+def _dashboard_patches(analysis: dict[str, Any]):
+    """The health-scan pipeline stubs shared by the run_dashboard_mode tests."""
+    return (
+        patch("agent.health_scan.scan_github", return_value={"era": {"ci_status": "success"}}),
+        patch(
+            "agent.health_scan.scan_azure_costs",
+            return_value={"total": 5, "projected": 20, "budget": 150, "remaining": 145,
+                          "by_resource_group": {}},
+        ),
+        patch("agent.health_scan.scan_app_insights", return_value={}),
+        patch("agent.health_scan.check_deployed_urls", return_value={}),
+        patch("agent.health_scan.analyze_with_ai", return_value=analysis),
+        patch("builtins.print"),
+    )
+
+
+def _run_dashboard(output_file: str, report_path: str | None) -> str:
+    analysis: dict[str, Any] = {
+        "health_scores": {}, "alerts": [], "recommendations": [],
+        "focus_project": "", "issues_to_create": [],
+    }
+    from contextlib import ExitStack
+
+    from agent.main import run_dashboard_mode
+
+    with ExitStack() as stack:
+        for patcher in _dashboard_patches(analysis):
+            stack.enter_context(patcher)
+        run_dashboard_mode(["samoletovs/era"], output=output_file, report_path=report_path)
+
+    return open(output_file, encoding="utf-8").read()
+
+
+def test_run_dashboard_mode_fills_coverage_from_an_evaluate_report(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wiring: without this the Score Coverage section could never populate."""
+    monkeypatch.setenv("GH_TOKEN", "fake-token")
+
+    report = tmp_path / "report.json"
+    report.write_text(
+        json.dumps(
+            _evaluation("era", 100, measured=["metadata"], skipped={"tests": "not-declared"}),
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    content = _run_dashboard(str(tmp_path / "out.html"), str(report))
+
+    assert "Score Coverage" in content
+    assert "100/100" in content
+    assert ">1/2<" in content
+    assert "tests (not-declared)" in content
+
+
+def test_run_dashboard_mode_without_a_report_renders_an_empty_section(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GH_TOKEN", "fake-token")
+
+    content = _run_dashboard(str(tmp_path / "out.html"), None)
+
+    assert "Score Coverage" in content
+    assert "No evaluation coverage" in content
+
+
+def test_run_dashboard_mode_survives_a_missing_report(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crashed evaluate run leaves no file; that costs a section, not the page."""
+    monkeypatch.setenv("GH_TOKEN", "fake-token")
+
+    content = _run_dashboard(str(tmp_path / "out.html"), str(tmp_path / "absent.json"))
+
+    assert "<!DOCTYPE html>" in content
+    assert "No evaluation coverage" in content
+
+
+def test_load_quality_coverage_reads_every_evaluation_object(tmp_path) -> None:
+    from agent.main import load_quality_coverage
+
+    report = tmp_path / "report.json"
+    report.write_text(
+        "\n".join(
+            json.dumps(o, indent=2)
+            for o in (
+                _evaluation("a", 100, measured=["metadata"], skipped={"tests": "not-declared"}),
+                _evaluation("b", 70, measured=["metadata", "tests"], skipped={}),
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    objects = load_quality_coverage(str(report))
+
+    assert [o["project"] for o in objects] == ["a", "b"]
+    assert objects[0]["coverage"]["summary"] == "1/2 measured"
+
+
+def test_load_quality_coverage_returns_empty_for_a_missing_file(tmp_path) -> None:
+    from agent.main import load_quality_coverage
+
+    assert load_quality_coverage(str(tmp_path / "nope.json")) == []

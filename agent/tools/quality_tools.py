@@ -1,9 +1,23 @@
-"""Quality tools — deterministic technical quality checks."""
+"""Quality tools — deterministic technical quality checks.
+
+Each check reports two independent things, and conflating them is what made the
+0-100 score dishonest: *findings* (what is wrong) and *coverage* (whether the
+check ran at all). Most checks are gated on the project's self-declared
+``project.yaml`` ``quality:`` list or on a stack artefact such as
+``package.json``, so "no findings" has always meant either "clean" or "never
+looked", with no way to tell which. A project that declares nothing scores
+100/100.
+
+:class:`DimensionResult` separates the two. :func:`run_quality_checks` keeps its
+old findings-only contract; :func:`run_quality_checks_with_coverage` returns the
+denominator alongside it. No weight, finding or score changes as a result —
+this makes the gap measurable, it does not close it.
+"""
 
 import json
 import logging
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from agent.config import ProjectConfig
@@ -17,6 +31,19 @@ REQUIRED_SECURITY_HEADERS = {
     "Strict-Transport-Security": "max-age=31536000",
 }
 
+# Why a dimension produced no findings.
+#
+# Most checks here are gated: they early-return unless the project's own
+# `project.yaml` lists the trait, or unless the stack happens to carry the file
+# they read. An empty finding list therefore means one of two opposite things —
+# "we looked and it was fine" or "we never looked" — and the 0-100 score cannot
+# tell them apart, because both deduct nothing. A project that declares nothing
+# scores 100 for it. These reasons are what make the difference legible, and
+# they change no finding and no score: they only say what the number covers.
+SKIP_NOT_DECLARED = "not-declared"
+SKIP_NOT_APPLICABLE = "not-applicable"
+SKIP_TOOLING_UNAVAILABLE = "tooling-unavailable"
+
 
 @dataclass
 class QualityFinding:
@@ -29,12 +56,89 @@ class QualityFinding:
     fixable: bool = False  # can autoRefine fix this automatically?
 
 
-def check_tests(project_dir: Path, config: ProjectConfig) -> list[QualityFinding]:
-    """Check if the project has tests."""
+@dataclass
+class DimensionResult:
+    """The outcome of one quality dimension — including "did not run".
+
+    ``measured`` is derived from ``skip_reason`` rather than stored beside it,
+    so the two can never drift into disagreeing about whether the check ran.
+    """
+
+    dimension: str  # metadata, tests, ci-cd, security, deps, i18n
+    findings: list[QualityFinding] = field(default_factory=list)
+    skip_reason: str | None = None  # one of the SKIP_* constants
+    detail: str = ""  # human-readable, shown next to the score
+
+    @property
+    def measured(self) -> bool:
+        """True when the check actually inspected the project."""
+        return self.skip_reason is None
+
+
+@dataclass
+class QualityCoverage:
+    """Which dimensions the score is built from, and why the rest are absent.
+
+    This is the denominator the 0-100 score has always been missing. It carries
+    no weight and never alters a finding — reporting only.
+    """
+
+    results: list[DimensionResult] = field(default_factory=list)
+
+    @property
+    def total(self) -> int:
+        return len(self.results)
+
+    @property
+    def measured(self) -> list[str]:
+        return [r.dimension for r in self.results if r.measured]
+
+    @property
+    def skipped(self) -> list[str]:
+        return [r.dimension for r in self.results if not r.measured]
+
+    def summary(self) -> str:
+        """A terse "2/6 measured" for Telegram, where every character costs."""
+        return f"{len(self.measured)}/{self.total} measured"
+
+    def as_dict(self) -> dict[str, object]:
+        """JSON-serialisable form for the evaluation report."""
+        return {
+            "measured": len(self.measured),
+            "total": self.total,
+            "summary": self.summary(),
+            "dimensions": [
+                {
+                    "dimension": r.dimension,
+                    "measured": r.measured,
+                    "skip_reason": r.skip_reason,
+                    "detail": r.detail,
+                }
+                for r in self.results
+            ],
+        }
+
+
+def _measured(dimension: str, findings: list[QualityFinding]) -> DimensionResult:
+    """A dimension that ran. An empty list here genuinely means "clean"."""
+    return DimensionResult(dimension=dimension, findings=findings)
+
+
+def _skipped(dimension: str, reason: str, detail: str) -> DimensionResult:
+    """A dimension that never ran. It contributes no findings *and* no assurance."""
+    return DimensionResult(dimension=dimension, skip_reason=reason, detail=detail)
+
+
+def measure_tests(project_dir: Path, config: ProjectConfig) -> DimensionResult:
+    """Check if the project has tests — only where it claims to have them."""
     findings: list[QualityFinding] = []
 
     if "tests" not in config.quality:
-        return findings  # project doesn't claim to have tests
+        return _skipped(
+            "tests",
+            SKIP_NOT_DECLARED,
+            "'tests' not listed in project.yaml quality:",
+        )
 
     test_dirs = [
         project_dir / "tests",
@@ -53,15 +157,24 @@ def check_tests(project_dir: Path, config: ProjectConfig) -> list[QualityFinding
             weight=20,
         ))
 
-    return findings
+    return _measured("tests", findings)
 
 
-def check_ci_cd(project_dir: Path, config: ProjectConfig) -> list[QualityFinding]:
+def check_tests(project_dir: Path, config: ProjectConfig) -> list[QualityFinding]:
+    """Findings-only view of :func:`measure_tests`."""
+    return measure_tests(project_dir, config).findings
+
+
+def measure_ci_cd(project_dir: Path, config: ProjectConfig) -> DimensionResult:
     """Check CI/CD pipeline presence."""
     findings: list[QualityFinding] = []
 
     if "ci-cd" not in config.quality:
-        return findings
+        return _skipped(
+            "ci-cd",
+            SKIP_NOT_DECLARED,
+            "'ci-cd' not listed in project.yaml quality:",
+        )
 
     workflows = project_dir / ".github" / "workflows"
     if not workflows.exists() or not list(workflows.glob("*.yml")):
@@ -72,16 +185,25 @@ def check_ci_cd(project_dir: Path, config: ProjectConfig) -> list[QualityFinding
             weight=10,
         ))
 
-    return findings
+    return _measured("ci-cd", findings)
 
 
-def check_security_headers(project_dir: Path, _config: ProjectConfig) -> list[QualityFinding]:
+def check_ci_cd(project_dir: Path, config: ProjectConfig) -> list[QualityFinding]:
+    """Findings-only view of :func:`measure_ci_cd`."""
+    return measure_ci_cd(project_dir, config).findings
+
+
+def measure_security_headers(project_dir: Path, _config: ProjectConfig) -> DimensionResult:
     """Check SWA security headers."""
     findings: list[QualityFinding] = []
     swa_config = project_dir / "staticwebapp.config.json"
 
     if not swa_config.exists():
-        return findings
+        return _skipped(
+            "security",
+            SKIP_NOT_APPLICABLE,
+            "no staticwebapp.config.json — headers are not this project's to set",
+        )
 
     try:
         data = json.loads(swa_config.read_text(encoding="utf-8"))
@@ -92,7 +214,7 @@ def check_security_headers(project_dir: Path, _config: ProjectConfig) -> list[Qu
             priority="P0",
             weight=20,
         ))
-        return findings
+        return _measured("security", findings)
 
     headers = data.get("globalHeaders", {})
     missing = [h for h in REQUIRED_SECURITY_HEADERS if h not in headers]
@@ -106,16 +228,25 @@ def check_security_headers(project_dir: Path, _config: ProjectConfig) -> list[Qu
             fixable=True,
         ))
 
-    return findings
+    return _measured("security", findings)
 
 
-def check_dependencies(project_dir: Path, _config: ProjectConfig) -> list[QualityFinding]:
+def check_security_headers(project_dir: Path, _config: ProjectConfig) -> list[QualityFinding]:
+    """Findings-only view of :func:`measure_security_headers`."""
+    return measure_security_headers(project_dir, _config).findings
+
+
+def measure_dependencies(project_dir: Path, _config: ProjectConfig) -> DimensionResult:
     """Check for outdated or vulnerable dependencies."""
     findings: list[QualityFinding] = []
     pkg_json = project_dir / "package.json"
 
     if not pkg_json.exists():
-        return findings
+        return _skipped(
+            "deps",
+            SKIP_NOT_APPLICABLE,
+            "no package.json — nothing for npm audit to read",
+        )
 
     # Check for npm audit vulnerabilities
     try:
@@ -127,34 +258,48 @@ def check_dependencies(project_dir: Path, _config: ProjectConfig) -> list[Qualit
             timeout=120,
         )
         audit = json.loads(result.stdout)
-        vulns = audit.get("metadata", {}).get("vulnerabilities", {})
-        critical = vulns.get("critical", 0)
-        high = vulns.get("high", 0)
+    except (json.JSONDecodeError, FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        # npm missing from the runner, or the audit timed out. The old code
+        # swallowed this and returned no findings, which reads downstream as a
+        # clean dependency tree. It is not one — nothing was ever audited.
+        log.debug("npm audit did not complete in %s: %s", project_dir, exc)
+        return _skipped(
+            "deps",
+            SKIP_TOOLING_UNAVAILABLE,
+            f"npm audit did not complete ({type(exc).__name__})",
+        )
 
-        if critical > 0:
-            findings.append(QualityFinding(
-                category="deps",
-                description=f"{critical} critical npm vulnerabilities",
-                priority="P0",
-                weight=20,
-                fixable=True,
-            ))
-        elif high > 0:
-            findings.append(QualityFinding(
-                category="deps",
-                description=f"{high} high npm vulnerabilities",
-                priority="P1",
-                weight=10,
-                fixable=True,
-            ))
-    except (json.JSONDecodeError, FileNotFoundError, subprocess.TimeoutExpired):
-        pass
+    vulns = audit.get("metadata", {}).get("vulnerabilities", {})
+    critical = vulns.get("critical", 0)
+    high = vulns.get("high", 0)
 
-    return findings
+    if critical > 0:
+        findings.append(QualityFinding(
+            category="deps",
+            description=f"{critical} critical npm vulnerabilities",
+            priority="P0",
+            weight=20,
+            fixable=True,
+        ))
+    elif high > 0:
+        findings.append(QualityFinding(
+            category="deps",
+            description=f"{high} high npm vulnerabilities",
+            priority="P1",
+            weight=10,
+            fixable=True,
+        ))
+
+    return _measured("deps", findings)
 
 
-def check_project_yaml(project_dir: Path, _config: ProjectConfig) -> list[QualityFinding]:
-    """Check project.yaml completeness."""
+def check_dependencies(project_dir: Path, _config: ProjectConfig) -> list[QualityFinding]:
+    """Findings-only view of :func:`measure_dependencies`."""
+    return measure_dependencies(project_dir, _config).findings
+
+
+def measure_project_yaml(project_dir: Path, _config: ProjectConfig) -> DimensionResult:
+    """Check project.yaml completeness. The one check that always runs."""
     findings: list[QualityFinding] = []
     yaml_path = project_dir / "project.yaml"
 
@@ -165,7 +310,7 @@ def check_project_yaml(project_dir: Path, _config: ProjectConfig) -> list[Qualit
             priority="P0",
             weight=25,
         ))
-        return findings
+        return _measured("metadata", findings)
 
     if not _config.purpose:
         findings.append(QualityFinding(
@@ -191,15 +336,24 @@ def check_project_yaml(project_dir: Path, _config: ProjectConfig) -> list[Qualit
             weight=5,
         ))
 
-    return findings
+    return _measured("metadata", findings)
 
 
-def check_i18n(project_dir: Path, config: ProjectConfig) -> list[QualityFinding]:
+def check_project_yaml(project_dir: Path, _config: ProjectConfig) -> list[QualityFinding]:
+    """Findings-only view of :func:`measure_project_yaml`."""
+    return measure_project_yaml(project_dir, _config).findings
+
+
+def measure_i18n(project_dir: Path, config: ProjectConfig) -> DimensionResult:
     """Check internationalization if declared."""
     findings: list[QualityFinding] = []
 
     if "i18n" not in config.quality:
-        return findings
+        return _skipped(
+            "i18n",
+            SKIP_NOT_DECLARED,
+            "'i18n' not listed in project.yaml quality:",
+        )
 
     # Look for i18n config files / directories (standard layouts)
     i18n_indicators = [
@@ -257,23 +411,57 @@ def check_i18n(project_dir: Path, config: ProjectConfig) -> list[QualityFinding]
             weight=5,
         ))
 
-    return findings
+    return _measured("i18n", findings)
 
 
-def run_quality_checks(project_dir: str, config: ProjectConfig) -> list[QualityFinding]:
-    """Run all quality checks on a project."""
+def check_i18n(project_dir: Path, config: ProjectConfig) -> list[QualityFinding]:
+    """Findings-only view of :func:`measure_i18n`."""
+    return measure_i18n(project_dir, config).findings
+
+
+# Every dimension the score is built from, in report order. Adding a check here
+# is what puts it in the denominator; a check that is not listed is invisible to
+# both the findings and the coverage, which is the failure mode this whole file
+# now exists to make impossible.
+_MEASURERS = (
+    measure_project_yaml,
+    measure_tests,
+    measure_ci_cd,
+    measure_security_headers,
+    measure_dependencies,
+    measure_i18n,
+)
+
+
+def run_quality_checks_with_coverage(
+    project_dir: str, config: ProjectConfig
+) -> tuple[list[QualityFinding], QualityCoverage]:
+    """Run all quality checks, returning findings *and* what they cover.
+
+    The findings half is byte-identical to what :func:`run_quality_checks` has
+    always returned — same checks, same order, same weights, same score. The
+    coverage half is new and purely descriptive: it says which of those checks
+    actually looked at anything.
+    """
     path = Path(project_dir)
-    findings: list[QualityFinding] = []
+    results = [measure(path, config) for measure in _MEASURERS]
 
-    findings.extend(check_project_yaml(path, config))
-    findings.extend(check_tests(path, config))
-    findings.extend(check_ci_cd(path, config))
-    findings.extend(check_security_headers(path, config))
-    findings.extend(check_dependencies(path, config))
-    findings.extend(check_i18n(path, config))
+    findings = [f for result in results for f in result.findings]
 
-    # Sort by priority
+    # Sort by priority. `list.sort` is stable, so findings of equal priority
+    # keep the dimension order above — the order callers already depend on.
     priority_order = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
     findings.sort(key=lambda f: priority_order.get(f.priority, 9))
 
+    return findings, QualityCoverage(results=results)
+
+
+def run_quality_checks(project_dir: str, config: ProjectConfig) -> list[QualityFinding]:
+    """Run all quality checks on a project.
+
+    Unchanged contract: priority-sorted findings, nothing else. Callers that
+    want to know what the score covers should use
+    :func:`run_quality_checks_with_coverage`.
+    """
+    findings, _coverage = run_quality_checks_with_coverage(project_dir, config)
     return findings
