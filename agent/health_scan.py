@@ -546,6 +546,70 @@ def check_deployed_urls() -> dict[str, Any]:
 
 
 # ── AI Analysis ────────────────────────────────────────────────────────────
+def _int_env(name: str, default: int) -> int:
+    """Read an int from the environment, falling back on anything unusable.
+
+    This is read outside the request's ``try``, so a typo'd value raising here
+    would abort the whole scan — the failure mode this module is being hardened
+    against. A bad knob should cost the knob, not the run.
+    """
+    raw = os.environ.get(name, "")
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("%s=%r is not an integer — using %d", name, raw, default)
+        return default
+    if value <= 0:
+        log.warning("%s=%d must be positive — using %d", name, value, default)
+        return default
+    return value
+
+
+def _parse_analysis_reply(raw: str) -> dict[str, Any]:
+    """Extract the analysis object from a model reply.
+
+    Raises ValueError if no JSON object can be found, TypeError if the reply
+    parses to something that is not an object.
+
+    The reply is meant to be bare JSON, but models wrap it in a markdown fence
+    or top and tail it with prose regardless. The previous unwrapper was
+    ``raw.split("```")[1]``, which keeps only the span between the first two
+    fences — so a reply whose issue body contained its own code fence was
+    truncated mid-string and the whole sweep was discarded. That is not a
+    corner case: the system prompt asks for issue bodies about "recurring JS
+    exceptions with stack traces", which is exactly the content a model fences.
+
+    So: try the raw text first (the documented, common case, and free), then
+    fall back to the outermost ``{``…``}`` span. Taking the outermost braces is
+    what makes an inner fence harmless — anything nested, fences included, is
+    inside the span by construction.
+    """
+    raw = raw.strip()
+    if not raw:
+        raise ValueError("model returned an empty reply")
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        start, end = raw.find("{"), raw.rfind("}")
+        if start == -1 or end <= start:
+            raise ValueError(
+                f"no JSON object found in model reply: {raw[:120]!r}"
+            ) from None
+        parsed = json.loads(raw[start : end + 1])
+
+    if not isinstance(parsed, dict):
+        # Valid JSON, wrong shape. Every caller does analysis.get(...), so
+        # letting a list or a bare string through crashes the sweep in
+        # generate_report before the report is committed or Telegram is sent.
+        raise TypeError(
+            f"model returned {type(parsed).__name__}, expected a JSON object"
+        )
+    return parsed
+
+
 def analyze_with_ai(
     github_data: dict[str, Any],
     cost_data: dict[str, Any],
@@ -587,6 +651,18 @@ def analyze_with_ai(
     # bumped to ``gpt-5`` or another high-tier deployment per AGENTS.md
     # "Model strategy".
     model = os.environ.get("HEALTH_SCAN_MODEL", "gpt-4o-mini")
+
+    # Output ceiling. The old value of 2000 was not enough for a full-fleet
+    # answer: tokenised with o200k_base, the schema above for 24 repos with the
+    # 5 issues create_github_issues will actually file (each with a stack-trace
+    # body, as the prompt asks for) measures 2035 tokens compact and 2312
+    # indented. health_scores alone costs 676 for 24 repos. Because
+    # issues_to_create is emitted last, the overflow lands exactly on the part
+    # that files issues, and the failure is silent. max_tokens is a ceiling and
+    # not a reservation, so raising it bills nothing on the runs that don't need
+    # it — and output is the cheap side of this workload anyway (AGENTS.md: 425M
+    # input against 0.79M output).
+    max_tokens = _int_env("HEALTH_SCAN_MAX_TOKENS", 4000)
 
     system_prompt = """You are NauroLabs' automated health analyst. Analyze project data, Azure costs, app telemetry, and URL health.
 
@@ -639,15 +715,27 @@ Do NOT create issues for: subjective improvements, architecture decisions, or is
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_msg},
             ],
-            max_tokens=2000,
+            max_tokens=max_tokens,
             temperature=0.1,
         )
-        raw = (response.choices[0].message.content or "").strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        return json.loads(raw)
+        choice = response.choices[0]
+        raw = (choice.message.content or "").strip()
+
+        # A truncated reply is cut off mid-structure, so it fails to parse and
+        # the sweep files nothing. Say so plainly instead of reporting it as a
+        # generic JSON error — the cause and the fix are different.
+        if getattr(choice, "finish_reason", None) == "length":
+            log.error(
+                "AI analysis hit the %d-token output ceiling and was truncated "
+                "mid-reply — no issues will be filed this run. Raise "
+                "HEALTH_SCAN_MAX_TOKENS.",
+                max_tokens,
+            )
+            raise ValueError(
+                f"model reply truncated at max_tokens={max_tokens}"
+            )
+
+        return _parse_analysis_reply(raw)
     except Exception as e:
         log.error("AI analysis failed: %s", e)
         return {"error": str(e), "recommendations": [], "alerts": []}
