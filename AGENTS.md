@@ -120,6 +120,35 @@ take it per-project, not fleet-wide.
 priorities or ordering changed, and `tests/test_score_coverage.py` pins the
 scores so it stays that way.
 
+### Detection must be as honest as the gate
+
+The gate above decides *whether* a check runs. What it finds when it does run is
+a separate way to be wrong, and it was. `check_tests` looked only at four
+directories at the repository **root**. Measured across the 24 live manifest
+projects on 2026-08-26, four of the six repos it would have called untested had
+tests one level down — `app/tests/`, `harness/tests/`, a deep `smoke_test.py`, a
+bare `test.js` — and two of those had CI running the very suite it said did not
+exist. `glassBox` keeps `.test.ts` files beside its source and was carrying a
+false P0 for it.
+
+Detection now covers nested directories and file-naming conventions. Three
+guards keep it from swinging the other way, because a detector too permissive to
+fail is just another check that can never fire:
+
+- vendor and dot directories are pruned during the walk, not filtered after —
+  that is where a permissive glob finds its false comfort;
+- a test file must carry a code suffix, so `test_plan.md` proves nothing;
+- a runner config alone is not evidence — `pytest.ini` with no tests runs none.
+
+`_has_tests` is deliberately written as "the old rule, then additions". Every
+path the old rule accepted is accepted first and unchanged, which is what makes
+this a contained change: it can only ever *remove* a finding, never create one,
+so it cannot create an idea and cannot spend money. Verified across the fleet —
+exactly one score moved, `glassBox` 70 → 90, and upward.
+
+Fixtures in `tests/test_test_detection.py` are real layouts from real projects
+rather than invented ones.
+
 ### Advisory findings
 
 Some defects are real, worth scoring, and impossible to fix with a commit —
