@@ -84,46 +84,41 @@ def test_build_improvement_items_ignores_non_autorefine_ideas() -> None:
 
 # ── build_telegram_summary ────────────────────────────────────────────────
 def test_build_summary_minimal() -> None:
-    report = "# NauroLabs Health Report\n\n## Project Health\n"
-    msg = health_scan.build_telegram_summary(report, None, [])
+    msg = health_scan.build_telegram_summary({}, None, [])
     assert "NauroLabs Health Report" in msg
     assert "<b>" in msg  # HTML parse mode
 
 
 def test_build_summary_with_focus_and_alerts() -> None:
-    report = (
-        "# NauroLabs Health Report\n\n"
-        "## 🚨 Alerts\n"
-        "- alert one\n"
-        "- alert two\n"
-        "- alert three\n"
-        "- alert four\n\n"
-        "## 🎯 This Week: focus on era\n"
+    analysis: dict[str, Any] = {
+        "alerts": ["alert one", "alert two", "alert three", "alert four"],
+        "focus_project": "focus on era",
+    }
+    msg = health_scan.build_telegram_summary(
+        analysis, "reports/run/run-2026-05-17.md", ["url1"]
     )
-    msg = health_scan.build_telegram_summary(report, "reports/run/run-2026-05-17.md", ["url1"])
     assert "focus on era" in msg
     assert "alert one" in msg
     assert "alert four" not in msg  # capped at 3
+    assert "and 1 more" in msg  # but the cap is disclosed
     assert "Created 1 tech-debt issue" in msg
     assert 'href="https://github.com/samoletovs/nauroLabs-github' in msg
 
 
 def test_build_summary_no_issues_no_focus() -> None:
-    report = "# Report\n"
-    msg = health_scan.build_telegram_summary(report, None, [])
+    msg = health_scan.build_telegram_summary({}, None, [])
     assert "Created" not in msg
     assert "Full report" not in msg
 
 
 def test_build_summary_includes_azure_cost() -> None:
-    report = "# NauroLabs Health Report\n"
     cost_data: dict[str, Any] = {
         "total": 42.5,
         "projected": 80.0,
         "budget": 150.0,
         "remaining": 107.5,
     }
-    msg = health_scan.build_telegram_summary(report, None, [], cost_data=cost_data)
+    msg = health_scan.build_telegram_summary({}, None, [], cost_data=cost_data)
     assert "Azure" in msg
     assert "$42.5" in msg
     assert "projected $80.0" in msg
@@ -139,7 +134,7 @@ def test_build_summary_azure_cost_yellow_warning() -> None:
         "budget": 150.0,
         "remaining": 40.0,
     }
-    msg = health_scan.build_telegram_summary("# Report\n", None, [], cost_data=cost_data)
+    msg = health_scan.build_telegram_summary({}, None, [], cost_data=cost_data)
     assert "🟡" in msg  # 73 % used → yellow
 
 
@@ -150,7 +145,7 @@ def test_build_summary_azure_cost_over_budget() -> None:
         "budget": 150.0,
         "remaining": 20.0,
     }
-    msg = health_scan.build_telegram_summary("# Report\n", None, [], cost_data=cost_data)
+    msg = health_scan.build_telegram_summary({}, None, [], cost_data=cost_data)
     assert "🔴" in msg  # projected > budget
     assert "OVER BUDGET" in msg
 
@@ -162,20 +157,20 @@ def test_build_summary_azure_cost_negative_remaining() -> None:
         "budget": 150.0,
         "remaining": -10.0,
     }
-    msg = health_scan.build_telegram_summary("# Report\n", None, [], cost_data=cost_data)
+    msg = health_scan.build_telegram_summary({}, None, [], cost_data=cost_data)
     assert "OVER BUDGET" in msg
 
 
 def test_build_summary_azure_cost_error_skipped() -> None:
     """When cost_data signals an error (total=-1), no cost line is added."""
     cost_data: dict[str, Any] = {"error": "no creds", "total": -1}
-    msg = health_scan.build_telegram_summary("# Report\n", None, [], cost_data=cost_data)
+    msg = health_scan.build_telegram_summary({}, None, [], cost_data=cost_data)
     assert "Azure" not in msg
 
 
 def test_build_summary_cost_data_none_skipped() -> None:
     """When cost_data is None (default), no cost line is added."""
-    msg = health_scan.build_telegram_summary("# Report\n", None, [])
+    msg = health_scan.build_telegram_summary({}, None, [])
     assert "Azure" not in msg
 
 
