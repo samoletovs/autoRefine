@@ -17,8 +17,10 @@ this makes the gap measurable, it does not close it.
 import json
 import logging
 import subprocess
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from agent.config import ProjectConfig
 
@@ -54,6 +56,18 @@ class QualityFinding:
     priority: str  # P0, P1, P2, P3
     weight: int  # points deducted from score (P0=20, P1=10, P2=5, P3=2)
     fixable: bool = False  # can autoRefine fix this automatically?
+    # True when *no pull request can repair this* — the remedy is a repository
+    # setting, an org policy, or infrastructure outside the repo. Such a finding
+    # is reported and scored like any other but is withheld from the planning
+    # prompt, because an idea filed from it buys a 10-30 minute coding-agent run
+    # that is guaranteed to produce nothing. See `plannable_findings`.
+    #
+    # NOT the same as `fixable`, and confusing the two would be expensive.
+    # `fixable` means autoRefine's own deterministic fixer can repair it without
+    # an LLM; almost every finding is `fixable=False` yet perfectly repairable by
+    # a coding agent, so reusing that field here would silently starve the model
+    # of nearly every finding it currently sees.
+    advisory: bool = False
 
 
 @dataclass
@@ -117,6 +131,45 @@ class QualityCoverage:
                 for r in self.results
             ],
         }
+
+
+def is_advisory(finding: Mapping[str, Any]) -> bool:
+    """True when *no pull request can repair* this finding.
+
+    Operates on the plain-dict form because that is the shape a finding has by
+    the time it reaches the planning prompt (``evaluate_project`` flattens
+    :class:`QualityFinding` into the report).
+
+    Non-boolean values are ignored rather than coerced, and loudly. ``bool("false")``
+    is ``True``, and a single such typo would silently withhold every finding from
+    the model — a far worse failure than the one this guards against. Absent means
+    plannable, which is exactly today's behaviour for every existing finding.
+    """
+    value = finding.get("advisory", False)
+    if isinstance(value, bool):
+        return value
+    log.warning(
+        "Ignoring non-boolean 'advisory' value %r on finding %r — treating it as "
+        "plannable", value, finding.get("description", "?"),
+    )
+    return False
+
+
+def plannable_findings(findings: Iterable[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """The findings a coding agent could actually act on.
+
+    Advisory findings are dropped. They still score, still appear in the report,
+    and still reach humans through Telegram and the dashboard — they are withheld
+    only from the LLM, because an improvement generated from one becomes a GitHub
+    issue that, if approved, buys a 10-30 minute coding-agent run against a defect
+    no commit can fix.
+
+    Priority is deliberately *not* the mechanism. Filing is gated on
+    ``DEFAULT_IDEA_PRIORITIES = {"P0", "P1"}``, but a P2 finding still enters the
+    prompt and the model is free to answer it with a P1 improvement. Only removing
+    it from the prompt actually closes the path.
+    """
+    return [f for f in findings if not is_advisory(f)]
 
 
 def _measured(dimension: str, findings: list[QualityFinding]) -> DimensionResult:

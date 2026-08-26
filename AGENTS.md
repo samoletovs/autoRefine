@@ -120,6 +120,39 @@ take it per-project, not fleet-wide.
 priorities or ordering changed, and `tests/test_score_coverage.py` pins the
 scores so it stays that way.
 
+### Advisory findings
+
+Some defects are real, worth scoring, and impossible to fix with a commit —
+default-branch protection, org policy, infrastructure outside the repo. Left in
+the planning prompt they become improvements, improvements at P0/P1 become filed
+issues, and an approved issue becomes a 10-30 minute coding-agent run that is
+*guaranteed* to produce nothing, or worse a plausible workflow file that pretends
+to do the job. Near-certain no-op runs are the worst cost profile in the system.
+
+`QualityFinding.advisory` marks them. They score, they appear in the report, and
+they reach humans through Telegram and the dashboard — they are withheld only
+from the LLM, by `plannable_findings()` inside `build_plan_task`.
+
+Three things about that are load-bearing:
+
+- **The filter lives at the chokepoint, not at the call sites.** `build_plan_task`
+  is the one place a finding becomes prompt text, so it is the only place the
+  exclusion can be enforced rather than merely remembered. A test asserts it stays
+  the only such function; add a second prompt builder taking `findings` and that
+  test fails on purpose.
+- **Priority is not the mechanism.** Filing is gated on `DEFAULT_IDEA_PRIORITIES`,
+  but a P2 finding still enters the prompt and the model may answer it with a P1
+  improvement. Only removing it from the prompt closes the path.
+- **`advisory` is not `fixable`.** `fixable` means autoRefine's deterministic fixer
+  can repair it without an LLM; almost every finding is `fixable=False` yet
+  perfectly repairable by a coding agent. Reusing that field would starve the
+  model of nearly every finding it sees today.
+
+`advisory` governs the prompt only. Whether such a finding should also deduct
+score is a separate decision, deliberately left to whoever adds the first one:
+a weighted advisory finding moves the whole fleet's average for something no
+project can act on.
+
 ## Build & run
 
 ```bash
