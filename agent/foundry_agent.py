@@ -787,25 +787,7 @@ def create_agent(
         temperature=0.3,
     )
     log.info("Created agent: %s (mode=%s, model=%s)", agent.id, mode, deployment)
-    _remember_agent_mode(agent.id, mode)
     return agent.id
-
-
-# Mode is chosen at create_agent time but the cost row is written at run time,
-# and run_agent is only given an agent_id. Keying the mode by that id carries it
-# across without widening run_agent's signature, which main.py owns and calls.
-# Bounded because this is a cache, not a ledger: a sweep creates one agent per
-# project and the process then exits, so the cap is only a guard against an
-# unbounded map in some future long-lived host.
-_AGENT_MODES: dict[str, str] = {}
-_MAX_TRACKED_AGENT_MODES = 64
-
-
-def _remember_agent_mode(agent_id: str, mode: str) -> None:
-    """Record which mode an agent was built for, evicting the oldest entry."""
-    if len(_AGENT_MODES) >= _MAX_TRACKED_AGENT_MODES:
-        _AGENT_MODES.pop(next(iter(_AGENT_MODES)), None)
-    _AGENT_MODES[agent_id] = mode
 
 
 def _append_cost_row(
@@ -981,6 +963,8 @@ def run_agent(
     project_dir: Path,
     config: ProjectConfig,
     task: str,
+    *,
+    mode: str = "unknown",
 ) -> dict | None:
     """Run the agent with a task message. Returns the parsed plan or None.
 
@@ -990,6 +974,13 @@ def run_agent(
     :class:`FoundryRunAbortedError` rather than returning ``None`` — callers
     read ``None`` as "the model declined to plan" and retry it, which would
     pay for a spinning run two more times.
+
+    :param mode: What this run is for, recorded on the cost row so a round and
+        token distribution can be read per mode. This is the *run's* purpose,
+        not the agent's tool set: functional ideation builds a plan-mode agent
+        but is the daily sweep, and conflating the two would hide the thing
+        the rows exist to show. Defaults to ``"unknown"`` rather than guessing,
+        so a caller that says nothing is visible as such in the data.
     """
     max_tool_rounds = resolve_max_tool_rounds()
     stuck_repeats = resolve_stuck_repeats()
@@ -1156,7 +1147,7 @@ def run_agent(
         _append_cost_row(
             run,
             project=config.name,
-            mode=_AGENT_MODES.get(agent_id, "unknown"),
+            mode=mode,
             rounds=rounds,
             tool_calls=tool_calls,
             guard=guard_fired,

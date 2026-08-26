@@ -75,7 +75,7 @@ def test_refine_project_rolls_back_and_returns_false_on_incomplete(
 
     committed: list[str] = []
 
-    def fake_run_agent(_client, _agent_id, project_dir, _config, _task):
+    def fake_run_agent(_client, _agent_id, project_dir, _config, _task, **_kwargs):
         # The agent writes a file, then the run is cut short.
         (Path(project_dir) / "half_done.py").write_text("# partial\n", encoding="utf-8")
         raise FoundryRunIncompleteError("run-1", "max_prompt_tokens")
