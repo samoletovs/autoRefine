@@ -27,6 +27,14 @@ with tests + PRs, and can file idea memos.
    why it did not catch the second — so it is stated here, once, for all of them. The
    method survives; the number does not.
 
+   One exemption, because the rule read literally destroys things worth keeping: a
+   figure that records **why a past decision was taken**, and sizes nothing live, is a
+   fossil and may stay undated. `main.bicep`'s header cites ~43 min/day of Actions time
+   to explain why the job moved to Container Apps; that workflow is retired, so there is
+   no measurement left to re-run. Dating it would imply it can be refreshed, and deleting
+   it would destroy the only surviving record of the reason. The test is not whether a
+   number is old — they all are — but whether anyone can still *size* something on it.
+
 ## Model strategy
 
 autoRefine uses a **tiered model strategy** — cheap models for routine work,
