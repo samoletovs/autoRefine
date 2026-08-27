@@ -1,9 +1,18 @@
 #!/bin/sh
 # Entry point for the autoRefine evaluation job.
 #
-# The code is cloned at start-up rather than baked into an image: that keeps the job on a
+# The *code* is cloned at start-up rather than baked into an image: that keeps the job on a
 # public base image with no container registry to build, pay for, or keep in sync, and it
-# always runs whatever is on master. Cost is ~30s of clone plus pip install.
+# means agent/ really is whatever is on master. Cost is ~30s of clone plus pip install.
+#
+# This file is the exception, and the exception is the whole trap. main.bicep inlines it
+# with loadTextContent(), so production runs the copy captured by the last deployment:
+# editing this file requires a redeploy to take effect. Merging is not enough, and nothing
+# announces the gap, because from the outside nothing has gone wrong — the job simply keeps
+# running the older script. The cost-telemetry block at the bottom shipped that way in #12
+# and stayed inert, on a run that was otherwise executing new Python from master, and the
+# only symptom was a file that never appeared. Change anything below and redeploy
+# infrastructure/main.bicep.
 #
 # Every stage announces itself. Console-log ingestion is lossy, so these markers are what
 # tell us how far the job actually got when something goes wrong.
