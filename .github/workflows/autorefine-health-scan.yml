@@ -66,21 +66,31 @@ jobs:
       # autorefine-evaluate.yml — the AZURE_CREDENTIALS secret this used to read has
       # never existed. Still inert until AZURE_CLIENT_ID and AZURE_TENANT_ID are created.
       #
-      # This job is the riskier of the two under OIDC and has never run to prove
-      # otherwise (every run since AUTOREFINE_TIER went to 'critical' has been skipped).
-      # It needs three different token scopes — ARM for costs and management,
-      # api.loganalytics.io for telemetry, cognitiveservices for the AI analyst — and only the ARM one is cached by
-      # `az login`. Each of the others is a fresh request needing the federated token,
-      # which GitHub expires 5 minutes after this step (Azure/azure-cli#28708). The
-      # analyst call in particular runs after all the data gathering. If this workflow is
-      # ever ungated, expect to pre-warm those scopes here with
-      # `az account get-access-token --scope ... --output none` before trusting a run.
+      # This job needs three scopes and `az login` caches only one of them, so it is the
+      # riskier of the two under OIDC — and it has never run to prove otherwise (every
+      # run since AUTOREFINE_TIER went to 'critical' has been skipped). The analyst call
+      # in particular happens after all the data gathering, well past the 5 minutes
+      # GitHub's federated token lasts (Azure/azure-cli#28708). Pre-warmed below.
       - name: Azure login
         uses: azure/login@v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # See the matching step in autorefine-evaluate.yml for why this exists and why it
+      # uses `--resource` rather than `--scope`. The three here are ARM for Cost
+      # Management, api.loganalytics.io for App Insights telemetry, and cognitiveservices
+      # for the Azure OpenAI analyst — the scopes named in agent/health_scan.py. A
+      # service this job starts calling in future needs adding here too, and nothing
+      # checks that for you: the scope a client asks for is usually an SDK default
+      # rather than a string in our code, so it cannot be derived by reading the source.
+      - name: Pre-warm Azure token cache
+        run: |
+          for resource in https://management.azure.com https://api.loganalytics.io https://cognitiveservices.azure.com; do
+            az account get-access-token --resource "$resource" --output none \
+              || echo "::warning::Could not pre-warm $resource — a later token request may fail with AADSTS700024"
+          done
 
       - name: Run health scan
         env:

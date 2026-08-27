@@ -295,8 +295,10 @@ def test_azure_login_supplies_its_identity_inputs(
 # ARM token, so the *first* request for any other scope — the Foundry/AI scope the
 # agent needs — must land inside those 5 minutes or it fails with AADSTS700024.
 #
-# Both workflows currently put every slow step before the login, so the agent's
-# first token lands seconds after it. That ordering is now correctness, not taste.
+# The pre-warm step now takes those tokens up front, so the window has to survive
+# only until the step right after the login rather than until the agent's first
+# call. Both guards still matter: this one keeps the window short, and
+# ``test_azure_login_is_followed_by_a_prewarm`` keeps the pre-warm there at all.
 SLOW_SETUP_ACTIONS = ("actions/checkout", "actions/setup-python", "actions/setup-node")
 SLOW_SETUP_COMMANDS = ("pip install", "npm install", "npm ci", "apt-get install")
 
@@ -340,5 +342,60 @@ def test_no_slow_setup_runs_after_azure_login(path: Path) -> None:
         "5-minute federated-token window before the agent asks for its first "
         "non-ARM token (Azure/azure-cli#28708). Move these above the login:\n  "
         + "\n  ".join(offenders)
+    )
+
+
+@pytest.mark.parametrize("path", workflow_files(), ids=_ids(workflow_files()))
+def test_azure_login_is_followed_by_a_prewarm(path: Path) -> None:
+    """Every ``azure/login`` must be followed straight away by a token pre-warm.
+
+    Deleting the pre-warm looks harmless: the evaluate sweep would still pass,
+    because its agent starts seconds later and lands inside the window anyway.
+    It would keep passing until a dependency install got slower or a step moved,
+    and then fail as an Entra error deep inside a 43-minute run.
+
+    What this cannot check is whether the *list of resources* is complete. A
+    client's scope is usually an SDK default rather than a string in our source
+    — ``AgentsClient``'s ``https://ai.azure.com`` is not written down anywhere in
+    this repository — so a guard that tried to derive the list would be guessing,
+    and a guard that hard-coded it would just be the workflow again. Adding a new
+    Azure service means adding its resource by hand.
+    """
+    document = _load(path)
+    offenders: list[str] = []
+
+    for job_name, job in (document.get("jobs") or {}).items():
+        steps = (job or {}).get("steps") or []
+
+        for index, step in enumerate(steps):
+            uses = str((step or {}).get("uses") or "")
+            if uses.split("@", 1)[0].lower() != AZURE_LOGIN_ACTION:
+                continue
+
+            follower = steps[index + 1] if index + 1 < len(steps) else {}
+            script = (follower or {}).get("run")
+            script = script if isinstance(script, str) else ""
+            label = (step or {}).get("name") or f"step #{index + 1}"
+
+            if "get-access-token" not in script:
+                offenders.append(
+                    f"{job_name} / after '{label}': no pre-warm step follows the login"
+                )
+                continue
+            if "--output none" not in script:
+                offenders.append(
+                    f"{job_name} / after '{label}': pre-warm must pass '--output none', "
+                    "or it prints access tokens into the run log"
+                )
+            fails_open = "||" in script or (follower or {}).get("continue-on-error") is True
+            if not fails_open:
+                offenders.append(
+                    f"{job_name} / after '{label}': pre-warm can fail the job. It is a "
+                    "diagnostic; it must not kill the work it protects"
+                )
+
+    assert not offenders, (
+        f"{path.name} has an azure/login whose token pre-warm is missing or unsafe "
+        "(Azure/azure-cli#28708):\n  " + "\n  ".join(offenders)
     )
 
