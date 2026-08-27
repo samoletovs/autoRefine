@@ -10,6 +10,10 @@ on:
 
 permissions:
   contents: read
+  # Required by azure/login's OIDC flow, and by nothing else here. It only lets the job
+  # mint a GitHub-signed identity token for the "Azure login" step to exchange with
+  # Entra ID; it grants no additional access to this repository's contents or metadata.
+  id-token: write
 
 jobs:
   health-scan:
@@ -58,10 +62,25 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # OIDC, not a service-principal secret. See the matching step in
+      # autorefine-evaluate.yml — the AZURE_CREDENTIALS secret this used to read has
+      # never existed. Still inert until AZURE_CLIENT_ID and AZURE_TENANT_ID are created.
+      #
+      # This job is the riskier of the two under OIDC and has never run to prove
+      # otherwise (every run since AUTOREFINE_TIER went to 'critical' has been skipped).
+      # It needs three different token scopes — ARM for costs and management,
+      # api.loganalytics.io for telemetry, cognitiveservices for the AI analyst — and only the ARM one is cached by
+      # `az login`. Each of the others is a fresh request needing the federated token,
+      # which GitHub expires 5 minutes after this step (Azure/azure-cli#28708). The
+      # analyst call in particular runs after all the data gathering. If this workflow is
+      # ever ungated, expect to pre-warm those scopes here with
+      # `az account get-access-token --scope ... --output none` before trusting a run.
       - name: Azure login
         uses: azure/login@v3
         with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Run health scan
         env:
