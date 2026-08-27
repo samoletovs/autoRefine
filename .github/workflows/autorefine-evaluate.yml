@@ -5,13 +5,17 @@ on:
   # (infrastructure/main.bicep). This workflow averaged 43 min/run — ~1,744 Actions minutes
   # a month, by far the largest consumer across every repo.
   #
-  # Kept dispatch-only so a run can be triggered by hand from the GitHub UI — but note
-  # that this path does NOT currently work: the "Azure login" step below reads a
-  # repository secret named AZURE_CREDENTIALS which does not exist, so every dispatch
-  # fails there with "Ensure 'client-id' and 'tenant-id' are supplied" and the agent
-  # never starts. Making it work needs an auth decision a human has to take — either
-  # recreating that service-principal secret, or moving to OIDC federated credentials
-  # (client-id/tenant-id/subscription-id plus `permissions: id-token: write`).
+  # Kept dispatch-only so a run can be triggered by hand from the GitHub UI. That path
+  # was dead until now: the "Azure login" step read a repository secret named
+  # AZURE_CREDENTIALS which does not exist, so `creds:` resolved to empty, the action
+  # fell through to service-principal auth with nothing to use, and every dispatch died
+  # with "Ensure 'client-id' and 'tenant-id' are supplied" before the agent started.
+  #
+  # It now authenticates with OIDC federated credentials instead — no long-lived secret
+  # to rotate or leak. That needs `id-token: write` below, plus two repository secrets,
+  # AZURE_CLIENT_ID and AZURE_TENANT_ID, pointing at an Entra app whose federated
+  # credential trusts this repository. Until a human creates those two secrets the login
+  # step still fails, with the same message: this workflow is inert, not fixed.
   #
   # The scheduled Container Apps job is unaffected: it authenticates with a
   # system-assigned managed identity and needs no secret at all.
@@ -34,6 +38,10 @@ on:
 permissions:
   contents: read
   issues: write
+  # Required by azure/login's OIDC flow, and by nothing else here. It only lets the job
+  # mint a GitHub-signed identity token for the "Azure login" step to exchange with
+  # Entra ID; it grants no additional access to this repository's contents or metadata.
+  id-token: write
 
 # One sweep at a time. A run holds a Foundry agent open for ~43 min (AGENTS.md)
 # and re-reads every project in the manifest, so two dispatches at once buy two
@@ -90,10 +98,29 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # OIDC, not a service-principal secret. With no client-secret supplied, azure/login
+      # runs `az login --service-principal --federated-token <github-oidc-jwt>`, which
+      # leaves an authenticated Azure CLI on the runner. That CLI session is the whole
+      # handoff: the action exports no environment variables (there is no exportVariable
+      # call anywhere in Azure/login), so the Python below reaches Azure through
+      # DefaultAzureCredential's AzureCliCredential link, not EnvironmentCredential.
+      #
+      # Keep this step last before "Run autoRefine". GitHub's identity token expires 5
+      # minutes after it is minted and the Azure CLI cannot mint another
+      # (Azure/azure-cli#28708, still open). `az login` caches only an ARM token, so the
+      # agent's first request for the Foundry scope must land inside that window or it
+      # fails with AADSTS700024. It does today — the step runs seconds after this one,
+      # and the token it caches then lasts ~60 min against a ~43 min sweep. That is
+      # working headroom, not comfortable headroom: this job's timeout-minutes is 90, so
+      # a sweep that runs long can still outlive its token. If that starts happening,
+      # the documented fix is to pre-warm the scopes here with
+      # `az account get-access-token --scope ... --output none` immediately after login.
       - name: Azure login
         uses: azure/login@v3
         with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Run autoRefine
         env:

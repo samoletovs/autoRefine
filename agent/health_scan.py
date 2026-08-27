@@ -6,8 +6,11 @@ commits it to the governance repo, creates issues for critical findings,
 and sends a Telegram summary via agent.notify.
 
 Moved from agentMode/functions/nauro_bot.py (May 2026). Adapted for
-GitHub Actions auth: uses GH_TOKEN env var instead of Key Vault, relies
-on the `azure/login@v2` action (AZURE_CREDENTIALS) for DefaultAzureCredential.
+GitHub Actions auth: uses GH_TOKEN env var instead of Key Vault, and relies
+on `azure/login@v3` (OIDC federated credentials) leaving an authenticated
+Azure CLI on the runner, which DefaultAzureCredential reaches via its
+AzureCliCredential link. The action exports no environment variables, so
+EnvironmentCredential is not what satisfies these calls.
 """
 
 from __future__ import annotations
