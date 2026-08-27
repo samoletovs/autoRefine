@@ -56,6 +56,16 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
   }
   properties: {
     environmentId: cae.id
+    // Declared, not left to inference. `cae-agents` is a workload-profiles environment
+    // offering exactly one profile — Consumption — and all seven workloads in it run on
+    // that profile, this job included. Leaving the property out kept the deployed value
+    // out of the template, so `what-if` reported
+    //   properties.workloadProfileName: 'Consumption' -> null
+    // on every run: a permanent red herring sitting next to the one delta a deploy is
+    // actually for. Whether the RP would honour that null or re-default it is not worth
+    // resolving, because naming the profile the job already runs on is correct either
+    // way — and it is what makes a redeploy a true no-op apart from the script below.
+    workloadProfileName: 'Consumption'
     configuration: {
       triggerType: 'Schedule'
       // The run is one long sequential pass; a second concurrent copy would double-file the
@@ -114,6 +124,20 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
           ]
           command: ['/bin/sh', '-c']
           args: [
+            // BAKED AT DEPLOY TIME — the one thing here that is not read from master.
+            // loadTextContent inlines the file into the ARM template, so the job runs
+            // whatever copy the last deployment captured. Editing run-autorefine.sh and
+            // merging it changes nothing in production until this template is redeployed,
+            // and nothing reports that: no error, no failed run, no missing output that
+            // anyone is watching for.
+            //
+            // It has already happened once. The cost-telemetry block added in #12 sat
+            // merged and inert while the 06:00 job kept executing the pre-#12 script, and
+            // the only symptom was a file that never appeared in reports/cost.
+            //
+            // The Python is the opposite and that asymmetry is the trap: the script
+            // git-clones autoRefine at start-up, so agent/ really is whatever is on
+            // master. Only this one file is frozen.
             loadTextContent('run-autorefine.sh')
           ]
         }
