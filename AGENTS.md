@@ -17,6 +17,15 @@ with tests + PRs, and can file idea memos.
 6. **Cost discipline.** Default to `gpt-4o-mini` for the daily evaluate/health-scan
    passes (these run across 11 repos twice a day). Budget cap: €5/month on
    autoRefine's own consumption. See "Model strategy" below before bumping.
+7. **Every measured number in this file and in code comments has expired.** They are
+   observations with a date, not properties of the system. Quote one only with its date
+   and sample size attached, and re-measure before sizing anything on it. This has now
+   failed twice in place: the gate-widening count (see "What the score actually
+   measures") and the 116-minute sweep duration that sized `replicaTimeout` for months
+   after the real spread turned out to be 7.4–167.8 min (see "Sizing the job ceiling").
+   The shelf-life warning existed for the first of those and was scoped to it, which is
+   why it did not catch the second — so it is stated here, once, for all of them. The
+   method survives; the number does not.
 
 ## Model strategy
 
@@ -366,8 +375,47 @@ Two rules it must keep:
 Only the Foundry planning is gated. The deterministic evaluation still runs for every
 project, so scores and the Telegram summary continue to cover the whole fleet.
 
-## Why the PR-card sweep is a cron and not an event
+### Sizing the job ceiling
 
+`replicaTimeout` was 3h, sized on a single 116-minute sample whose comment described it as
+"3h rather than a snug fit". Eight days of real execution history (2026-08-20..27) read
+7.4 / 14.0 / 24.4 / 28.1 / 85.5 / 103.0 / 108.3 / 167.8 minutes — a 23× spread whose
+longest run sat at **93.2% of the ceiling**, which is a snug fit by any reading. It is now
+6h.
+
+**It is a backstop, not a prediction, so do not size it off the distribution.** The usual
+"measure before you pick a number" rule does not bind here because the errors are not
+symmetric. Too generous costs a few percent of a free grant on a day that never arrives:
+at 0.5 vCPU / 1Gi, burning the whole 6h is 10,800 vCPU-seconds and 21,600 GiB-seconds, 6.0%
+of each monthly grant, and a ceiling that is never reached bills nothing. Too tight throws
+away the sweep **and** leaks a Foundry agent, because a `replicaTimeout` kill is a hard kill
+that never reaches `main.py`'s `finally` (see "Foundry agent lifecycle").
+
+Three things that are easy to get wrong here:
+
+- **No maximum is documented.** Not in the jobs article, the quotas page, the ARM schema
+  (`int`, required, no range), or `az containerapp job create --help`. 21600 is accepted by
+  the RP — confirmed by `what-if` — but if you need a much larger value, verify it rather
+  than assuming the field is unbounded.
+- **The timeout bounds the whole execution, not each attempt.** "The `replicaTimeout`
+  setting takes precedence if it expires before all retries occur"
+  ([jobs, Advanced job configuration](https://learn.microsoft.com/azure/container-apps/jobs)).
+  So worst case is 6h total, not 6h × attempts — and `replicaRetryLimit: 1` only has room to
+  achieve anything when the ceiling is well clear of a normal run. Under the old 3h, a run
+  failing at 167.8 min left its retry 12 minutes.
+- **The round guards do not make this redundant.** `DEFAULT_MAX_TOOL_ROUNDS = 200` and
+  `DEFAULT_STUCK_REPEATS = 3` bound *iteration*, so a runaway tool loop is far less likely
+  than when 10800 was chosen. They do not bound *wall clock*: `run_agent` uses
+  `time.monotonic()` only to report `duration_s`, so a hang inside a single blocking call
+  advances no rounds and trips neither guard. Everything outside `run_agent` — clone, pip,
+  the per-project loop — is unguarded too. This ceiling is still the only wall-clock bound.
+
+Provisional, and subject to hard rule 7. Eight samples spanning the activity-gate change is
+two regimes rather than one distribution. The cost rows in `reports/cost` carry per-run
+`mode` and `rounds`, which will say whether a long run is many projects or a few slow ones —
+and that, not the ceiling, decides whether the gate is the thing to move.
+
+## Why the PR-card sweep is a cron and not an event
 `pr-ready-cards.yml` reads open PRs across every project in the workspace manifest.
 GitHub delivers `pull_request` and `check_suite` only to workflows in the repo where
 the event happened, so no trigger here can see them. Making it event-driven would mean
