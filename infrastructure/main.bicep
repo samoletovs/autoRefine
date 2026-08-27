@@ -154,7 +154,10 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'NAURO_CHAT_ID', value: nauroChatId }
             { name: 'FOUNDRY_PROJECT_ENDPOINT', value: foundryEndpoint }
             { name: 'AZURE_SUBSCRIPTION_ID', value: subscription().subscriptionId }
-            // Observe-first, mirroring the workflow it replaces: propose, never file.
+            // `cards`, NOT `propose`: this files each idea as a `needs-approval` memo and
+            // sends a Telegram approval card. It does file issues — nothing builds until a
+            // human taps 👍, which is where the observe-first guarantee actually lives.
+            // `propose` is the mode that files nothing; do not read the two as synonyms.
             { name: 'AUTOREFINE_FUNCTIONAL_MODE', value: 'cards' }
             { name: 'AUTOREFINE_TIER', value: 'high' }
           ]
