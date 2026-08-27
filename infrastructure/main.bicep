@@ -9,10 +9,14 @@
 // Python Functions runtime image cannot do. Reuses the existing `cae-agents` environment
 // rather than standing up another one.
 //
-// Cost: a full pass over all 20 projects measured 116 min. At 0.5 vCPU / 1Gi that is
-// ~106k of the 180k free vCPU-seconds and ~212k of the 360k free GiB-seconds per month.
-// Doubling either dimension would overrun the grant for no gain — the loop spends almost
-// all of that time blocked on Foundry responses, not computing.
+// Cost, measured 2026-08-20..27 over eight runs: 7.4 / 14.0 / 24.4 / 28.1 / 85.5 / 103.0 /
+// 108.3 / 167.8 minutes — a 23x spread, median ~57 min. At 0.5 vCPU / 1Gi and one run a
+// day that is roughly 61k of the 180k free vCPU-seconds and 121k of the 360k free
+// GiB-seconds per month, about a third of each grant. The figure this replaced was a
+// single 116-minute sample quoted as though it were a property; it read as 59% of both.
+// Doubling either dimension would still buy nothing — the loop spends almost all of that
+// time blocked on Foundry responses, not computing. Re-measure rather than quote: the
+// window spans the activity gate, so even this spread is two regimes, not one.
 
 targetScope = 'resourceGroup'
 
@@ -70,10 +74,42 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
       triggerType: 'Schedule'
       // The run is one long sequential pass; a second concurrent copy would double-file the
       // same idea cards, so retries are serial and overlap is not allowed.
-      // A full pass measured 116 min and the length moves with how many projects are due
-      // for a new idea card, so this is 3h rather than a snug fit — a timeout throws away
-      // the entire run, and an unused ceiling costs nothing on a job that scales to zero.
-      replicaTimeout: 10800
+      //
+      // 6h, raised from 3h on 2026-08-27. The old value was sized on a single 116-minute
+      // sample and its comment called 3h "rather than a snug fit". Eight days of real
+      // execution history say otherwise: 7.4, 14.0, 24.4, 28.1, 85.5, 103.0, 108.3 and
+      // 167.8 minutes. The longest run reached 93.2% of the 180-minute ceiling, which is a
+      // snug fit by any reading, and the comment's own two reasons — a timeout throws away
+      // the entire run, and an unused ceiling costs nothing on a job that scales to zero —
+      // both argue for a larger number, not that one.
+      //
+      // This is a backstop, not a prediction, so it is not sized off the distribution. It
+      // should sit far enough above any plausible run to catch only pathology, and the two
+      // errors are not symmetric: too generous costs a few percent of a free grant on a day
+      // that never comes, while too tight costs the whole sweep *and* leaks a Foundry agent,
+      // because a hard kill never reaches main.py's `finally` (see AGENTS.md, "Foundry agent
+      // lifecycle").
+      //
+      // Priced, so the next person can re-derive rather than trust: at 0.5 vCPU / 1Gi a run
+      // that burned the full ceiling costs 21,600 x 0.5 = 10,800 vCPU-seconds and 21,600
+      // GiB-seconds, which is 6.0% of the 180k free vCPU-seconds and 6.0% of the 360k free
+      // GiB-seconds for the month. A ceiling that is never reached bills nothing at all.
+      //
+      // It also bounds the whole execution rather than each attempt: "The replicaTimeout
+      // setting takes precedence if it expires before all retries occur"
+      // (learn.microsoft.com/azure/container-apps/jobs, "Advanced job configuration"). So
+      // the worst case is 6h total, not 6h per try — and the deliberate single retry below
+      // only has room to accomplish anything if the ceiling is well clear of a normal run.
+      // Under the old 3h a run failing at 167.8 min left the retry 12 minutes, which would
+      // have timed out having done nothing.
+      //
+      // Provisional. Eight samples spanning the activity-gate change is not a stable
+      // distribution — the two shortest are post-gate — and the cost rows now landing in
+      // reports/cost carry per-run mode and rounds, which will say whether a long run is
+      // many projects or a few slow ones. That decides whether this ceiling or the gate is
+      // the thing to move. Re-measure before quoting any number in this comment.
+      replicaTimeout: 21600
+      // Not raised with the ceiling, deliberately: a retry re-runs the entire sweep.
       replicaRetryLimit: 1
       scheduleTriggerConfig: {
         cronExpression: scheduleEnabled ? cronExpression : '0 0 31 2 *' // 31 Feb = never
