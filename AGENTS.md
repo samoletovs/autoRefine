@@ -341,6 +341,64 @@ the labels, and `closedByPullRequestsReferences(includeClosedPrs: true)`. There 
 deliberately no committed script, for the reason given under "What the score
 actually measures".
 
+### Why ideation is not grounded in failing CI
+
+Peer-reviewed work says a pure static scan is the weakest grounding available —
+[RLEF, ICML 2025](https://icml.cc/virtual/2025/poster/45358) and
+[arXiv:2604.10800](https://arxiv.org/html/2604.10800v1) both find that removing
+runtime validation raises error and unnecessary-repair rates. `build_plan_task`
+sees deterministic findings and `project.yaml`, and no runtime fact at all. So
+feeding it recent CI failures looks obviously right, and it was investigated
+properly on 2026-08-27. **Do not build it without re-running the measurement
+below, because the signal is empty.**
+
+The classifier works. Distinguishing "a test is failing" from "a workflow is
+misconfigured" is reliable from the Actions API in three layers, and this is the
+part worth keeping:
+
+- `conclusion == "startup_failure"` — the workflow never ran;
+- `name == path` — GitHub falls back to the file path when it cannot parse
+  `name:` from the YAML on that ref, which is what an unparseable workflow looks
+  like from outside;
+- otherwise fetch `/jobs` and read the failed *step* names, denying infra
+  (`deploy`, `login`, `auth`, `secret`, `token`, `checkout`, `install`) and
+  allowing code (`test`, `lint`, `typecheck`, `pytest`, `tsc`, `ruff`).
+
+The third layer is load-bearing on its own: a run failing at `Azure login` has a
+proper name, a real job and `conclusion: failure`, so at run level it is
+**identical** to a failing test suite. Any design that skips the `/jobs` call
+cannot tell them apart.
+
+What killed it is the population, measured across the 24 live manifest projects:
+**0 repos had a code-level failure on their default branch.** The fleet showed 58
+failed runs, which is a count of *runs, not defects*. Two artefacts inflate it —
+failures on merged-and-deleted branches persist in the API indefinitely, and one
+bad workflow file emits one failed run per push (autoRefine's own 10 path-named
+runs are a single defect counted ten times). `portaBaltica`, the worst repo at 29
+failures, has a fully green master: every code failure was on a PR branch and
+fixed before merge, which is CI doing its job.
+
+**The aggregate count and the deduplicated defect count are different quantities,
+and the API hands you the aggregate first.** That is the trap; it caught two
+readers on the same day.
+
+And the one red default-branch workflow in the entire fleet fails at
+`Azure login` — which hard rule 3 forbids autoRefine from fixing. A perfect
+classifier applied to the only live failure available yields an idea that
+violates a hard rule.
+
+So the feature would be dead code carrying a live network dependency and a
+permanent maintenance surface, paying nothing: a worse trade than an expensive
+feature that works. Marginal token cost measured 0/run — not because it is cheap
+but because it emits nothing.
+
+**Re-run before revisiting** (~49 API calls for the fleet, trivial against
+15,000/hr): for each live manifest repo take the newest *completed* run per
+workflow **on the default branch**, drop `startup_failure` and `name == path`,
+fetch `/jobs`, and keep only runs whose failed step matches the code allow-list.
+Build it the day that returns a non-empty set for more than one or two repos.
+No committed script, per the precedent above.
+
 ## The workflows have five minutes to buy their tokens
 
 Both agent workflows authenticate with OIDC federated credentials rather than a
