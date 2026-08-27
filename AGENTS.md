@@ -269,6 +269,49 @@ python -m agent.main --repo owner/repo --mode file-ideas
 2. `./.github-gov/scripts/file-idea.py` (CI checkout path)
 3. `/tmp/nauroLabs-github/scripts/file-idea.py` (cloned on demand)
 
+## The entrypoint is baked in; the Python is not
+
+`infrastructure/main.bicep` builds the job's command with
+`loadTextContent('run-autorefine.sh')`, which inlines that file into the ARM template **at
+deploy time**. The Python is the opposite: the script git-clones autoRefine at start-up, so
+`agent/` really is whatever is on master. One repo, two very different freshness rules, and
+the script's own header used to claim the runtime one for both.
+
+The gap is silent by construction. Editing `run-autorefine.sh` and merging it produces no
+error and no failed run — production just keeps executing the older copy. Measured
+2026-08-27: the deployed job was running the 2,918-character pre-#12 script with no
+`AUTOREFINE_COST_LOG` in it, while that same 06:00 run pulled new Python from master and
+scored normally. The cost-telemetry block from #12 had never executed once, and the only
+symptom was a file that never appeared in `reports/cost`.
+
+**A change to `infrastructure/` is not live until someone redeploys.** There is no deploy
+workflow; it is a human running `az deployment group create`. Say so in the PR when you
+touch that directory.
+
+No hermetic test can catch the drift itself — "is it deployed" is a fact about Azure, not
+about the repo, and the only real check needs ARM credentials, which in CI means a skip,
+and a test that skips where it matters is the kind this repo deletes.
+`tests/test_infra_entrypoint.py` therefore guards the mechanism instead: every
+`loadTextContent` target must exist, must say in prose that editing it requires a redeploy,
+and must be pinned to `eol=lf` — it is inlined verbatim and then run by `/bin/sh` in a Linux
+container, and deploys are issued from Windows.
+
+Two things there are load-bearing:
+
+- **The path filter must list `infrastructure/**`.** It was absent from `tests.yml`, so a PR
+  touching only the bicep and the entrypoint ran no tests at all. Without it every guard
+  above is decorative, which is why one of the tests asserts the filter itself.
+- **The anti-vacuity test.** The per-file guards are parametrised over whatever the template
+  inlines, so if nothing is inlined they collect nothing and pass. Moving the entrypoint out
+  of the template is a deliberate change to the deployment model and should fail here rather
+  than quietly emptying the module.
+
+`workloadProfileName: 'Consumption'` is declared rather than left to the RP for a related
+reason: omitting it kept the deployed value out of the template, so every `what-if` reported
+`'Consumption' -> null` — a permanent red herring beside the one delta a deploy is actually
+for. `cae-agents` offers exactly one profile and all seven workloads in it run on it, so
+naming it is correct regardless of how the RP treats the omission.
+
 ## What the sweep actually costs
 
 The daily manifest sweep is the whole Foundry bill. On 2026-08-21 the live meter had
