@@ -16,6 +16,16 @@ Three separate hazards, all of which the evaluate workflow shipped with:
 
 3. **Unbounded concurrency.** No ``concurrency`` group, so two dispatches ran
    two full Foundry sweeps at once — double the bill for one answer.
+
+4. **Authentication that only fails at runtime.** Both agent workflows read a
+   ``creds:`` secret named ``AZURE_CREDENTIALS`` that had never been created.
+   Actions substitutes a missing secret as the empty string rather than
+   erroring, so ``azure/login`` fell through to service-principal auth with
+   nothing to use and every dispatch died at the login step. Nothing in the
+   repository could have caught that, because the mistake was a *valid* YAML
+   reference to a name that did not exist. They now authenticate with OIDC,
+   which has two preconditions that fail the same silent way — see
+   ``AZURE_LOGIN_STEPS`` below.
 """
 
 from __future__ import annotations
@@ -144,5 +154,191 @@ def test_evaluate_workflow_does_not_cancel_runs_in_progress() -> None:
     assert concurrency.get("cancel-in-progress") is not True, (
         "cancel-in-progress must not be true: a cancelled evaluate run never "
         "reaches the 'finally' that deletes its Foundry agent."
+    )
+
+
+# ── Azure OIDC login ───────────────────────────────────────────────────────
+#
+# The action ref is matched case-insensitively because GitHub resolves it that
+# way: ``Azure/login`` and ``azure/login`` are the same action, and a guard that
+# saw only one spelling would silently stop covering a renamed step.
+AZURE_LOGIN_ACTION = "azure/login"
+
+
+def _azure_login_steps(document: dict):
+    """Yield ``(job_name, step_label, step, effective_permissions)``.
+
+    A job-level ``permissions`` block *replaces* the workflow-level one outright
+    — GitHub does not merge the two — so the effective set is the job's if it
+    declares one and the workflow's otherwise.
+    """
+    workflow_permissions = document.get("permissions")
+
+    for job_name, job in (document.get("jobs") or {}).items():
+        job = job or {}
+        permissions = job.get("permissions", workflow_permissions)
+
+        for index, step in enumerate(job.get("steps") or []):
+            step = step or {}
+            uses = str(step.get("uses") or "")
+            if uses.split("@", 1)[0].lower() == AZURE_LOGIN_ACTION:
+                label = step.get("name") or f"step #{index + 1}"
+                yield job_name, label, step, permissions
+
+
+def _discover_azure_login_steps() -> list[tuple]:
+    return [
+        (path, job_name, label, step, permissions)
+        for path in workflow_files()
+        for job_name, label, step, permissions in _azure_login_steps(_load(path))
+    ]
+
+
+AZURE_LOGIN_STEPS = _discover_azure_login_steps()
+
+
+def _login_ids(entries: list[tuple]) -> list[str]:
+    return [f"{path.name}::{job_name}::{label}" for path, job_name, label, _, _ in entries]
+
+
+def test_azure_login_steps_are_discoverable() -> None:
+    """Guard the guard: the tests below are parametrised over this list.
+
+    If discovery stops matching — an action rename, a ref this helper does not
+    split correctly — it collects nothing and every assertion below passes by
+    finding no work to do. That is precisely the failure mode this module
+    exists to prevent, so make it loud.
+    """
+    assert AZURE_LOGIN_STEPS, (
+        f"no '{AZURE_LOGIN_ACTION}' steps found. Either the workflows stopped "
+        "authenticating to Azure — in which case delete these tests deliberately "
+        "— or _azure_login_steps() stopped recognising them."
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "job_name", "label", "step", "permissions"),
+    AZURE_LOGIN_STEPS,
+    ids=_login_ids(AZURE_LOGIN_STEPS),
+)
+def test_azure_login_job_may_mint_an_oidc_token(
+    path: Path, job_name: str, label: str, step: dict, permissions: object
+) -> None:
+    """OIDC needs ``id-token: write``, and says so only once the job is running.
+
+    ``azure/login`` calls ``core.getIDToken()``, which needs the job to have been
+    granted ``id-token: write``. Without it the run fails inside the action with
+    "Failed to fetch federated token from GitHub" — long after the point where a
+    test could have said so for free.
+    """
+    assert isinstance(permissions, dict), (
+        f"{path.name} / job '{job_name}' declares permissions {permissions!r}. "
+        "These jobs carry a deliberately restrictive block; keep it an explicit "
+        "mapping and add 'id-token: write' to it rather than widening the lot."
+    )
+    assert permissions.get("id-token") == "write", (
+        f"{path.name} / job '{job_name}' runs '{label}' but does not grant "
+        "'id-token: write', so azure/login cannot fetch a federated token from "
+        "GitHub and the step fails before it ever reaches Entra ID."
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "job_name", "label", "step", "permissions"),
+    AZURE_LOGIN_STEPS,
+    ids=_login_ids(AZURE_LOGIN_STEPS),
+)
+def test_azure_login_supplies_its_identity_inputs(
+    path: Path, job_name: str, label: str, step: dict, permissions: object
+) -> None:
+    """The shipped bug, in test form.
+
+    ``creds: ${{ secrets.AZURE_CREDENTIALS }}`` named a secret that did not
+    exist. Actions renders a missing secret as the empty string, so the action
+    saw no credentials at all and raised "Using auth-type: SERVICE_PRINCIPAL.
+    Not all values are present. Ensure 'client-id' and 'tenant-id' are
+    supplied." Asserting the inputs are present catches that shape of mistake
+    without a dispatch — though note that no test can tell whether the *secrets*
+    behind them exist, which is why the workflow headers say so in prose.
+
+    The subscription rule mirrors the action's own ``LoginConfig.validate()``:
+    a subscription is required unless ``allow-no-subscriptions`` is set.
+    """
+    inputs = step.get("with") or {}
+
+    assert "creds" not in inputs, (
+        f"{path.name} / '{label}' passes 'creds:'. These workflows authenticate "
+        "with OIDC federated credentials so that no long-lived secret exists to "
+        "rotate or leak; going back to a credentials blob is a deliberate "
+        "decision, not an edit that should pass quietly."
+    )
+
+    missing = [
+        key for key in ("client-id", "tenant-id") if not str(inputs.get(key, "")).strip()
+    ]
+    assert not missing, (
+        f"{path.name} / '{label}' is missing {missing!r}. azure/login fails with "
+        "\"Ensure 'client-id' and 'tenant-id' are supplied\"."
+    )
+
+    if not str(inputs.get("subscription-id", "")).strip():
+        assert str(inputs.get("allow-no-subscriptions", "")).lower() == "true", (
+            f"{path.name} / '{label}' supplies neither 'subscription-id' nor "
+            "'allow-no-subscriptions: true'; azure/login requires one of them."
+        )
+
+
+# Steps that take minutes rather than seconds. Under OIDC the login step starts a
+# clock that these would burn: GitHub's identity token expires 5 minutes after it
+# is minted, and the Azure CLI stores that token verbatim and cannot mint another
+# (Azure/azure-cli#28708, open since 2024-04-08). `az login` itself only caches an
+# ARM token, so the *first* request for any other scope — the Foundry/AI scope the
+# agent needs — must land inside those 5 minutes or it fails with AADSTS700024.
+#
+# Both workflows currently put every slow step before the login, so the agent's
+# first token lands seconds after it. That ordering is now correctness, not taste.
+SLOW_SETUP_ACTIONS = ("actions/checkout", "actions/setup-python", "actions/setup-node")
+SLOW_SETUP_COMMANDS = ("pip install", "npm install", "npm ci", "apt-get install")
+
+
+@pytest.mark.parametrize("path", workflow_files(), ids=_ids(workflow_files()))
+def test_no_slow_setup_runs_after_azure_login(path: Path) -> None:
+    """Keep the slow steps before the login, not after it.
+
+    Moving ``pip install`` below ``azure/login`` would not fail here, or in
+    review, or in any run that happens to be quick. It would fail intermittently
+    and much later, inside the agent, with an Entra error naming a clock rather
+    than a workflow edit.
+    """
+    document = _load(path)
+    offenders: list[str] = []
+
+    for job_name, job in (document.get("jobs") or {}).items():
+        seen_login = False
+
+        for index, step in enumerate((job or {}).get("steps") or []):
+            step = step or {}
+            uses = str(step.get("uses") or "")
+            action = uses.split("@", 1)[0].lower()
+            label = step.get("name") or f"step #{index + 1}"
+
+            if action == AZURE_LOGIN_ACTION:
+                seen_login = True
+                continue
+            if not seen_login:
+                continue
+
+            script = step.get("run") if isinstance(step.get("run"), str) else ""
+            slow = action in SLOW_SETUP_ACTIONS or any(
+                command in script for command in SLOW_SETUP_COMMANDS
+            )
+            if slow:
+                offenders.append(f"{job_name} / {label}")
+
+    assert not offenders, (
+        f"{path.name} runs slow setup work after 'azure/login', which spends the "
+        "5-minute federated-token window before the agent asks for its first "
+        "non-ARM token (Azure/azure-cli#28708). Move these above the login:\n  "
+        + "\n  ".join(offenders)
     )
 
