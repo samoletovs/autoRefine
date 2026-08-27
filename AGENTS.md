@@ -341,6 +341,102 @@ the labels, and `closedByPullRequestsReferences(includeClosedPrs: true)`. There 
 deliberately no committed script, for the reason given under "What the score
 actually measures".
 
+## Why ideation is not grounded in CI signal
+
+The planning pass sees deterministic findings and `project.yaml` and nothing about
+how the code behaves — no failing test, no crash, no error rate. Static grounding is
+the weakest kind available, so feeding recent CI failures into `build_plan_task` was
+investigated on 2026-08-27 and **declined**. The noise problem turned out to be
+solvable; the signal turned out not to exist.
+
+### The classifier works, and it is the part worth keeping
+
+A failed workflow run is far more often a broken *workflow* than broken code, and
+proposing a code fix for one is worse than proposing nothing. Three layers separate
+them using only what the Actions API returns:
+
+1. `conclusion == "startup_failure"` — the run never started; the YAML did not parse.
+2. `name == path` — GitHub falls back to the workflow's file path when it cannot read
+   `name:` from the YAML on that ref, so a run named `.github/workflows/x.yml` is a
+   broken workflow file however else it looks.
+3. Otherwise fetch `/actions/runs/{id}/jobs` and read the failed **step** names:
+   deny-list infrastructure (`deploy`, `login`, `auth`, `secret`, `token`, `checkout`,
+   `install`, `merge`, `provision`), allow-list code (`test`, `lint`, `typecheck`,
+   `pytest`, `tsc`, `ruff`, `suite`).
+
+**Layer 3 is not optional.** A workflow failing because a secret does not exist has a
+proper name, a real job and `conclusion: failure` — at run level it is
+indistinguishable from a failing test suite. Only step detail separates them, so a
+design that skips the per-run `/jobs` call cannot work.
+
+The layers were derived from the API shape *before* reading a description of the
+noise already known by hand, and they independently reproduced both categories of it:
+a batch of unparseable-YAML runs and a missing-secret run. Built the other way round
+they would have been unfalsifiable.
+
+### The count that looks like signal, and the count that is
+
+Measured 2026-08-27 across the 24 live manifest projects: **58 failed or
+startup-failed runs in 10 of the 24.** Deduplicated to distinct broken things on a
+branch anyone cares about, it is **0 of 24**. Three readings agree:
+
+| Reading | Result |
+|---------|--------|
+| newest run per workflow on each default branch | 1 red project fleet-wide |
+| worst project spot-checked (`portaBaltica`, 29 failures) | default branch fully green |
+| workflows failing >=20% of default-branch runs | 2, both deploy/agent infrastructure |
+
+Two artefacts inflate the aggregate, and both are properties of the API rather than
+of the fleet:
+
+- **Failures on merged and deleted branches persist forever.** `portaBaltica`'s
+  code-level failures (`Test`, `Run the content-safety suite`, `Lint`, `Type check`)
+  were all on pull-request branches and all fixed before merge — CI doing its job. A
+  recent-failures window resurfaces them as live defects indefinitely.
+- **One bad workflow file emits one failed run per push.** autoRefine's own 10
+  path-named runs are a single defect counted ten times.
+
+**This is the open-issue trap one layer down.** 5 open non-PR issues across 24
+projects is visibly too thin to ground on; 58 failed runs is not visibly thin, and
+reads as a fleet in trouble until it is deduplicated. The aggregate is the number the
+API hands you first. Distrust it.
+
+### The collision that outlives the counts
+
+The one red default branch was autoRefine's own `Evaluate All Projects`, failing at
+step `Azure login` — which **hard rule 3 forbids autoRefine from fixing.** A perfect
+classifier, applied to the entire live population of failures it can find, yields one
+idea, and that idea violates a hard rule.
+
+Unlike the counts, this does not expire. Credential and infrastructure failures are
+the class that survives *longest* on a default branch, precisely because no pull
+request the idea could buy will clear them. A fleet that goes red tomorrow is most
+likely red in exactly the way autoRefine may not repair.
+
+### Why this is not the precedent set just above
+
+`_abandoned_after_build` also adds 0 tokens per run today and was built anyway, so
+the difference has to be stated or this section contradicts that one. That channel is
+silent *temporally* — declines and closed-unmerged PRs accumulate as the pipeline
+runs — and it needs no classifier, because a human's comment is self-evidently a
+human's comment. This one is silent *structurally*: it is empty because CI is
+working, and it would need a deny/allow list over step names kept correct against 24
+repositories' naming conventions indefinitely. A silent check with no moving parts is
+cheap insurance; a silent check with a drifting heuristic is a liability that pays
+nothing.
+
+### Re-running it
+
+The counts expire under hard rule 7; the method does not. For each live manifest
+project take the newest completed run per workflow on the default branch, drop layers
+1 and 2, fetch `/jobs` for what remains, and keep only runs whose failed step matches
+the code allow-list. A full sweep is ~49 calls for 24 projects against a 15,000/hr
+core budget, so cost is not the obstacle and never was.
+
+Build it the day that returns a non-empty set for more than one or two projects — and
+re-check the hard rule 3 collision first. There is deliberately no committed script,
+for the reason given under "What the score actually measures".
+
 ## The workflows have five minutes to buy their tokens
 
 Both agent workflows authenticate with OIDC federated credentials rather than a
