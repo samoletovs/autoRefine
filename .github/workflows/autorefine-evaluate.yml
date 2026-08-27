@@ -105,22 +105,43 @@ jobs:
       # call anywhere in Azure/login), so the Python below reaches Azure through
       # DefaultAzureCredential's AzureCliCredential link, not EnvironmentCredential.
       #
-      # Keep this step last before "Run autoRefine". GitHub's identity token expires 5
-      # minutes after it is minted and the Azure CLI cannot mint another
-      # (Azure/azure-cli#28708, still open). `az login` caches only an ARM token, so the
-      # agent's first request for the Foundry scope must land inside that window or it
-      # fails with AADSTS700024. It does today — the step runs seconds after this one,
-      # and the token it caches then lasts ~60 min against a ~43 min sweep. That is
-      # working headroom, not comfortable headroom: this job's timeout-minutes is 90, so
-      # a sweep that runs long can still outlive its token. If that starts happening,
-      # the documented fix is to pre-warm the scopes here with
-      # `az account get-access-token --scope ... --output none` immediately after login.
+      # Keep this step immediately before the pre-warm below. GitHub's identity token
+      # expires 5 minutes after it is minted and the Azure CLI cannot mint another
+      # (Azure/azure-cli#28708), so anything slow inserted between them spends a window
+      # the agent needs. `az login` caches only an ARM token.
       - name: Azure login
         uses: azure/login@v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # Buy every token the sweep needs while the federated token is still valid.
+      #
+      # Without this the agent's first Foundry call is a fresh round-trip that
+      # re-presents the federated token, and whether it succeeds depends on how long
+      # `pip install` happened to take. It works today by luck of step order, not by
+      # design. Acquiring the token here puts it in ~/.azure/msal_token_cache.json,
+      # where the Python finds it without presenting an assertion at all.
+      #
+      # `--resource`, not `--scope`, on purpose: this is character-for-character the
+      # command azure-identity's AzureCliCredential runs — it strips the '/.default'
+      # suffix and passes `--resource` — so this writes the cache entry it will later
+      # look for, rather than one that merely ought to normalise to the same key.
+      #
+      # https://ai.azure.com is the AgentsClient default scope; ARM is what `az login`
+      # already holds, re-taken here so the whole set shares one expiry.
+      #
+      # Fail-open and quiet. `--output none` keeps tokens out of the log, and the
+      # fallback keeps a diagnostic from killing the ~43 minutes of work it exists to
+      # protect: if this step cannot pre-warm, the run proceeds exactly as it would
+      # have without it, and says so.
+      - name: Pre-warm Azure token cache
+        run: |
+          for resource in https://ai.azure.com https://management.azure.com; do
+            az account get-access-token --resource "$resource" --output none \
+              || echo "::warning::Could not pre-warm $resource — a later token request may fail with AADSTS700024"
+          done
 
       - name: Run autoRefine
         env:
