@@ -273,6 +273,74 @@ critical or high alerts, so the check currently produces no findings at all.
 `samoletovs/.github` answers 403 with alerts disabled; that is the one repo where
 the dimension is unmeasured rather than clean.
 
+## What the ideation loop learns from
+
+An idea can die in two places, and until 2026-08-27 the loop only watched one of
+them. `_recent_declined_reasons` reads issues labelled `declined` — a 👎 on a
+Telegram card, which costs one tap. `_abandoned_after_build` reads the other end
+of the funnel: an idea that was approved, ran a 10-30 minute Copilot Coding
+Agent, opened a PR, and had that PR closed unmerged. That run is the largest
+single unit of spend the pipeline can produce, and nothing read its outcome back.
+
+**Both channels are currently silent, and that is the most useful thing to know
+about them.** Measured 2026-08-27 across all 25 manifest projects: no issue
+anywhere in the org carries `declined`, and no `Feedback from Telegram:` comment
+exists, so the older loop has returned `[]` on every production run it has ever
+made. The new one returns `[]` too — there is exactly one closed-unmerged PR
+tracing to an idea in the fleet's whole history, and it is excluded on purpose
+(below). So this adds **0 tokens per run today**, and ~131 per entry when it
+fires, capped at 4 entries. Do not read the empty block as the check being
+broken; read the log, which says which it is.
+
+Four things are load-bearing:
+
+- **The linkage is GitHub's, not ours.** `closedByPullRequestsReferences` with
+  `includeClosedPrs: true`. Without that argument the field reports only PRs that
+  *merged* — precisely the outcome this is not looking for — so the check would be
+  dead on every repo while every mocked test still passed. Verified against era#1
+  on 2026-08-27: `gh issue view --json closedByPullRequestsReferences` returns
+  `[]` there, because it does not pass the argument, while the raw query returns
+  PR #2 with `merged: false`. It is a raw `gh api graphql` call for that reason,
+  and being raw also sidesteps the CLI version pinned in `run-autorefine.sh`.
+- **The issue must be closed too**, which `states: [CLOSED]` enforces. era#2 was
+  closed unmerged and the human wrote "#1 stays open and is ready to be picked up
+  again": the *idea* survived and only the build failed. Feeding that back as
+  "avoid this" would contradict them outright, and `_is_near_duplicate` already
+  suppresses a re-proposal for as long as the issue is open. An idea kept open
+  after a failed PR is a retry request, not a lesson.
+- **Ideas that died of a defect we have since fixed are skipped.**
+  `unbuildable-memo` is what `is_specified()` now rejects before filing and
+  `duplicate` is what `_is_near_duplicate` now stops. Measured 2026-08-27: 20 of
+  the fleet's 23 closed idea issues carry one, every one of them predating the fix
+  that would have prevented it. Replaying those would suppress ideas that file
+  perfectly well today and spend tokens to re-punish a fixed bug.
+- **Only a human's words are replayed.** A bot's status line costs tokens and
+  teaches nothing, so the reason is the last OWNER/MEMBER/COLLABORATOR comment,
+  hard-capped at `AVOID_REASON_MAX_CHARS`. The cap is not decoration: a Telegram
+  decline is a phrase, but a human's PR post-mortem is an essay — era#2's is 1,615
+  characters — and it would ride the planning prompt on every run.
+
+They render as two blocks, not one, because the instruction differs. A declined
+idea was refused on its face, so the answer is to propose something different in
+kind. An abandoned one passed the human filter and died in the build: the area was
+wanted, and telling the model to avoid it would throw away the part a human had
+already said yes to.
+
+`AUTOREFINE_SKIP_PR_OUTCOMES=1` stops the call, on the same reasoning as
+`AUTOREFINE_SKIP_DEPENDABOT`. Every failure returns `[]` — a GitHub hiccup must
+never stop the proposer — but failure logs at WARNING and emptiness at DEBUG, so
+"could not tell" and "nothing to avoid" are distinguishable even though both look
+the same to the caller. That is the `npm audit` lesson above, applied one function
+over.
+
+**The counts here expire; hard rule 7 applies.** They describe a 27-day-old
+pipeline that had, at the time of measurement, never once had a human reject an
+idea on its merits. Re-measure before sizing anything on them: list every
+`idea`-labelled issue per project, and for the closed ones read `state_reason`,
+the labels, and `closedByPullRequestsReferences(includeClosedPrs: true)`. There is
+deliberately no committed script, for the reason given under "What the score
+actually measures".
+
 ## The workflows have five minutes to buy their tokens
 
 Both agent workflows authenticate with OIDC federated credentials rather than a
