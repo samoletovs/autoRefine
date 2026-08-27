@@ -84,6 +84,60 @@ WIKI_CONTEXT_MAX_CHARS = 2400
 WIKI_CONTEXT_RECENT_DAYS = 60
 WIKI_CONTEXT_OTHER_CAP = 2
 
+# ── Learning from ideas that failed ──────────────────────────────────────────
+# `_recent_declined_reasons` learns from a 👎 on a Telegram card — the cheapest way an
+# idea can fail, costing one tap. `_abandoned_after_build` learns from the most expensive
+# one: an idea that was approved, ran a 10-30 minute Copilot Coding Agent, opened a PR,
+# and had that PR closed unmerged.
+#
+# Both feed the planning prompt on every run, and input tokens are the entire Foundry bill
+# (AGENTS.md, "What the sweep actually costs"), so both are capped. The caps differ because
+# the reasons do: a Telegram decline is a phrase, while a human's PR post-mortem is an
+# essay — era#2's is ~2,000 characters. Four entries at 220 characters is ~325 tokens in
+# the worst case, against a run that already sends hundreds of thousands.
+AVOID_REASON_MAX_CHARS = 220
+ABANDONED_CONTEXT_CAP = 4
+# Closed idea issues to look at before filtering. Most are excluded below, so reading only
+# the newest four would usually find none of the ones that matter — this is a local filter
+# over one response, not extra calls.
+ABANDONED_SCAN_LIMIT = 25
+# Labels that say an idea died of a defect autoRefine has since fixed: `unbuildable-memo`
+# is what is_specified() now rejects before filing, `duplicate` is what _is_near_duplicate
+# now stops. Replaying those as "avoid this" would suppress ideas that are perfectly
+# fileable today and spend tokens to do it. Measured 2026-08-27: 20 of the fleet's 23
+# closed idea issues carry one, so this exclusion is most of the population, and every
+# one of those 20 predates the fix that would have prevented it.
+SUPERSEDED_FAILURE_LABELS = frozenset({"unbuildable-memo", "duplicate"})
+# Whose words are worth replaying to the model. A human explaining why they threw a build
+# away is the signal; a bot's status line is noise that would cost tokens to repeat.
+HUMAN_COMMENT_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+
+# One call per repo. `closedByPullRequestsReferences` needs `includeClosedPrs: true` or it
+# reports only PRs that merged — which is precisely the outcome this is not looking for.
+# The `gh issue view --json closedByPullRequestsReferences` convenience field does not pass
+# that argument: verified against era#1 on 2026-08-27, where it returns [] while this query
+# returns PR #2 with `merged: false`. Being a raw query also sidesteps the CLI version pin
+# in infrastructure/run-autorefine.sh (gh 2.63.2), since `gh api graphql` is a passthrough.
+ABANDONED_IDEAS_QUERY = """
+query($owner: String!, $name: String!, $limit: Int!) {
+  repository(owner: $owner, name: $name) {
+    issues(labels: ["idea"], states: [CLOSED], first: $limit,
+           orderBy: {field: UPDATED_AT, direction: DESC}) {
+      nodes {
+        title
+        labels(first: 30) { nodes { name } }
+        closedByPullRequestsReferences(first: 5, includeClosedPrs: true) {
+          nodes {
+            merged
+            comments(last: 10) { nodes { authorAssociation body } }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
 # ── Activity gate ────────────────────────────────────────────────────────────
 # The sweep's expense is almost entirely the two Foundry planning runs per project
 # (technical + functional), not the deterministic evaluation around them. A plan run
@@ -1019,8 +1073,9 @@ def _extract_relevant_wiki_insights(project_name: str) -> str:
 def _functional_task(cap: int = FUNCTIONAL_IDEA_CAP, avoid_context: str = "", wiki_context: str = "") -> str:
     """Foundry task that asks for vision-aligned feature ideas, not technical fixes.
 
-    ``avoid_context`` carries recently declined ideas (+ their Telegram reasons) so the
-    agent proposes something *different* — closing the loop from a 👎 back into ideation.
+    ``avoid_context`` carries ideas that already failed — declined in Telegram, or approved
+    and then thrown away unmerged — so the agent proposes something *different*, closing the
+    loop from both ends of the funnel back into ideation.
     ``wiki_context`` carries recent lab knowledge (memex-ingested insights/trends) so ideas
     can draw on what the lab just learned, not only the project's own files.
     """
@@ -1056,7 +1111,8 @@ def plan_functional(
 ) -> dict | None:
     """Run the Foundry plan agent with a functional/vision focus. Returns a plan or None.
 
-    ``avoid_context`` (recently declined ideas + reasons) is threaded into the task prompt.
+    ``avoid_context`` (ideas that were declined, or built and thrown away) is threaded into
+    the task prompt.
     """
     endpoint = os.environ.get("FOUNDRY_PROJECT_ENDPOINT", "")
     if not endpoint:
@@ -1346,16 +1402,137 @@ def _recent_declined_reasons(repo: str, limit: int = 6) -> list[str]:
     return reasons
 
 
-def _format_avoid_context(declined: list[str]) -> str:
-    """Render declined ideas as an 'avoid these' block for the generator prompt."""
-    if not declined:
-        return ""
-    lines = [
-        "Previously proposed ideas that were DECLINED — do NOT re-propose these; the text "
-        "after the dash is the reason, so propose something meaningfully different:"
-    ]
-    lines.extend(f"- {item}" for item in declined)
-    return "\n".join(lines)
+def _human_close_reason(pr: dict) -> str:
+    """The last human comment on a thrown-away PR, condensed to one line. '' when none.
+
+    Only OWNER/MEMBER/COLLABORATOR comments count: a bot's status line teaches nothing and
+    would cost tokens to repeat. The *last* one is taken because the comment that explains
+    a close is the one that precedes it.
+    """
+    comments = (pr.get("comments") or {}).get("nodes") or []
+    for comment in reversed(comments):
+        association = str(comment.get("authorAssociation") or "").upper()
+        if association not in HUMAN_COMMENT_ASSOCIATIONS:
+            continue
+        # Markdown post-mortems carry code fences and blank lines; the model needs the
+        # words, and the prompt is charged for the whitespace.
+        body = " ".join(str(comment.get("body") or "").split())
+        if not body:
+            continue
+        if len(body) > AVOID_REASON_MAX_CHARS:
+            body = body[:AVOID_REASON_MAX_CHARS].rsplit(" ", 1)[0] + "…"
+        return body
+    return ""
+
+
+def _abandoned_after_build(repo: str, limit: int = ABANDONED_CONTEXT_CAP) -> list[str]:
+    """Ideas that were approved, built, and thrown away — title + why. Best-effort.
+
+    `_recent_declined_reasons` learns from the cheapest failure there is: a 👎 on a Telegram
+    card. This learns from the most expensive one — an idea that was approved, ran a 10-30
+    minute Copilot Coding Agent, opened a PR, and had that PR closed unmerged. That run is
+    the largest single unit of spend the idea pipeline can produce, and until now nothing
+    read its outcome back.
+
+    Two exclusions carry the correctness of this, and both are deliberate:
+
+    * **The issue must be closed too**, which `states: [CLOSED]` enforces. era#2 was closed
+      unmerged and the human wrote "#1 stays open and is ready to be picked up again" — the
+      *idea* survived and only the execution failed. Replaying that as "avoid this" would
+      contradict them, and `_is_near_duplicate` already stops a re-proposal for as long as
+      the issue is open. Only when the issue is closed as well has anyone given up on it.
+    * **Ideas that died of a defect autoRefine has since fixed are skipped** — see
+      SUPERSEDED_FAILURE_LABELS.
+
+    Returns [] on any failure, so a GitHub hiccup can never stop ideation. Failure logs at
+    WARNING and emptiness at DEBUG: both return [], but "could not tell" and "nothing to
+    avoid" must not look alike in the console, which is the mistake the old `npm audit`
+    dependency check made (AGENTS.md, "The dependency check").
+    """
+    if os.environ.get("AUTOREFINE_SKIP_PR_OUTCOMES") == "1":
+        log.debug("PR-outcome feedback disabled by AUTOREFINE_SKIP_PR_OUTCOMES.")
+        return []
+
+    owner, _, name = repo.partition("/")
+    if not owner or not name:
+        log.warning("Could not read PR outcomes: %r is not owner/name.", repo)
+        return []
+
+    try:
+        out = subprocess.run(
+            ["gh", "api", "graphql",
+             "-f", f"query={ABANDONED_IDEAS_QUERY}",
+             "-F", f"owner={owner}", "-F", f"name={name}",
+             "-F", f"limit={ABANDONED_SCAN_LIMIT}"],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        if out.returncode != 0:
+            log.warning("Could not read PR outcomes for %s: %s", repo, out.stderr.strip()[:200])
+            return []
+        payload = json.loads(out.stdout or "{}")
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        log.warning("Could not read PR outcomes for %s: %s", repo, exc)
+        return []
+
+    # GraphQL answers a missing repo with `data.repository: null` and HTTP 200, so every
+    # step here has to survive a null rather than assume the shape it asked for.
+    repository = (payload.get("data") or {}).get("repository") or {}
+    nodes = (repository.get("issues") or {}).get("nodes") or []
+
+    entries: list[str] = []
+    for issue in nodes:
+        if len(entries) >= limit:
+            break
+        labels = {
+            str(node.get("name") or "")
+            for node in (issue.get("labels") or {}).get("nodes") or []
+        }
+        if labels & SUPERSEDED_FAILURE_LABELS:
+            continue
+        prs = (issue.get("closedByPullRequestsReferences") or {}).get("nodes") or []
+        thrown_away = [pr for pr in prs if not pr.get("merged")]
+        if not thrown_away:
+            continue
+        title = str(issue.get("title") or "").replace("[idea]", "").strip()
+        if not title:
+            continue
+        reason = next((r for r in map(_human_close_reason, thrown_away) if r), "")
+        entries.append(f"{title} — {reason}" if reason else title)
+
+    if not entries:
+        log.debug("No abandoned-after-build ideas to feed back for %s.", repo)
+    return entries
+
+
+def _format_avoid_context(declined: list[str], abandoned: list[str] | None = None) -> str:
+    """Render past failures as an 'avoid these' block for the generator prompt.
+
+    Two blocks rather than one, because the instruction they imply is different. A declined
+    idea was refused on its face, so the answer is to propose something different in kind.
+    An abandoned one passed the human filter and died in the build: the area was wanted,
+    and what failed was the shape, so telling the model to avoid the whole area would
+    throw away the part a human had already said yes to.
+    """
+    blocks: list[str] = []
+    if declined:
+        blocks.append("\n".join([
+            (
+                "Previously proposed ideas that were DECLINED — do NOT re-propose these; the "
+                "text after the dash is the reason, so propose something meaningfully different:"
+            ),
+            *(f"- {item}" for item in declined),
+        ]))
+    if abandoned:
+        blocks.append("\n".join([
+            (
+                "Previously proposed ideas that were approved, BUILT, and then THROWN AWAY "
+                "unmerged. The idea itself passed review — the attempt to build it failed, "
+                "and the text after the dash is how. Do not repeat that failure; a smaller "
+                "or differently shaped idea in the same area is welcome:"
+            ),
+            *(f"- {item}" for item in abandoned),
+        ]))
+    return "\n\n".join(blocks)
 
 
 def handle_functional_ideas(
@@ -1953,10 +2130,12 @@ def _process_repo(repo: str, config: AutoRefineConfig) -> None:
         fmode = _functional_mode()
         if fmode != "off" and project_config.stage in FUNCTIONAL_STAGES:
             log.info("Functional ideation (%s) for %s...", fmode, name)
-            # In cards mode, feed recently declined ideas (+ reasons) back to the
-            # generator so a 👎 in Telegram reshapes the next proposals.
+            # In cards mode, feed past failures back to the generator: a 👎 in Telegram
+            # reshapes the next proposals, and so does a build that was thrown away.
             avoid = (
-                _format_avoid_context(_recent_declined_reasons(repo))
+                _format_avoid_context(
+                    _recent_declined_reasons(repo), _abandoned_after_build(repo)
+                )
                 if fmode == "cards"
                 else ""
             )
