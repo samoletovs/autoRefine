@@ -374,6 +374,13 @@ noise already known by hand, and they independently reproduced both categories o
 a batch of unparseable-YAML runs and a missing-secret run. Built the other way round
 they would have been unfalsifiable.
 
+**That provenance does not transfer.** It is a fact about the 2026-08-27 derivation,
+not a property of the classifier, and the recipe below quietly destroys it: anyone
+following it will have read this section first, so their layers are fitted to noise
+already described to them. Re-derive from the API shape if you want the same
+confidence, and strike this paragraph if you cannot — an unfalsifiability claim that
+has silently become false is worse than none at all.
+
 ### The count that looks like signal, and the count that is
 
 Measured 2026-08-27 across the 24 live manifest projects: **58 failed or
