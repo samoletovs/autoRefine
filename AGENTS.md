@@ -256,6 +256,59 @@ critical or high alerts, so the check currently produces no findings at all.
 `samoletovs/.github` answers 403 with alerts disabled; that is the one repo where
 the dimension is unmeasured rather than clean.
 
+## The workflows have five minutes to buy their tokens
+
+Both agent workflows authenticate with OIDC federated credentials rather than a
+service-principal secret. The two are not interchangeable, and the difference is
+a clock.
+
+`azure/login` exports **no environment variables** — `exportVariable` appears
+nowhere in the action; it runs `az login` and stops. So `DefaultAzureCredential`
+never reaches Azure through `EnvironmentCredential` here, under OIDC or before
+it. The link that works is `AzureCliCredential`, which shells out to
+`az account get-access-token` against the CLI session the action left behind.
+Nothing in `agent/` needed changing to move to OIDC, and nothing should be
+changed on the assumption that it did.
+
+What did change is expiry. GitHub's federated token lasts about five minutes,
+the Azure CLI persists it verbatim, and it cannot mint another. `az login` buys
+an ARM token and nothing else, so the *first* request for any other scope is a
+fresh round-trip that re-presents a token which has probably expired, and fails
+with `AADSTS700024`. A client secret had no such window.
+
+Three consequences, all load-bearing:
+
+- **Step order is correctness, not tidiness.** Both workflows put every slow step
+  — checkout, `setup-python`, `pip install` — *above* the login. Moving one below
+  it spends the window. That failure is invisible locally, invisible in review,
+  and surfaces as an Entra error deep inside a 43-minute run.
+- **The pre-warm exists because of this.** The step after each login takes every
+  token the job will need while the federated token is still valid, writing them
+  to `~/.azure/msal_token_cache.json` where the Python finds them without
+  presenting an assertion at all. It uses `--resource`, not `--scope`, because
+  that is character-for-character the command `AzureCliCredential` itself runs —
+  it strips `/.default` and passes `--resource` — so the entry written is the one
+  later looked for, rather than one that ought to normalise to the same key.
+- **The resource list cannot be derived, only maintained.** A client's scope is
+  usually an SDK default rather than a string in our source: `AgentsClient` asks
+  for `https://ai.azure.com` and that appears nowhere in this repository. Calling
+  a new Azure service means adding its resource to the pre-warm by hand.
+  `tests/test_workflow_hardening.py` guards that a pre-warm exists, follows the
+  login immediately, hides its output and cannot fail the job — it deliberately
+  does not guard the list, because a guard that hard-coded it would just be the
+  workflow restated.
+
+**Check the status rather than trusting this paragraph.** Read on 2026-08-27:
+[azure-cli#28708](https://github.com/Azure/azure-cli/issues/28708) open since
+2024-04-08, opened by an Azure CLI maintainer, and the `ubuntu-24.04` runner
+image README listing Azure CLI 2.89.1. Neither was verified by running a job —
+the version came from `actions/runner-images`, not from `az version` on a runner,
+and no run has exercised any of this because the secrets do not exist yet. Some
+sources claim the issue was fixed in 2.60.0; that did not match the still-open
+issue, and it is the kind of claim worth re-checking rather than inheriting. If
+the CLI learns to refresh the token, the pre-warm becomes dead weight and should
+go — but confirm it, don't assume it.
+
 ## Build & run
 
 ```bash
