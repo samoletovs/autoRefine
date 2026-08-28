@@ -210,3 +210,60 @@ def test_pr_card_callback_data_within_telegram_limit(monkeypatch: pytest.MonkeyP
     _, kwargs = client_instance.post.call_args
     for button in kwargs["json"]["reply_markup"]["inline_keyboard"][0]:
         assert len(button["callback_data"].encode("utf-8")) <= 64
+
+
+# --- send_pr_blocked_card ---------------------------------------------------
+
+
+def test_pr_blocked_card_skipped_without_creds() -> None:
+    assert notify.send_pr_blocked_card("samoletovs/atlas", 4, "Extract scoring") is False
+
+
+def _blocked_payload(monkeypatch: pytest.MonkeyPatch, **kwargs: object) -> dict:
+    monkeypatch.setenv("NAURO_BOT_TOKEN", "tok")
+    monkeypatch.setenv("NAURO_CHAT_ID", "999")
+    with patch("agent.notify.httpx.Client") as mock_client_cls:
+        client_instance = mock_client_cls.return_value.__enter__.return_value
+        client_instance.post.return_value = MagicMock(status_code=200)
+        assert notify.send_pr_blocked_card(
+            "samoletovs/atlas", 4,
+            "Extract adaptive-learning scoring logic into a testable module",
+            **kwargs,
+        ) is True
+    _, call_kwargs = client_instance.post.call_args
+    return call_kwargs["json"]
+
+
+def test_pr_blocked_card_offers_no_merge_tap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Load-bearing: a 👍 on an ``arfpr:`` card squash-merges.
+
+    This card reports that CI has never run, so it must carry no button and no ``arfpr:``
+    token — otherwise the fix for the false green would itself hand a human a one-tap merge
+    of untested code.
+    """
+    payload = _blocked_payload(monkeypatch)
+    assert "reply_markup" not in payload
+    assert "arfpr:" not in payload["text"]
+    assert "arf:" not in payload["text"]
+
+
+def test_pr_blocked_card_says_ci_has_not_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = _blocked_payload(
+        monkeypatch,
+        pr_url="https://github.com/samoletovs/atlas/pull/4",
+        workflows=["Azure Static Web Apps CI/CD", "Auto-merge Dependabot PRs",
+                   "Azure Static Web Apps CI/CD"],
+    )
+    text = payload["text"]
+    assert "CI is green" not in text
+    assert "CI has not run" in text
+    assert "Approve and run workflows" in text
+    assert "https://github.com/samoletovs/atlas/pull/4" in text
+    # Deduplicated — atlas#4 really does carry the same workflow name twice.
+    assert text.count("Azure Static Web Apps CI/CD") == 1
+
+
+def test_pr_blocked_card_survives_unnamed_workflows(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = _blocked_payload(monkeypatch, workflows=[])
+    assert "workflows awaiting approval" in payload["text"]
+
