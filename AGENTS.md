@@ -548,6 +548,20 @@ awaiting review, but residue of merges that had already happened.
 merged the PR out from under a run already in flight is **not determinable** from
 the run data — but either way it did not perform the merge, and a human did.
 
+This is the same defect as "An empty check rollup is not evidence that CI is
+green", seen from the other end. That section explains why the PR-card sweep read
+these PRs as ready: at the moment it looks, the rollup is `[]`, because a run held
+at `action_required` has produced no check run. The timing above says where the
+`[]` comes from — the run had not been queued yet when the PR was merged, and
+never will produce a job. Both were verified on `portaBaltica#181`.
+
+**The two measurements have different scopes and do not disagree.** That section
+counts 17 Copilot PRs org-wide; this one counts 5, because it walks only the live
+workspace manifest. `nauroLabs-github#213` and `#205` are in the org and not in
+the manifest, so they are invisible here. When these numbers are re-run, say which
+population is being counted — it is the largest single source of apparent
+contradiction between them.
+
 ### Why that is a reason not to enable it
 
 The queue is drainable. That is precisely the problem. The drain is a human
@@ -852,6 +866,14 @@ called)` lines across the 10 genuine runs.** The model essentially never calls
 `submit_plan`. Every run in that sweep terminated holding a plan, and almost none of
 them terminated the way this document assumed.
 
+**That 9 is a count and not a floor, and the reason is load-bearing.** The log line sits
+behind `if plan_result:`, so a fallback that set `plan_captured` without logging would
+hide inside the remaining 1. It cannot: `_parse_plan_from_text` returns `None` on
+unparseable text rather than a falsy dict — verified 2026-08-28 for unparseable prose,
+for a bare `Score: 70`, and for the empty string — so the fallback cannot set
+`plan_captured` without also logging. Change that function's failure return and this
+number silently becomes a lower bound.
+
 **That inverts the reassurance.** A run that stops calling tools and writes prose
 instead is what a truncated run losing its thread looks like, so a high
 `plan_captured` rate is as consistent with the hazard as with safety. Reading it as
@@ -889,6 +911,12 @@ starts `run_`, and report: aggregate prompt/completion, the **per-run** ratio sp
 `plan` and `file-ideas` differ — and treat any span across a config change as two
 regimes, not one distribution. There is deliberately no committed script, for the
 reason given under "What the score actually measures".
+
+**Pair it with the run logs, not just the rows.** Count how many runs logged `Parsed
+plan from text response (submit_plan not called)`. A `plan_captured` count read
+without it cannot tell a run that submitted a plan from one that wrote prose and had
+it scraped — see the previous entry, which is the whole reason that distinction
+matters.
 
 ### What `reports/cost` does not measure
 
