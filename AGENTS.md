@@ -543,6 +543,14 @@ It is queued against a branch that is already in `master`, and there it sits.
 Those are three of the six `action_required` runs in the fleet: not a backlog
 awaiting review, but residue of merges that had already happened.
 
+**Do not say the human merged over red checks.** The other runs were *queued*
+9–21 seconds before each merge, which is tempting to read that way, but none had
+*concluded*: measured 2026-08-28, every run on all three PRs concluded 1–3
+seconds **after** the merge, so **0 failures were visible at merge time**. The
+merge did not override a red build — it happened before CI could report at all.
+Queued-before and concluded-before are different claims and only the second would
+support that reading.
+
 `Auto-merge Copilot PRs` started 9–21 seconds before each merge and concluded
 `failure` on all three. Whether it failed on its own merits or because a human
 merged the PR out from under a run already in flight is **not determinable** from
@@ -555,12 +563,29 @@ at `action_required` has produced no check run. The timing above says where the
 `[]` comes from — the run had not been queued yet when the PR was merged, and
 never will produce a job. Both were verified on `portaBaltica#181`.
 
-**The two measurements have different scopes and do not disagree.** That section
-counts 17 Copilot PRs org-wide; this one counts 5, because it walks only the live
-workspace manifest. `nauroLabs-github#213` and `#205` are in the org and not in
-the manifest, so they are invisible here. When these numbers are re-run, say which
-population is being counted — it is the largest single source of apparent
-contradiction between them.
+**The two measurements have different scopes and do not disagree.** They count
+different populations, and the split is not marginal. Measured 2026-08-28 —
+Copilot-authored pull requests, all states, across the non-archived org:
+
+| Population | Copilot PRs |
+|---|---|
+| `mindVault` (private, **not in the manifest**) | 87 |
+| `nauroLabs-github` (governance, **not in the manifest**) | 19 |
+| manifest projects (`portaBaltica` 4, `atlas` 1, `era` 1) | 6 |
+| `familyVault` | 2 |
+| **org total** | **114** |
+
+**106 of 114 agent pull requests in this org are invisible to a manifest-scoped
+sweep**, and the single largest producer is a repo autoRefine has never heard of.
+So a manifest-walking method is right about the fleet it ships and blind to where
+the agent is actually used. When these numbers are re-run, say which population
+was counted — it is the largest single source of apparent contradiction between
+these two sections, and an earlier revision of this paragraph carried an
+unsourced "17 org-wide" that reproduces under no definition tried.
+
+`mindVault` is also the second-largest line in the Actions bill (§"What the sweep
+actually costs"). It is not a manifest project, so nothing autoRefine measures —
+score, cost rows, PR cards — sees any of it.
 
 ### Why that is a reason not to enable it
 
@@ -593,11 +618,19 @@ and `mindVault` at $2.03 (23%), the rest a long tail of `*-legacy` repositories.
 
 ### What would change the decision
 
-A `pull_request` run on a `copilot/*` branch that concludes `success` at
-`run_attempt = 1`. That single fact would mean the approval gate has been
-configured away or satisfied, that CI is judging agent work rather than being
-skipped past, and that a merge could rest on something. Until then, more agent
-PRs buy more unreviewed merges.
+A `pull_request` run on a `copilot/*` branch **in a manifest project** that
+concludes `success` at `run_attempt = 1`. That single fact would mean the approval
+gate has been configured away or satisfied, that CI is judging agent work rather
+than being skipped past, and that a merge could rest on something. Until then,
+more agent PRs buy more unreviewed merges.
+
+**The scope qualifier is load-bearing.** `nauroLabs-github#191`
+(`copilot/restart-nauro-ops-loop`) already meets the bare condition — measured
+2026-08-28, its `Auto-review and merge` run is `success` at `run_attempt = 1`. So
+without "in a manifest project" the criterion reads as already satisfied while
+every project the fleet actually ships remains at zero. That repo is also the one
+with a working `Auto-review and merge`, which is why it clears and the others do
+not: **it is the example to copy, not evidence the problem is solved.**
 
 Fixing `Auto-merge Copilot PRs` would also change it — but establish first whether
 it is broken. It is the only automation that could drain this queue on evidence
