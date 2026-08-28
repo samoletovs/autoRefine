@@ -498,7 +498,10 @@ def test_fetch_workspace_manifest_fetches_and_caches(tmp_path: Path) -> None:
         )
 
     mock_get.assert_called_once_with(
-        "https://example.com/manifest.json", timeout=15, follow_redirects=True
+        "https://example.com/manifest.json",
+        timeout=15,
+        follow_redirects=True,
+        headers={},
     )
     assert result == _SAMPLE_MANIFEST
     assert cache_file.exists()
@@ -517,6 +520,75 @@ def test_fetch_workspace_manifest_raises_on_non_200(tmp_path: Path) -> None:
             health_scan.fetch_workspace_manifest(
                 url="https://example.com/manifest.json", cache_path=cache_file
             )
+
+
+# ── Manifest fetch must authenticate ────────────────────────────────────────
+# Added 2026-08-28. `nauroLabs-github` is private, and an unauthenticated GET of
+# a private repo's raw URL returns **404, not 401** — so the fetch failed with a
+# message that reads as "no such file". Both callers of this function
+# (`scan_app_insights`, `check_deployed_urls`) are unguarded, so the RuntimeError
+# aborted the whole run. Verified by running `--mode dashboard` against the live
+# API: it died at `check_deployed_urls`. This is why `--mode dashboard` had never
+# produced a file, and it takes `--mode health-scan` down the same way.
+
+
+def test_fetch_workspace_manifest_authenticates_to_github(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real manifest lives in a private repo, so the token must be sent."""
+    cache_file = tmp_path / "manifest.json"
+    monkeypatch.setenv("GH_TOKEN", "ghp_sekrit")
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = _SAMPLE_MANIFEST
+
+    with patch("agent.health_scan.httpx.get", return_value=mock_resp) as mock_get:
+        health_scan.fetch_workspace_manifest(
+            url=health_scan.MANIFEST_URL, cache_path=cache_file
+        )
+
+    headers = mock_get.call_args.kwargs["headers"]
+    assert headers == {"Authorization": "Bearer ghp_sekrit"}
+
+
+def test_fetch_workspace_manifest_does_not_leak_token_off_github(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``url`` is a parameter, so a non-GitHub host must never see the token."""
+    cache_file = tmp_path / "manifest.json"
+    monkeypatch.setenv("GH_TOKEN", "ghp_sekrit")
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = _SAMPLE_MANIFEST
+
+    with patch("agent.health_scan.httpx.get", return_value=mock_resp) as mock_get:
+        health_scan.fetch_workspace_manifest(
+            url="https://example.com/manifest.json", cache_path=cache_file
+        )
+
+    assert mock_get.call_args.kwargs["headers"] == {}
+
+
+def test_fetch_workspace_manifest_sends_no_header_without_a_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No token is not the same as an empty token — send nothing at all."""
+    cache_file = tmp_path / "manifest.json"
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = _SAMPLE_MANIFEST
+
+    with patch("agent.health_scan.httpx.get", return_value=mock_resp) as mock_get:
+        health_scan.fetch_workspace_manifest(
+            url=health_scan.MANIFEST_URL, cache_path=cache_file
+        )
+
+    assert mock_get.call_args.kwargs["headers"] == {}
 
 
 # ── Shipped vs not-shipped classification ───────────────────────────────────────
