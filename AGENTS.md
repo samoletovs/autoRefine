@@ -273,6 +273,55 @@ critical or high alerts, so the check currently produces no findings at all.
 `samoletovs/.github` answers 403 with alerts disabled; that is the one repo where
 the dimension is unmeasured rather than clean.
 
+## `--mode dashboard` was dead, and the manifest fetch was why
+
+The `--report` contract described above — pass the evaluate-mode report or the
+Score Coverage section renders empty — was documented but had never been run.
+Exercised end to end on 2026-08-28 it did not merely render an empty section: the
+process died before writing any file at all.
+
+`fetch_workspace_manifest()` GETs the manifest from `raw.githubusercontent.com`
+and, until 2026-08-28, sent no credential. `nauroLabs-github` is **private**, and
+an unauthenticated GET of a private repo's raw URL returns **404, not 401** —
+GitHub hides existence rather than refusing access. So the fetch raised
+`RuntimeError: … HTTP 404`, which reads as "the manifest is gone" rather than
+"you did not ask as anyone". Both callers — `check_deployed_urls` and
+`scan_app_insights` — are unguarded, so the exception took the whole run with it.
+
+Three things about that are worth keeping:
+
+- **The 404 is the trap, not the 401.** Any future check that reads a private
+  repo over `raw.githubusercontent.com` will fail this same way, and the error
+  will point at the path. `_manifest_auth_headers` is host-gated — `url` is a
+  parameter, and a token must not follow an override to a non-GitHub host.
+- **The loud failure stays loud.** It would have been easy to catch the error in
+  dashboard mode and carry on. That renders a page reporting zero unhealthy URLs
+  because none were checked, which is a false all-clear — the same class of bug
+  as a green tick for a check that never ran. A manifest that cannot be read must
+  stop the run.
+- **It is not a dashboard bug.** `--mode health-scan` calls the same two
+  functions and dies identically. That mode has never run: all 6 of its scheduled
+  runs are `skipped`, and `reports/health` does not exist in the governance repo,
+  so nothing has ever been committed by it. The defect was invisible because the
+  only two modes that could have hit it were both switched off.
+
+**Verified after the fix**, `--repo samoletovs/autoRefine`, exit 0: Score Coverage
+renders `autoRefine | 90/100 | 4/7 | ci-cd (not-declared), security
+(not-applicable), i18n (not-declared)`, matching the evaluate report exactly.
+Omitting `--report` renders "No evaluation coverage available — run `--mode
+evaluate` to populate it." Both halves of the documented contract hold.
+
+Dashboard mode makes no writes: it files no issue, opens no PR and sends no
+Telegram, and `analyze_with_ai` returns an error dict rather than calling a model
+when `AZURE_OPENAI_ENDPOINT` is unset. That is what made it safe to run against
+the live API at no token cost, and it is why this could be verified when
+health-scan could not.
+
+Two failures seen while doing this were **Windows-only** and must not be "fixed":
+`/tmp/workspace-manifest.json` has no parent on Windows, and `print(report)`
+raises `UnicodeEncodeError` under a cp1252 console. The job runs on Linux in a
+`python:3.12` container where both are fine.
+
 ## What the ideation loop learns from
 
 An idea can die in two places, and until 2026-08-27 the loop only watched one of
@@ -444,6 +493,130 @@ Build it the day that returns a non-empty set for more than one or two projects 
 re-check the hard rule 3 collision first. There is deliberately no committed script,
 for the reason given under "What the score actually measures".
 
+## Why `refine` mode is implemented and not enabled
+
+`refine` is the autonomous-fix path: plan, apply, test, branch, push, open a PR.
+It is fully implemented (`agent/main.py`, `refine_project`) and has **never run in
+production**, because `infrastructure/run-autorefine.sh` hard-codes
+`--mode file-ideas`. Enabling it was considered on 2026-08-28 and **declined**.
+
+The reason is not the one that looks obvious. It is not that agent PRs pile up
+unmergeably — measured below, they merge fine. It is that **the only demonstrated
+way they merge is a human merging past CI that never ran**, and `refine` would
+scale exactly that.
+
+### What was measured, 2026-08-28
+
+Across the 25 live manifest projects, every PR authored by the Copilot coding
+agent, and every workflow run on those PRs' head branches:
+
+| | |
+|---|---|
+| Copilot-authored PRs, all states, all time | **5**, in 3 repos |
+| …merged | **3** (`portaBaltica` #179, #180, #181, all that day) |
+| Workflow runs on those branches | **22** |
+| …at `run_attempt = 2` | **0** |
+| `event=pull_request` runs among them | 16 |
+| …that concluded `success` | **0** |
+| …`action_required` (awaiting a human click) | 6 |
+| …`failure` | 10 |
+
+The 5 runs that did succeed are all `Running Copilot cloud agent`
+(`event=dynamic`) — the agent building the branch, not CI judging it. **No
+`pull_request` run on a Copilot branch has ever passed, once, anywhere in the
+fleet.** All 6 `action_required` runs sit on `copilot/*` branches, so the
+approval gate is real and it is aimed squarely at this traffic.
+
+And yet three PRs merged, all by `samoletovs`, **14, 25 and 16 seconds after
+opening** — past checks showing `action_required` and `failure`. The timing is
+worth stating exactly, because it shows the gate was never reached rather than
+overridden:
+
+| | `#179` | `#180` | `#181` |
+|---|---|---|---|
+| PR created | 05:58:03 | 06:04:29 | 06:27:02 |
+| merged by a human | 05:58:28 | 06:04:43 | 06:27:18 |
+| the `action_required` CI run was queued | 05:58:31 | 06:04:46 | 06:27:20 |
+
+**The blocked CI run starts 2–3 seconds *after* the merge it was meant to gate.**
+It is queued against a branch that is already in `master`, and there it sits.
+Those are three of the six `action_required` runs in the fleet: not a backlog
+awaiting review, but residue of merges that had already happened.
+
+`Auto-merge Copilot PRs` started 9–21 seconds before each merge and concluded
+`failure` on all three. Whether it failed on its own merits or because a human
+merged the PR out from under a run already in flight is **not determinable** from
+the run data — but either way it did not perform the merge, and a human did.
+
+### Why that is a reason not to enable it
+
+The queue is drainable. That is precisely the problem. The drain is a human
+merging in about twenty seconds, before CI has even been queued, and it ran at
+three PRs a day. `refine` adds a second producer feeding the same queue, and
+nothing in the measurement suggests the *review* would scale with it — a
+20-second lag is already too short to have read a diff.
+
+So enabling `refine` does not risk a stalled queue. It risks a faster one,
+draining the same way, with more in it. The thing to fix first is the merge path,
+not the supply of PRs.
+
+Two supporting conditions, both weaker than the above and both temporary:
+
+- **The card/merge loop is switched off.** `AUTOREFINE_TIER=critical` skips
+  `.github/workflows/pr-ready-cards.yml`; every scheduled run since 2026-08-22 is
+  `skipped`, as is every run of the health scan.
+- **August's Actions allowance is spent**: gross $64.56, discount $55.60, **net
+  $8.97** overage on ~10,760 minutes. Read it with
+  `gh api "/users/samoletovs/settings/billing/usage?year=2026&month=8"`, summing
+  `grossAmount`/`discountAmount`/`netAmount` over `product == "actions"`; the
+  older `/settings/billing/actions` endpoint now answers **HTTP 410**.
+
+**Do not write that the brake was engaged because autoRefine is expensive.** It
+is not and never was: autoRefine is public, public minutes are free, and its
+entire August Actions cost is **$0.01** across 130 minutes. The brake bought
+about one cent. The bill is elsewhere — `nauroLabs-github` at $2.95 (33% of net)
+and `mindVault` at $2.03 (23%), the rest a long tail of `*-legacy` repositories.
+
+### What would change the decision
+
+A `pull_request` run on a `copilot/*` branch that concludes `success` at
+`run_attempt = 1`. That single fact would mean the approval gate has been
+configured away or satisfied, that CI is judging agent work rather than being
+skipped past, and that a merge could rest on something. Until then, more agent
+PRs buy more unreviewed merges.
+
+Fixing `Auto-merge Copilot PRs` would also change it — but establish first whether
+it is broken. It is the only automation that could drain this queue on evidence
+rather than on patience, and nobody has yet read why it fails.
+
+### Re-running the measurement
+
+Take the live manifest, list every PR whose `user.login` is `Copilot`, and for
+each fetch `/actions/runs?branch=<head>&per_page=100`; group by `event`,
+`run_attempt` and `conclusion`, and read `merged_by` alongside them. Cross-check
+the blocked set with `/actions/runs?status=action_required` per repo, which
+answers directly and avoids paginating history. About 55 calls for 25 projects
+against a 15,000/hr budget.
+
+**The step that produced the sharpest finding is comparing each run's
+`created_at` against the PR's `merged_at`.** Run-level conclusions alone say
+"blocked"; the timestamps say the blocked run was queued *after* the merge, which
+is a different fact and the one that matters. Do not skip it. There is
+deliberately no committed script, for the reason given under "What the score
+actually measures".
+
+**Every number here expires under hard rule 7**, and this set is unusually
+volatile: all three merges happened on the day of measurement, so the fleet had a
+one-day history of merging agent PRs at all. The Actions billing figures moved
+between two reads eight minutes apart (gross $64.39 → $64.56) because the meter
+is live; `action_required` counts move too, the moment somebody clicks.
+
+**The deploy trap applies if this is ever reversed.**
+`infrastructure/run-autorefine.sh` is inlined into the ARM template by
+`loadTextContent` at deploy time, so changing `--mode file-ideas` there does
+nothing until a human runs `az deployment group create`. See "The entrypoint is
+baked in; the Python is not".
+
 ## The workflows have five minutes to buy their tokens
 
 Both agent workflows authenticate with OIDC federated credentials rather than a
@@ -560,6 +733,9 @@ The daily manifest sweep is the whole Foundry bill. On 2026-08-21 the live meter
 47% of the entire Azure subscription — against 0.79M output tokens. A 552:1 input to
 output ratio is not analysis, it is the same context being re-sent.
 
+**That 552:1 is a 2026-08-21 reading and is not current** — see "The ratio,
+re-measured" below, which reads 58.5:1 from a different instrument.
+
 Two things drive it, and they multiply:
 
 | Driver | Why it costs | Lever |
@@ -607,6 +783,106 @@ Two rules it must keep:
 Only the Foundry planning is gated. The deterministic evaluation still runs for every
 project, so scores and the Telegram summary continue to cover the whole fleet.
 
+### The ratio, re-measured
+
+Measured 2026-08-28 from the only cost file that exists,
+`samoletovs/nauroLabs-github` → `reports/cost/run-2026-08-28-0607.jsonl`, filtered to
+the 10 genuine rows (see the contamination note under "Sizing the job ceiling"):
+**prompt 500,232, completion 8,558 — 58.5:1**, over 6 projects in one sweep.
+
+**Do not call that a 9× improvement on 552:1.** The two numbers come from different
+instruments and are not comparable:
+
+| | 552:1 | 58.5:1 |
+|---|---|---|
+| Source | Azure billing meter, month-to-date | `RunCompletionUsage`, per run |
+| Scope | one **cached** SKU, aggregated over a month | 10 runs, one sweep, n=10 |
+| Date | 2026-08-21 | 2026-08-28 |
+
+If the cached SKU was a subset of total input rather than all of it, the old true
+ratio was lower and any improvement is overstated. Nobody has checked which, and
+until someone does the honest statement is "58.5:1 on 2026-08-28, n=10" with no
+comparison attached.
+
+**Do not attribute the change to the activity gate.** The gate changes how many runs
+happen; this ratio is per-run. It moves the bill and can never move this number.
+`truncation_strategy` is the plausible cause, and the `system.md` cache prefix may
+contribute — but the mechanism is unconfirmed, and the next entry is why.
+
+**58.5:1 is a total, not a description of a run.** The per-run spread is
+min 10.8, median 61.8, max 84.7 — nearly 8×. Quote the aggregate for cost, never
+for "what a run looks like".
+
+#### An open contradiction, recorded rather than resolved
+
+The driver table above says a plan run is ~74 rounds and input is O(rounds²).
+Observed on the same 10 rows: `rounds` = 1, 4, 5, 5, 6, 6, 6, 7, 7, 8 — mean 5.5,
+and **6.0 for `plan` alone**, which is the like-for-like comparison and makes the
+gap wider, not narrower.
+
+74 → 6.0 is a 12.3× drop. Squared, that predicts ~152× less input. The observed
+ratio change is 9.4×. Something is wrong by more than an order of magnitude, and at
+least one of these is the culprit:
+
+- the O(rounds²) model — but `truncation_strategy` was *designed* to convert it to
+  roughly O(rounds), so comparing both regimes under one model is itself suspect;
+- the ~74 figure, which may never have been representative;
+- the cross-instrument comparison in the table above, which is already known to be
+  unsound.
+
+**Truncation does not explain the round collapse.** It caps context *per round*; it
+does not make a model ask for fewer rounds. Why rounds fell from ~74 to ~6 is
+genuinely unexplained. Do not assert a cause — measure it when there are files to
+measure.
+
+#### The window is verified at the depth actually observed
+
+AGENTS.md asks for evidence before tightening the truncation window: *"Don't tighten
+the window below 12 without evidence that runs still reach `submit_plan`."* The cost
+rows carry it. All 10 genuine rows: `RunStatus.COMPLETED`, `plan_captured = True`,
+`guard = None` — 6/6 `plan` and 4/4 `file-ideas`, at 1–8 rounds. Neither round guard
+fired. Fewer rounds is not runs giving up early.
+
+Read the scope exactly, because it is narrower than it looks. This is evidence that
+the **default** window of 12 is safe at the depths observed. It is **not** evidence
+that a tighter window is safe, and it cannot be: the rows record `rounds` and
+`tool_calls`, not messages, so nothing here says whether the 12-message window was
+ever the binding constraint. The shortest run — `prime`/`file-ideas`, 1 round, 3 tool
+calls — cannot have reached 12 messages at all, so truncation certainly never
+engaged on it. That same row is its own open question: either a legitimately trivial
+run, or `plan_captured` goes `True` more easily than it should. Unresolved.
+
+### Re-running the ratio measurement
+
+One file, one sweep, one regime. This wants several clean files before anyone sizes
+anything on it. Files from 2026-08-29 onward are clean (`_test_subprocess_env` and
+`tests/conftest.py` now strip `AUTOREFINE_*` from child processes).
+
+Fetch each `reports/cost/*.jsonl` from `nauroLabs-github`, keep rows whose `run_id`
+starts `run_`, and report: aggregate prompt/completion, the **per-run** ratio spread,
+`rounds` by `mode`, and the `status`/`plan_captured`/`guard` counts. Split by `mode` —
+`plan` and `file-ideas` differ — and treat any span across a config change as two
+regimes, not one distribution. There is deliberately no committed script, for the
+reason given under "What the score actually measures".
+
+### What `reports/cost` does not measure
+
+"Cost" there means **Foundry LLM tokens, and nothing else**. The row schema is
+`project, mode, rounds, run_id, status, guard, plan_captured, prompt_tokens,
+completion_tokens, total_tokens, tool_calls, duration_s, ts` — no field for GitHub
+Actions minutes, and no field for money in any currency. The €5/month cap in hard
+rule 6 is a cap on that one meter.
+
+The fleet's other meter is real and entirely unmodelled. August 2026 Actions, read
+2026-08-28: gross $64.56, discount $55.60, **net $8.97** on ~10,760 minutes. The
+largest lines are `nauroLabs-github` at $2.95 (33% of net) and `mindVault` at $2.03
+(23%) — and **`mindVault` is not in the workspace manifest at all**. So there are two
+limitations stacked, and the first is the sharper: Actions spend is not in the schema,
+so autoRefine cannot see it for any repo; and even if it were, the telemetry is
+manifest-scoped, so `mindVault` would stay invisible.
+
+Do not conclude the fleet costs whatever the cost log says. It reports one meter.
+
 ### Sizing the job ceiling
 
 `replicaTimeout` was 3h, sized on a single 116-minute sample whose comment described it as
@@ -647,13 +923,22 @@ two regimes rather than one distribution. The cost rows in `reports/cost` carry 
 `mode` and `rounds`, which will say whether a long run is many projects or a few slow ones —
 and that, not the ceiling, decides whether the gate is the thing to move.
 
-**The first cost file is contaminated; do not read it as data.**
+**The first cost file is partly fabricated. Filter it, don't avoid it.**
 `nauroLabs-github`'s `reports/cost/run-2026-08-28-0607.jsonl` — the first one ever written,
-so the tempting baseline — has 18 of its 28 rows fabricated. autoRefine is in its own
-manifest, so planning itself made the model call `run_project_tests`, and pytest inherited
-the entrypoint's `AUTOREFINE_COST_LOG` and appended `tests/test_foundry_agent.py`'s
-fixtures. They are obvious once known: `project: "demo"`, `run_id: "run-1"`,
-`duration_s: 0.0`, all 18 inside 0.11s.
+so the tempting baseline — has 18 of its 28 rows fabricated. **Keep the rows whose `run_id`
+starts `run_`** (a real Foundry id). That leaves 10 genuine rows, and they are good data:
+"The ratio, re-measured" above is built on them.
+
+This warning used to open with "do not read it as data", and that cost something: a reader
+took it as "don't look" and nearly discarded every finding in that section. The remedy
+belongs first — the story second.
+
+The story: autoRefine is in its own manifest, so planning itself made the model call
+`run_project_tests`, and pytest inherited the entrypoint's `AUTOREFINE_COST_LOG` and
+appended `tests/test_foundry_agent.py`'s fixtures. Three markers catch all 18 —
+`project: "demo"`, `run_id: "run-1"`, `duration_s: 0.0`, all inside 0.11s. A null
+`prompt_tokens` looks like a fourth and **is not**: measured 2026-08-28 it holds for only
+14 of the 18, so it leaks four fixtures into a set you believe is clean. Use `run_id`.
 
 It did not merely pad the file, it **inverted its headline finding**. The fixtures carry 7
 `stuck_tool_loop` trips and 2 `max_tool_rounds`, so the file reads as though the loop
@@ -662,8 +947,7 @@ Sum tokens over those 18 and the bill is wrong in the other direction too.
 
 `_test_subprocess_env` strips every `AUTOREFINE_*` before the child starts and
 `tests/conftest.py` does the same from the suite's side, so files from 2026-08-29 onward
-are clean. Filter on `run_id` starting `run_` — a real Foundry id — if you ever need to
-read the contaminated one anyway.
+are clean and need no filtering.
 
 ## Why the PR-card sweep is a cron and not an event
 `pr-ready-cards.yml` reads open PRs across every project in the workspace manifest.

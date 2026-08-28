@@ -44,6 +44,29 @@ MANIFEST_URL = (
 )
 _MANIFEST_CACHE_PATH = Path("/tmp/workspace-manifest.json")
 
+# Hosts the manifest token may be presented to. The token is a credential, and
+# ``url`` is a parameter, so an override pointing anywhere else must not be sent
+# one — a redirect off GitHub would otherwise hand it to a third party.
+_GITHUB_AUTH_HOSTS = frozenset(
+    {"raw.githubusercontent.com", "api.github.com", "github.com"}
+)
+
+
+def _manifest_auth_headers(url: str) -> dict[str, str]:
+    """Authorization header for *url*, or ``{}`` when none should be sent.
+
+    ``nauroLabs-github`` is a **private** repository, and an unauthenticated GET
+    of a private repo's raw URL returns 404 — not 401 — so the failure reads as
+    "no such file" rather than "not allowed". Every caller here already requires
+    ``GH_TOKEN``, so presenting it is free.
+    """
+    from urllib.parse import urlsplit
+
+    if urlsplit(url).hostname not in _GITHUB_AUTH_HOSTS:
+        return {}
+    token = os.environ.get("GH_TOKEN", "") or os.environ.get("GITHUB_TOKEN", "")
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
 
 # ── Workspace manifest helpers ─────────────────────────────────────────────
 def fetch_workspace_manifest(
@@ -53,7 +76,9 @@ def fetch_workspace_manifest(
     """Fetch workspace-manifest.json, caching it for this invocation.
 
     Raises RuntimeError if the remote returns a non-200 status so that
-    health-scan fails loudly rather than silently scanning a stale list.
+    health-scan fails loudly rather than silently scanning a stale list. That
+    loudness is deliberate and must stay: a dashboard drawn from an absent
+    manifest would report zero unhealthy URLs, which reads as all-clear.
     """
     if cache_path.exists():
         try:
@@ -63,7 +88,9 @@ def fetch_workspace_manifest(
             log.warning("Manifest cache at %s is unreadable (%s) — re-fetching", cache_path, exc)
             cache_path.unlink(missing_ok=True)
 
-    resp = httpx.get(url, timeout=15, follow_redirects=True)
+    resp = httpx.get(
+        url, timeout=15, follow_redirects=True, headers=_manifest_auth_headers(url)
+    )
     if resp.status_code != 200:
         raise RuntimeError(
             f"Failed to fetch workspace manifest from {url}: HTTP {resp.status_code}"
