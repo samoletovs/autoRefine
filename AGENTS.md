@@ -835,22 +835,47 @@ does not make a model ask for fewer rounds. Why rounds fell from ~74 to ~6 is
 genuinely unexplained. Do not assert a cause — measure it when there are files to
 measure.
 
-#### The window is verified at the depth actually observed
+#### `plan_captured` is not evidence about `submit_plan` — measured, and it is worse
 
-AGENTS.md asks for evidence before tightening the truncation window: *"Don't tighten
-the window below 12 without evidence that runs still reach `submit_plan`."* The cost
-rows carry it. All 10 genuine rows: `RunStatus.COMPLETED`, `plan_captured = True`,
-`guard = None` — 6/6 `plan` and 4/4 `file-ideas`, at 1–8 rounds. Neither round guard
-fired. Fewer rounds is not runs giving up early.
+This section previously read the cost rows as the evidence AGENTS.md asks for before
+tightening the truncation window: *"Don't tighten the window below 12 without evidence
+that runs still reach `submit_plan`."* **It is not that evidence, and the production
+logs say the opposite.**
 
-Read the scope exactly, because it is narrower than it looks. This is evidence that
-the **default** window of 12 is safe at the depths observed. It is **not** evidence
-that a tighter window is safe, and it cannot be: the rows record `rounds` and
-`tool_calls`, not messages, so nothing here says whether the 12-message window was
-ever the binding constraint. The shortest run — `prime`/`file-ideas`, 1 round, 3 tool
-calls — cannot have reached 12 messages at all, so truncation certainly never
-engaged on it. That same row is its own open question: either a legitimately trivial
-run, or `plan_captured` goes `True` more easily than it should. Unresolved.
+`plan_captured` is `plan_result is not None`, and `plan_result` is assigned in **two**
+places: `foundry_agent.py:1110` when the model calls `submit_plan`, and `:1162` when it
+did not and autoRefine scraped a plan out of its prose instead
+(`_parse_plan_from_text`). The row cannot tell you which fired. Only the log line can.
+
+Measured on the 2026-08-28 sweep — **9 `Parsed plan from text response (submit_plan not
+called)` lines across the 10 genuine runs.** The model essentially never calls
+`submit_plan`. Every run in that sweep terminated holding a plan, and almost none of
+them terminated the way this document assumed.
+
+**That inverts the reassurance.** A run that stops calling tools and writes prose
+instead is what a truncated run losing its thread looks like, so a high
+`plan_captured` rate is as consistent with the hazard as with safety. Reading it as
+safety is the `npm audit` shape again: a value that is present, correct, and means two
+opposite things.
+
+What the rows do support, and it is worth keeping: all 10 were
+`RunStatus.COMPLETED` with `guard = None` at 1–8 rounds, so no run hit a loop guard and
+none ended empty-handed. That rules out the worst case. It says nothing about the
+window, because the rows record `rounds` and `tool_calls`, not messages —
+`prime`/`file-ideas` at 1 round and 3 tool calls cannot have reached 12 messages, so
+truncation never engaged on it at all.
+
+Two questions this opens, neither answered:
+
+- **Is `_parse_plan_from_text` load-bearing production code?** On this evidence it is
+  the normal path, not a fallback, and it is named and documented as a fallback. Nobody
+  has looked at whether the scraped plans are as good as submitted ones.
+- **Did truncation cause this, or has the model always ignored the tool?** One sweep
+  cannot say. The cheap test is the same grep against a pre-truncation sweep's logs.
+
+The measurement is one `az monitor log-analytics query` for
+`Parsed plan from text response` over a sweep's `ContainerGroupName_s`. Re-run it before
+believing anything in this subsection; per hard rule 7 the count is from one day.
 
 ### Re-running the ratio measurement
 
