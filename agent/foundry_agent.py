@@ -465,25 +465,128 @@ def _handle_list_directory(project_dir: Path, args: dict) -> str:
     return json.dumps({"path": rel_path, "entries": entries})
 
 
+CONTROL_ENV_PREFIX = "AUTOREFINE_"
+
+TEST_ENV_PASSTHROUGH_ENV = "AUTOREFINE_TEST_ENV_PASSTHROUGH"
+
+# What a project's test suite may inherit from us. Everything else is withheld.
+#
+# Compared case-insensitively, so each name appears once. Windows upper-cases every key
+# in ``os.environ`` while POSIX does not, and POSIX tooling reads both ``HTTPS_PROXY``
+# and ``https_proxy``; matching on case would mean listing several spellings of the same
+# variable and still missing one. A case variant of a benign name is benign — the risk
+# an allow-list controls is *which* variables, not how they are spelled.
+TEST_ENV_ALLOWED: frozenset[str] = frozenset({
+    # Finding and starting an interpreter at all. Without PATH there is no `python`,
+    # no `npm` and no `git`; without PATHEXT, Windows cannot resolve `npm.cmd`.
+    "PATH", "PATHEXT", "COMSPEC", "SHELL", "TERM",
+    # Where a toolchain looks for its config and writes its caches. pip, npm and git
+    # all resolve these before they do anything.
+    "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
+    "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
+    "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+    "TMPDIR", "TEMP", "TMP",
+    # Windows machinery. A child Python does not start without SYSTEMROOT, so these are
+    # correctness on the machine this is developed on rather than convenience.
+    "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "OS", "DRIVERDATA",
+    "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432",
+    "COMMONPROGRAMFILES", "COMMONPROGRAMFILES(X86)", "COMMONPROGRAMW6432",
+    "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "PROCESSOR_ARCHITEW6432",
+    "PROCESSOR_IDENTIFIER", "PROCESSOR_LEVEL", "PROCESSOR_REVISION",
+    "COMPUTERNAME", "USERNAME", "USERDOMAIN", "LOGNAME", "USER", "HOSTNAME", "PWD",
+    # Locale and time zone. Assertions on formatted dates and sorted text turn on these,
+    # and a suite that passes under one locale can fail under another.
+    "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_COLLATE", "LC_MESSAGES",
+    "LC_MONETARY", "LC_NUMERIC", "LC_TIME", "TZ",
+    # Python.
+    "PYTHONPATH", "PYTHONHOME", "PYTHONHASHSEED", "PYTHONIOENCODING", "PYTHONUTF8",
+    "PYTHONDONTWRITEBYTECODE", "PYTHONUNBUFFERED", "PYTHONWARNINGS", "PYTHONBREAKPOINT",
+    "PYTHONFAULTHANDLER", "PYTHONNOUSERSITE", "PYTHONPYCACHEPREFIX",
+    "VIRTUAL_ENV", "CONDA_PREFIX", "PIP_CACHE_DIR",
+    # Node. Named one by one rather than by a NODE_ prefix: `NODE_AUTH_TOKEN` is the npm
+    # registry credential `actions/setup-node` writes, so the obvious prefix would hand a
+    # publish token to every suite. The same reasoning excludes `npm_config_*`, which
+    # carries `npm_config__auth`.
+    "NODE_ENV", "NODE_PATH", "NODE_OPTIONS", "NODE_EXTRA_CA_CERTS", "NODE_NO_WARNINGS",
+    "NVM_DIR", "NVM_BIN",
+    # Reaching the network from a proxied or custom-CA network at all.
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "FTP_PROXY",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+    # The marker a suite reads to know it is not on a developer's laptop. Measured in use
+    # by one fleet project's tests.
+    "CI",
+})
+
+
+def _test_env_passthrough() -> set[str]:
+    """Extra names an operator has explicitly allowed, upper-cased."""
+    raw = os.environ.get(TEST_ENV_PASSTHROUGH_ENV, "")
+    return {part.strip().upper() for part in raw.split(",") if part.strip()}
+
+
 def _test_subprocess_env() -> dict[str, str]:
-    """Environment for a project's own test suite: ours minus our control variables.
+    """Environment for a project's own test suite: an allow-list, not our whole process.
 
-    A test suite runs as our child and inherits our environment, which includes
-    ``AUTOREFINE_COST_LOG`` — the path the entrypoint commits as production cost
-    telemetry. autoRefine is itself in the manifest, so when it plans itself the model
-    calls ``run_project_tests``, pytest reaches ``tests/test_foundry_agent.py``, and its
-    fixtures append rows to the live log.
+    A test suite is arbitrary code from someone else's repository, run as our child. It
+    inherited everything we hold, and in production that is every credential the job has:
+    ``GH_TOKEN`` and ``GITHUB_TOKEN`` (the same org-wide PAT), ``NAURO_BOT_TOKEN``, and —
+    because Azure Container Apps injects them and nothing in this repository ever named
+    them — ``IDENTITY_ENDPOINT`` and ``IDENTITY_HEADER``, which together mint tokens for
+    the job's managed identity. That identity holds Key Vault Secrets User on the vault
+    holding the PAT (``infrastructure/main.bicep``), so the pair is not one credential
+    but a key to the rest.
 
-    Measured 2026-08-28 on the first cost file ever written: 18 of 28 rows were fixtures
-    for a project named ``demo``, all inside 0.11s, carrying 7 ``stuck_tool_loop`` trips
-    and 2 ``max_tool_rounds`` — guards that had in fact never fired in production. The
-    file was not merely padded, it inverted its own headline finding.
+    **An allow-list rather than a deny-list, for a reason this file already demonstrates.**
+    The previous version of this function was a deny-list of one prefix, added because
+    ``AUTOREFINE_COST_LOG`` — a variable introduced in #12 and not thought about here —
+    leaked into children and corrupted the first cost file the pipeline ever wrote (18 of
+    28 rows were fixtures for a project named ``demo``). A deny-list is a promise to
+    remember every future variable; that promise had already been broken once before
+    anyone noticed. The two Container Apps identity variables make the point sharper still:
+    the most dangerous values in the production environment are ones no author of a
+    deny-list here would think to list, because Azure sets them and this repository has
+    never mentioned them.
 
-    Stripping every ``AUTOREFINE_*`` rather than the three known leaks is deliberate: the
-    next control variable is covered without anyone having to remember this. Nothing in
-    the suite reads one it did not itself set, so removing them changes no test outcome.
+    **The cost of getting an allow-list too narrow was measured, not assumed** (2026-08-28,
+    all 25 live manifest projects, shallow-cloned and scanned for environment reads). A
+    narrowing can only break a suite for a variable that is both read by that suite *and*
+    present in our environment to begin with. Of 267 distinct names the fleet reads, 256
+    are absent from ours — the child never received them under either rule. In test-scoped
+    files the intersection is two: ``AUTOREFINE_COST_LOG`` (this repo's own suite, already
+    withheld on purpose) and ``FOUNDRY_PROJECT_ENDPOINT`` (foundryLab, in
+    ``agents/labMemoryAgent/src/smoke_test.py``, which the ``pytest tests/`` this module
+    runs does not collect — foundryLab has no root ``tests/``). Re-measure rather than
+    quote: AGENTS.md hard rule 7 applies to every number here.
+
+    Withholding is also a correctness fix, not only a containment one. turgo's
+    ``src/server/services/ai-dev.ts`` logs ``GITHUB_TOKEN not set, returning mock
+    response`` — the branch its tests are written for. Today it finds a real org-wide PAT
+    in our environment and takes the live path instead, so autoRefine's credential is
+    spending someone else's rate limit inside their test run.
+
+    ``AUTOREFINE_*`` is stripped unconditionally after the allow-list rather than left
+    implicit. The allow-list already excludes it, but that is an accident of the list's
+    contents: ``AUTOREFINE_TIER`` is exactly the sort of thing someone later adds because
+    a project asks for it, and re-opening the path that corrupted production telemetry
+    should take more than one plausible-looking edit.
     """
-    return {k: v for k, v in os.environ.items() if not k.startswith("AUTOREFINE_")}
+    allowed = TEST_ENV_ALLOWED | _test_env_passthrough()
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() in allowed and not key.upper().startswith(CONTROL_ENV_PREFIX)
+    }
+
+    # Names only, never values: this line exists so a suite that broke because we took
+    # something away can be diagnosed from a run's logs, which is the whole risk of
+    # choosing an allow-list. Logging a value here would recreate the leak in the log.
+    withheld = sorted(key for key in os.environ if key not in env)
+    if withheld:
+        log.debug(
+            "test subprocess env: passing %d of %d variable(s); withheld %s",
+            len(env), len(os.environ), ", ".join(withheld),
+        )
+    return env
 
 
 def _handle_run_tests(project_dir: Path, _args: dict) -> str:

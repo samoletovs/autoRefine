@@ -83,19 +83,26 @@ class TestControlVariablesDoNotReachTheChild:
         assert rec.env is not None
         assert [k for k in rec.env if k.startswith("AUTOREFINE_")] == []
 
-    def test_unrelated_environment_survives(
+    def test_the_child_still_gets_an_environment_it_can_run_in(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Scrubbing our own knobs must not amount to handing the child an empty env."""
+        """Scrubbing must not amount to handing the child an empty env.
+
+        The assertion changed when ``_test_subprocess_env`` became an allow-list: an
+        arbitrary project variable is now withheld, which is the point of that change and
+        is covered in ``tests/test_test_env_scoping.py``. What this test is for survives
+        unaltered — a child that cannot find an interpreter runs nothing, and a
+        ``passed: false`` from a suite that never started is indistinguishable from a
+        suite that failed.
+        """
         monkeypatch.setenv("AUTOREFINE_COST_LOG", "/tmp/x.jsonl")
-        monkeypatch.setenv("PROJECT_NEEDS_THIS", "keep-me")
         rec = _Recorder()
         monkeypatch.setattr(subprocess, "run", rec)
 
         foundry_agent._handle_run_tests(_python_project(tmp_path), {})
 
         assert rec.env is not None
-        assert rec.env.get("PROJECT_NEEDS_THIS") == "keep-me"
+        assert rec.env, "an empty environment would stop the child from starting at all"
         assert "PATH" in rec.env
 
 
