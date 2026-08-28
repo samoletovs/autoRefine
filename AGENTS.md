@@ -652,6 +652,31 @@ is a different fact and the one that matters. Do not skip it. There is
 deliberately no committed script, for the reason given under "What the score
 actually measures".
 
+**`branch=` and `head_sha=` are different questions, and this document uses both.**
+This recipe says `branch=`; "An empty check rollup is not evidence that CI is
+green" says `head_sha=`. Both are correct for what they ask — `head_sha=` asks what
+ran on the PR's *current* head, which is what a live readiness check needs;
+`branch=` asks what ever ran on the branch, superseded commits included, which is
+what a historical claim needs. They do not agree. Measured 2026-08-28 over the same
+19 Copilot PRs in `nauroLabs-github`:
+
+| Query | total runs | `pull_request` | `run_attempt` | `action_required` | successes |
+|---|---|---|---|---|---|
+| `head_sha=` | 24 | 21 | 14 × 1, 7 × 2 | 11 | 6 (1 at attempt 1) |
+| `branch=` | 49 | 26 | 19 × 1, 7 × 2 | 13 | 7 (2 at attempt 1) |
+
+Ten of the 19 PRs return nothing at all under `head_sha=`. So "say which population
+you counted" has a second half — **say which question you asked the API** — and a
+reader comparing counts across these two sections without it will conclude one of
+them is wrong. Neither is.
+
+Note what did *not* move: `7 × 2` is identical under both, and it is the figure the
+argument rests on. **A conclusion that survives a change of query is worth more than
+one that needs the right query to hold**, and re-running a count both ways is the
+cheapest test available of whether a finding is real. Also paginate
+`pulls?state=all`; a repo's Copilot PRs run back past one page, and truncating there
+is what produced a wrong PR count the first time this was measured.
+
 **Every number here expires under hard rule 7**, and this set is unusually
 volatile: all three merges happened on the day of measurement, so the fleet had a
 one-day history of merging agent PRs at all. The Actions billing figures moved
