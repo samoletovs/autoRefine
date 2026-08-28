@@ -647,6 +647,24 @@ two regimes rather than one distribution. The cost rows in `reports/cost` carry 
 `mode` and `rounds`, which will say whether a long run is many projects or a few slow ones —
 and that, not the ceiling, decides whether the gate is the thing to move.
 
+**The first cost file is contaminated; do not read it as data.**
+`nauroLabs-github`'s `reports/cost/run-2026-08-28-0607.jsonl` — the first one ever written,
+so the tempting baseline — has 18 of its 28 rows fabricated. autoRefine is in its own
+manifest, so planning itself made the model call `run_project_tests`, and pytest inherited
+the entrypoint's `AUTOREFINE_COST_LOG` and appended `tests/test_foundry_agent.py`'s
+fixtures. They are obvious once known: `project: "demo"`, `run_id: "run-1"`,
+`duration_s: 0.0`, all 18 inside 0.11s.
+
+It did not merely pad the file, it **inverted its headline finding**. The fixtures carry 7
+`stuck_tool_loop` trips and 2 `max_tool_rounds`, so the file reads as though the loop
+guards fire constantly; across the 10 genuine rows the real count of both is **zero**.
+Sum tokens over those 18 and the bill is wrong in the other direction too.
+
+`_test_subprocess_env` strips every `AUTOREFINE_*` before the child starts and
+`tests/conftest.py` does the same from the suite's side, so files from 2026-08-29 onward
+are clean. Filter on `run_id` starting `run_` — a real Foundry id — if you ever need to
+read the contaminated one anyway.
+
 ## Why the PR-card sweep is a cron and not an event
 `pr-ready-cards.yml` reads open PRs across every project in the workspace manifest.
 GitHub delivers `pull_request` and `check_suite` only to workflows in the repo where

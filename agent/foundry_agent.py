@@ -465,12 +465,40 @@ def _handle_list_directory(project_dir: Path, args: dict) -> str:
     return json.dumps({"path": rel_path, "entries": entries})
 
 
+def _test_subprocess_env() -> dict[str, str]:
+    """Environment for a project's own test suite: ours minus our control variables.
+
+    A test suite runs as our child and inherits our environment, which includes
+    ``AUTOREFINE_COST_LOG`` — the path the entrypoint commits as production cost
+    telemetry. autoRefine is itself in the manifest, so when it plans itself the model
+    calls ``run_project_tests``, pytest reaches ``tests/test_foundry_agent.py``, and its
+    fixtures append rows to the live log.
+
+    Measured 2026-08-28 on the first cost file ever written: 18 of 28 rows were fixtures
+    for a project named ``demo``, all inside 0.11s, carrying 7 ``stuck_tool_loop`` trips
+    and 2 ``max_tool_rounds`` — guards that had in fact never fired in production. The
+    file was not merely padded, it inverted its own headline finding.
+
+    Stripping every ``AUTOREFINE_*`` rather than the three known leaks is deliberate: the
+    next control variable is covered without anyone having to remember this. Nothing in
+    the suite reads one it did not itself set, so removing them changes no test outcome.
+    """
+    return {k: v for k, v in os.environ.items() if not k.startswith("AUTOREFINE_")}
+
+
 def _handle_run_tests(project_dir: Path, _args: dict) -> str:
     """Run the project's test suite.
 
     A tool the model calls must never be able to abort the run. Whichever runner is
     missing, times out, or explodes, this reports the failure back to the model as data so
     the remaining projects still get evaluated.
+
+    The decode is pinned rather than left to the locale. ``text=True`` alone decodes with
+    ``locale.getpreferredencoding()`` and raises ``UnicodeDecodeError`` on any byte that
+    does not fit — a ``ValueError``, so it slips past all three handlers below and kills
+    the sweep, which is precisely what the paragraph above promises cannot happen. Test
+    output is arbitrary bytes from someone else's project; ``errors="replace"`` keeps a
+    stray one a mangled character in a log rather than a lost run.
     """
     pkg_json = project_dir / "package.json"
     pyproject = project_dir / "pyproject.toml"
@@ -488,6 +516,9 @@ def _handle_run_tests(project_dir: Path, _args: dict) -> str:
             cwd=str(project_dir),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=_test_subprocess_env(),
             timeout=300,
         )
     except FileNotFoundError:
