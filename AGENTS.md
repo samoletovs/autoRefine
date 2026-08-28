@@ -575,7 +575,7 @@ Copilot-authored pull requests, all states, across the non-archived org:
 | `familyVault` | 2 |
 | **org total** | **114** |
 
-**106 of 114 agent pull requests in this org are invisible to a manifest-scoped
+**108 of 114 agent pull requests in this org are invisible to a manifest-scoped
 sweep**, and the single largest producer is a repo autoRefine has never heard of.
 So a manifest-walking method is right about the fleet it ships and blind to where
 the agent is actually used. When these numbers are re-run, say which population
