@@ -208,3 +208,70 @@ def send_pr_card(
     except httpx.HTTPError as e:
         log.warning("PR card send error: %s", e)
         return False
+
+
+def send_pr_blocked_card(
+    repo: str,
+    pr_number: int,
+    title: str,
+    *,
+    pr_url: str = "",
+    workflows: list[str] | None = None,
+    bot_token: str | None = None,
+    chat_id: str | None = None,
+) -> bool:
+    """Tell a human a Copilot PR's workflows are waiting for their approval.
+
+    Sent by the pr-cards sweep when the head SHA carries workflow runs concluded
+    ``action_required`` — GitHub gating CI until someone presses *Approve and run
+    workflows*. That click is the only thing that unblocks the PR, and it can only happen
+    in the GitHub UI, so this card is a nudge with a link rather than an action.
+
+    **This card carries no buttons and no ``arfpr:`` token, deliberately.** nauroBot turns
+    a 👍 on an ``arfpr:`` card into an approve + squash-merge; offering that here would let
+    one tap merge a PR whose CI has never run — the very failure this card exists to
+    report. Returns True if delivered, False if skipped or failed. Never raises.
+    """
+    token = bot_token or os.environ.get("NAURO_BOT_TOKEN", "")
+    chat = chat_id or os.environ.get("NAURO_CHAT_ID", "")
+
+    if not token or not chat:
+        log.warning("NAURO_BOT_TOKEN or NAURO_CHAT_ID missing — skipping PR blocked card")
+        return False
+
+    name = repo.split("/")[-1]
+    lines = [f"⏸️ PR blocked — {name} #{pr_number}", title]
+    if pr_url:
+        lines.append(pr_url)
+    named = ", ".join(sorted(set(workflows or [])))
+    lines.append(
+        f"CI has not run: {named} awaiting approval"
+        if named
+        else "CI has not run: workflows awaiting approval"
+    )
+    lines.append("Open the PR and press “Approve and run workflows” — no card until it is green.")
+
+    payload = {
+        "chat_id": chat,
+        "text": _truncate("\n".join(lines)),
+        "disable_web_page_preview": True,
+    }
+
+    send_url = f"https://api.telegram.org/bot{token}/sendMessage"
+
+    try:
+        with httpx.Client(timeout=15) as client:
+            resp = client.post(send_url, json=payload)
+            if resp.status_code == 200:
+                return True
+            if 500 <= resp.status_code < 600:
+                resp = client.post(send_url, json=payload)
+                if resp.status_code == 200:
+                    return True
+            log.warning(
+                "PR blocked card send failed: HTTP %d %s", resp.status_code, resp.text[:200]
+            )
+            return False
+    except httpx.HTTPError as e:
+        log.warning("PR blocked card send error: %s", e)
+        return False
