@@ -678,6 +678,95 @@ daily health-scan job, which has already paid for its checkout and dependencies 
 carries it for free. When something here needs to run often, prefer attaching it to a
 job that is already running over giving it a schedule of its own.
 
+## An empty check rollup is not evidence that CI is green
+
+`_checks_green()` used to treat an empty `statusCheckRollup` as green, on the reasoning
+that a repo with no CI has nothing to wait for. That reasoning is sound and the conclusion
+was still wrong, because the rollup is not a list of *workflows* — it is a list of **check
+runs**, and a workflow run that never produced a job produces no check run. Verified
+2026-08-28 on `portaBaltica#181`: all four runs on its head SHA return
+`total_count: 0` from `/actions/runs/{id}/jobs`, and its rollup is `[]`.
+
+So an empty rollup means either "no CI ran" or "CI never started", and the sweep could not
+tell them apart. This is the `npm audit` shape from "The dependency check" — a failure that
+looks clean — **inverted and worse**: it did not look clean, it looked *ready to merge*.
+The card it sends says "CI is green" and carries a 👍 that nauroBot turns into an
+approve + squash-merge, so the bug's payload is merging code no test ever ran on.
+
+The gate is `conclusion: action_required` on `/repos/{repo}/actions/runs?head_sha={sha}`,
+which is GitHub holding a run until a human presses *Approve and run workflows*. This is
+the **default state of a Copilot PR** in a repo with CI, not an edge case, which is why it
+hits exactly the population this sweep exists to serve. It is a literal API value, so
+unlike the CI-signal grounding declined above it needs no deny/allow list kept correct
+across 24 repos as they rename their steps.
+
+Measured 2026-08-28 across 17 Copilot PRs (every open one org-wide plus a sample of
+closed):
+
+| Shape | n | Old verdict |
+|-------|---|-------------|
+| rollup non-empty | 6 | correct — new code never runs |
+| rollup `[]`, no runs at all | 4 | green, correct |
+| rollup `[]`, only good runs | 1 | green, correct |
+| rollup `[]`, `action_required` present | **6** | **green — wrong** |
+
+Both open Copilot PRs org-wide were in the wrong row (`atlas#4`, `nauroLabs-github#213`),
+and `nauroLabs-github#205` was merged in that state.
+
+Four things are load-bearing:
+
+- **`[]` and `None` are different answers.** `_workflow_runs` returns `[]` only for "the
+  API said there are no runs" and `None` for every failure — absent `gh`, non-zero exit,
+  malformed body, missing key, timeout, kill switch. Collapsing them would rebuild the
+  exact bug one layer down. `TestNoFailureLooksClean` walks every path.
+- **It fails closed, and the asymmetry is why.** An unknown CI state cards nothing. A
+  missed card costs a day and is retried on the next sweep, because the PR stays
+  unlabelled; a card sent wrongly cannot be recalled and may already have been tapped.
+  This is the opposite choice from the activity gate, which fails *open* — there, being
+  wrong costs one run, and here it can merge untested code.
+- **The blocked card has no buttons and no `arfpr:` token.** nauroBot turns 👍 on an
+  `arfpr:` card into a squash-merge. A card whose whole message is "CI has never run"
+  must not offer to merge, or the fix hands over the very tap it exists to prevent. It is
+  a nudge with a link, because the only thing that clears `action_required` is a human
+  clicking in the GitHub UI.
+- **Withholding alone was not enough.** `action_required` never clears on its own, so
+  suppressing the false green would have converted it into a permanent silent stall of the
+  idea → build → merge funnel, with nothing anywhere telling the human to click. A distinct
+  card is what keeps the pipeline alive.
+
+`AUTOREFINE_SKIP_RUN_CHECK=1` stops the new call, on the reasoning behind
+`AUTOREFINE_SKIP_DEPENDABOT`. It degrades to "unknown", **never** to the old card-anyway
+behaviour — the switch exists to stop a network call, not to re-enable a bug.
+
+**Narrow would have sufficed; general was chosen anyway.** On all 17 sampled PRs every
+false green carried an `action_required` run, so matching only that value would have given
+identical results. `_runs_verdict` also applies `_GOOD_CONCLUSIONS` — the set already
+applied to the rollup — to the runs the rollup could not see, so an invisible *failed* run
+also blocks. That is the same rule on better data rather than a new one, it diverges on
+nothing measured, and it exists because the invisible-run mechanism was measured directly
+(8 zero-job `failure` runs across `portaBaltica#179/180/181`) rather than inferred.
+`BLOCKED` beats `NOT_GREEN` when both are present, because until the gate opens no other
+run's verdict is the whole picture.
+
+**Why this was built while the sweep is switched off.** `AUTOREFINE_TIER=critical` makes
+`pr-ready-cards.yml:52` skip scheduled runs, and all 6 scheduled runs since 2026-08-22 are
+`skipped`, so this changes nothing today. It survives the dead-code test on the same
+grounds `_abandoned_after_build` did, and fails the test the CI-signal grounding failed:
+
+1. **Silent temporally, not structurally.** The brake is a repository variable one click
+   clears. Measured 2026-08-28 it gates a *public* repo whose entire month of Actions came
+   to 130 minutes, $0.78 gross and **$0.012 net** — public-repo minutes are free, so the
+   brake is not load-bearing on cost here and may lift at any time. The real August bill is
+   `nauroLabs-github` ($2.95) and `mindVault` ($2.03) of $8.97, both private and neither
+   gated by `AUTOREFINE_TIER`.
+2. **The signal is non-empty now.** `atlas#4` is a live false green, not a hypothetical.
+3. **No heuristic.** One literal API value, with no names to maintain.
+
+**Every count above expires under hard rule 7.** To re-measure: list open PRs per manifest
+project with `--json headRefOid,statusCheckRollup`, keep the Copilot-authored ones with an
+empty rollup, and read `/actions/runs?head_sha=…` for each. There is deliberately no
+committed script, for the reason given under "What the score actually measures".
+
 ## Test
 
 ```bash
