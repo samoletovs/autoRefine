@@ -924,6 +924,14 @@ called)` lines across the 10 genuine runs.** The model essentially never calls
 `submit_plan`. Every run in that sweep terminated holding a plan, and almost none of
 them terminated the way this document assumed.
 
+**Confirmed on a second, independent sweep.** 2026-08-29: **11 fallback lines against
+11 runs that captured a plan — `submit_plan` was called zero times all day.** Two
+consecutive sweeps, 20 of 21 successful runs on the scraping path. This is not a
+one-day artifact, and the second sweep is the cleaner sample: it is the first cost file
+written after `_test_subprocess_env` landed, so it carries no test fixtures at all
+(12 rows, 12 genuine, 0 fixtures — the contamination in the 08-28 file is described
+under "What the sweep actually costs").
+
 **That 9 is a count and not a floor, and the reason is load-bearing.** The log line sits
 behind `if plan_result:`, so a fallback that set `plan_captured` without logging would
 hide inside the remaining 1. It cannot: `_parse_plan_from_text` returns `None` on
@@ -1059,6 +1067,16 @@ Sum tokens over those 18 and the bill is wrong in the other direction too.
 `_test_subprocess_env` strips every `AUTOREFINE_*` before the child starts and
 `tests/conftest.py` does the same from the suite's side, so files from 2026-08-29 onward
 are clean and need no filtering.
+
+**Confirmed in production, 2026-08-29:** `run-2026-08-29-0607.jsonl` is 12 rows, 12
+genuine, **0 fixtures**, against the previous day's 28/10/18.
+
+That file is also the first honest record of a *failure*: one
+`portaBaltica`/`file-ideas` run carries `RunStatus.FAILED` with `plan_captured=False`,
+from a transient Foundry `server_error`, followed by a successful retry. The retry logic
+worked and the telemetry said so — which the contaminated file could not have done,
+since its 7 `stuck_tool_loop` and 2 `max_tool_rounds` trips were all fabricated. A
+guard count read from that file is fiction; read from this one it is zero, twice over.
 
 ## Why the PR-card sweep is a cron and not an event
 `pr-ready-cards.yml` reads open PRs across every project in the workspace manifest.
