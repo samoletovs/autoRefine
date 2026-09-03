@@ -965,11 +965,36 @@ The measurement is one `az monitor log-analytics query` for
 `Parsed plan from text response` over a sweep's `ContainerGroupName_s`. Re-run it before
 believing anything in this subsection; per hard rule 7 the count is from one day.
 
+### The ratio across six clean files
+
+The entry above was written on one file and said to wait for several. Measured
+2026-09-03 over the six clean files (2026-08-29 … 09-03), **84 runs, 23 projects**:
+
+| | |
+|---|---|
+| aggregate | prompt 3,330,075 / completion 59,232 — **56.2:1** |
+| per-run spread | min 10.3, median 52.1, max 159.4 |
+| rounds, `plan` | n=51, median 6.0, max 16 |
+| rounds, `file-ideas` | n=33, median 5.0, max 10 |
+
+Per-file ratios are 45.7 / 52.3 / 54.7 / 60.6 / 60.9 / 60.9 — a 1.33× spread, so the
+aggregate is stable enough to quote **for cost**, and the 15× per-run spread still means
+it never describes a run.
+
+**It excludes the tripped runs, which is the one thing to remember about it.** The 11
+`stuck_tool_loop` runs carry `prompt_tokens: null` (see "What the sweep actually costs"),
+so they contribute nothing to the numerator and are not in the 84's token totals. The
+true cost per sweep is higher than these figures by an unmeasured amount.
+
+The `plan` median of 6.0 is unchanged from the single-file reading, which is worth more
+than the ratio: it is the figure that contradicts the driver table's ~74, and it now
+survives a 5× larger sample.
+
 ### Re-running the ratio measurement
 
-One file, one sweep, one regime. This wants several clean files before anyone sizes
-anything on it. Files from 2026-08-29 onward are clean (`_test_subprocess_env` and
-`tests/conftest.py` now strip `AUTOREFINE_*` from child processes).
+Files from 2026-08-29 onward are clean (`_test_subprocess_env` and
+`tests/conftest.py` now strip `AUTOREFINE_*` from child processes); 08-28 is not and
+must be dropped or filtered.
 
 Fetch each `reports/cost/*.jsonl` from `nauroLabs-github`, keep rows whose `run_id`
 starts `run_`, and report: aggregate prompt/completion, the **per-run** ratio spread,
@@ -1075,8 +1100,45 @@ That file is also the first honest record of a *failure*: one
 `portaBaltica`/`file-ideas` run carries `RunStatus.FAILED` with `plan_captured=False`,
 from a transient Foundry `server_error`, followed by a successful retry. The retry logic
 worked and the telemetry said so — which the contaminated file could not have done,
-since its 7 `stuck_tool_loop` and 2 `max_tool_rounds` trips were all fabricated. A
-guard count read from that file is fiction; read from this one it is zero, twice over.
+since its 7 `stuck_tool_loop` and 2 `max_tool_rounds` trips were all fabricated.
+
+**The sentence that used to end this paragraph said the real guard count "is zero, twice
+over". Six clean files later it is 11, and hard rule 7 is why.** The measurement was
+correct for the two sweeps it covered; the error was writing a two-sample count in a form
+that reads as a property of the system. Measured 2026-09-03 over the six clean files:
+
+| day | runs | `stuck_tool_loop` |
+|---|---|---|
+| 08-29 | 12 | 0 |
+| 08-30 | 12 | 2 |
+| 08-31 | 14 | 0 |
+| 09-01 | 16 | 1 |
+| 09-02 | 19 | 3 |
+| 09-03 | 11 | **5** |
+| **total** | **84** | **11 (13%)** |
+
+Three things about it, in decreasing confidence:
+
+- **The waste is total.** `plan_captured` is `False` on all 11. A tripped run produces
+  nothing at all, so this is the one failure mode with no partial credit.
+- **Its cost is invisible.** A tripped run ends `RunStatus.REQUIRES_ACTION`, so
+  `_run_token_usage` finds no usage and the row carries `prompt_tokens: null`. Every
+  token aggregate in this document therefore **excludes** these runs and understates the
+  bill. Do not read 56.2:1 as covering the whole sweep.
+- **The cause is not established, and one plausible story is already half-refuted.** In
+  the one sequence traced from logs, the repeated batch was `run_project_tests`. The job
+  image is `python:3.12` with no node (`infrastructure/main.bicep:141`, no install step
+  in the entrypoint), so for any project with a `package.json` that tool can only ever
+  return `Test runner 'npm' is not installed in this environment` — the `npm audit`
+  shape again, one tool over. But 5 of 9 tripped projects have a `package.json` and so
+  do 2 of 6 that completed cleanly, so it is at most a contributing factor. **Do not fix
+  this on the strength of that correlation.**
+
+The rising trend is six points and small; treat it as an observation to re-run, not an
+established rate. Re-run with: fetch every `reports/cost/*.jsonl`, drop the contaminated
+08-28 file, and count `guard` by day. Tool *results* are never logged — only calls — so
+the return value that provokes a repeat cannot be read from Log Analytics, and
+establishing the cause needs either a logged tool result or a reproduction.
 
 ## Why the PR-card sweep is a cron and not an event
 `pr-ready-cards.yml` reads open PRs across every project in the workspace manifest.
