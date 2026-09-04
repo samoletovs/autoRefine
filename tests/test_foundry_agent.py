@@ -129,18 +129,35 @@ def test_handle_run_tests_python_project_failure(tmp_path: Path) -> None:
 
 
 def test_handle_run_tests_node_project_uses_npm(tmp_path: Path) -> None:
+    """A project with package.json builds the npm command.
+
+    ``shutil.which`` is patched so this asserts the command that gets built rather than
+    whether the developer's machine happens to have Node.js. Without it the test passes
+    locally where npm is installed and fails on a runner where it is not, because
+    ``_handle_run_tests`` now returns a terminal error before spawning anything.
+    """
     (tmp_path / "package.json").write_text("{}", encoding="utf-8")
     fake_run = SimpleNamespace(returncode=0, stdout="ok", stderr="")
 
-    with patch("subprocess.run", return_value=fake_run) as mock_run:
+    with patch("shutil.which", lambda cmd: f"/usr/bin/{cmd}"), \
+            patch("subprocess.run", return_value=fake_run) as mock_run:
         _ = foundry_agent._handle_run_tests(tmp_path, {})
 
     assert mock_run.call_args.args[0] == ["npm", "test", "--", "--reporter=verbose"]
 
 
 def test_handle_run_tests_no_runner_detected(tmp_path: Path) -> None:
+    """The condition is still reported; the message is prose for a model, not a contract.
+
+    This used to assert the exact string ``"No test runner detected"``. The message now
+    also names what was looked for and carries the terminal fields, because a project
+    with no manifest cannot grow one mid-run and a model that reads the old wording as
+    transient retries it — see ``tests/test_terminal_tool_errors.py``. Nothing parses
+    this text, so it is asserted by substring.
+    """
     result = json.loads(foundry_agent._handle_run_tests(tmp_path, {}))
-    assert result["error"] == "No test runner detected"
+    assert result["error"].startswith("No test runner detected")
+    assert result["retryable"] is False
 
 
 def test_create_agent_uses_passed_model() -> None:
