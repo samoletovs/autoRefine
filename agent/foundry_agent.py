@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import time
 from collections.abc import Callable, Sequence
@@ -589,6 +590,43 @@ def _test_subprocess_env() -> dict[str, str]:
     return env
 
 
+def _terminal_tool_error(reason: str) -> str:
+    """A tool result the model must not retry, said in terms a model will act on.
+
+    Measured 2026-08-29..09-04 across 98 production runs: 18 tripped the
+    ``stuck_tool_loop`` guard, rising from 0/12 on the first day to 7/14 on the last, and
+    **all 18 captured no plan at all**. Every one of the seven aborts traced from logs
+    ended with the same two calls — ``run_project_tests({})`` immediately repeated.
+
+    The old message was accurate and still provoked the retry. *"Test runner 'npm' is not
+    installed in this environment"* reads like a hiccup: something that might be different
+    next time. It never is. The job image is ``python:3.12`` with no Node.js and no
+    install step (``infrastructure/main.bicep``), so for any project carrying a
+    ``package.json`` that call cannot succeed on any round — the same standing fact that
+    made the old ``npm audit`` check dead.
+
+    A model retrying a permanently-failing call twice is enough to trip a guard set at
+    three identical rounds, and the run is then aborted holding nothing. So the fix is not
+    to make the tool work; it is to say *permanent* in a way that leaves nothing to infer.
+    ``retryable: False`` gives a machine-checkable field and the prose gives the
+    instruction, because only the prose reliably reaches a model that is not reading
+    schema.
+
+    Reserved for conditions that cannot change within a run. A timeout and an ``OSError``
+    stay ordinary errors: those really can differ next time, and telling a model never to
+    retry them would trade this bug for a quieter one.
+    """
+    return json.dumps({
+        "error": reason,
+        "passed": False,
+        "retryable": False,
+        "instruction": (
+            "Do not call run_project_tests again for this project — the result cannot "
+            "change. Continue with the information you already have."
+        ),
+    })
+
+
 def _handle_run_tests(project_dir: Path, _args: dict) -> str:
     """Run the project's test suite.
 
@@ -611,7 +649,17 @@ def _handle_run_tests(project_dir: Path, _args: dict) -> str:
     elif pyproject.exists() or (project_dir / "requirements.txt").exists():
         cmd = ["python", "-m", "pytest", "tests/", "-x", "-q"]
     else:
-        return json.dumps({"error": "No test runner detected"})
+        return _terminal_tool_error(
+            "No test runner detected: this project has no package.json, pyproject.toml "
+            "or requirements.txt."
+        )
+
+    if shutil.which(cmd[0]) is None:
+        return _terminal_tool_error(
+            f"This environment has no '{cmd[0]}' and cannot get one. The job image is "
+            f"python:3.12, which ships no Node.js, so a JavaScript project's tests can "
+            f"never run here. This is a property of the environment, not of the project."
+        )
 
     try:
         result = subprocess.run(
@@ -625,10 +673,9 @@ def _handle_run_tests(project_dir: Path, _args: dict) -> str:
             timeout=300,
         )
     except FileNotFoundError:
-        return json.dumps({
-            "error": f"Test runner '{cmd[0]}' is not installed in this environment",
-            "passed": False,
-        })
+        return _terminal_tool_error(
+            f"Test runner '{cmd[0]}' is not installed in this environment."
+        )
     except subprocess.TimeoutExpired:
         return json.dumps({"error": "Test run timed out after 300s", "passed": False})
     except OSError as exc:
