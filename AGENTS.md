@@ -1140,6 +1140,46 @@ established rate. Re-run with: fetch every `reports/cost/*.jsonl`, drop the cont
 the return value that provokes a repeat cannot be read from Log Analytics, and
 establishing the cause needs either a logged tool result or a reproduction.
 
+### The cause, found the next day, and the fix
+
+The trend continued: **2026-09-04 was 7 trips in 14 runs — 50%**, taking the corpus to
+18 in 98. At that rate the sweep spends half its Foundry budget producing nothing, so the
+"do not fix on a correlation" above was answered by getting better evidence rather than
+by waiting.
+
+**The `package.json` correlation is refuted, and `golazo` is what refutes it.** It ran
+clean on 09-03 and tripped on 09-04 with the same manifest, so no property of the project
+decides this. What decides it is what the model does with a particular tool result.
+
+**Every one of the seven aborts on 09-04 ends with the same two calls:**
+`run_project_tests({})`, immediately repeated. Read from the tool-call log, not inferred:
+
+```
+list_directory({}) / read_project_file(...) × 4
+run_project_tests({})
+run_project_tests({})          <- identical, three rounds running
+--- Aborting (stuck_tool_loop) at round 5
+```
+
+The tool returned `Test runner 'npm' is not installed in this environment`. That is
+**true**, and it is why the retry happens: it reads like a hiccup — something that might
+differ next round. It cannot. The image is `python:3.12` with no Node.js and no install
+step, so for a project carrying a `package.json` that call fails on every round of every
+sweep forever. Two identical retries is all it takes to trip a guard set at three.
+
+The fix is not to make the tool work — installing Node.js fleet-wide to run arbitrary
+`npm test` is a much larger decision. It is to stop a permanent condition being reported
+in language that invites a retry. `_terminal_tool_error` adds `retryable: False` and an
+explicit instruction not to call again, and `shutil.which` checks up front so the answer
+does not depend on catching an exception. **A timeout and an `OSError` deliberately keep
+the old shape:** those really can differ next time, and marking them terminal would trade
+this bug for a quieter one.
+
+**This does raise fleet-wide output**, and that is the point rather than a side effect:
+18 runs that produced nothing would have produced plans. It restores intended behaviour
+rather than exceeding it, but expect ideas from projects that have been silently
+skipped, and watch the first sweep after it lands.
+
 ## Why the PR-card sweep is a cron and not an event
 `pr-ready-cards.yml` reads open PRs across every project in the workspace manifest.
 GitHub delivers `pull_request` and `check_suite` only to workflows in the repo where
