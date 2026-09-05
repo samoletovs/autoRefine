@@ -1195,6 +1195,17 @@ job that is already running over giving it a schedule of its own.
 
 ## An empty check rollup is not evidence that CI is green
 
+The same ambiguity exists in a **partially populated** rollup: an auxiliary check can
+succeed while a test workflow is held before creating any jobs. Positive readiness
+verdicts therefore check the head SHA's workflow runs even when the rollup is nonempty.
+Older runs are superseded only by a newer run number for the same workflow ID, event,
+head branch, and PR-number set; matching display names are not sufficient. An older
+cancelled run must not permanently block a successful replacement on the same SHA.
+Failed repository reads, failed card sends, and failed sent-marker writes make the sweep
+fail after it has attempted the remaining repositories. A successful Telegram send alone
+does not prove that its deduplication marker persisted; this is not an exactly-once
+delivery guarantee.
+
 `_checks_green()` used to treat an empty `statusCheckRollup` as green, on the reasoning
 that a repo with no CI has nothing to wait for. That reasoning is sound and the conclusion
 was still wrong, because the rollup is not a list of *workflows* — it is a list of **check
@@ -1283,6 +1294,21 @@ empty rollup, and read `/actions/runs?head_sha=…` for each. There is deliberat
 committed script, for the reason given under "What the score actually measures".
 
 ## Test
+
+Health-scan CLI success requires successful analysis, a persisted report, and a delivered
+Telegram summary. The pipeline still attempts notification when report persistence fails;
+it emits `failed_stages` in its JSON result and exits nonzero after those attempts. The
+workflow preserves that exit code while printing its log, and the independent PR-card
+sweep still runs with `always()`. The job has a 30-minute ceiling and checks the three
+OIDC identity inputs before `azure/login`, naming missing secrets without printing values.
+Setup remains before that check so an absent identity does not disable the PR-card sweep.
+Credential provisioning and live recovery validation remain operator tasks.
+
+Failed Foundry runs are replayed only for `server_error` and `rate_limit_exceeded`.
+Permanent/unknown failures raise an incomplete-run subtype so functional planning does
+not buy three identical attempts, and failed refine runs reach the partial-edit rollback
+handler even when the service error is transient. Expected Azure/OS thread-cleanup
+failures do not replace the primary failure; unexpected programming errors propagate.
 
 ```bash
 pytest tests/ -x -q
