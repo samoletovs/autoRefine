@@ -40,13 +40,9 @@ WORKFLOW_DIR = Path(__file__).resolve().parent.parent / ".github" / "workflows"
 
 # The jobs that must not be able to run for GitHub's 6-hour default.
 #
-# Listed, not derived from "runs the agent". autorefine-health-scan.yml runs the
-# agent too and is deliberately absent: every one of its runs has been skipped
-# since AUTOREFINE_TIER went to 'critical', so there is no observed duration to
-# size a ceiling from, and a guessed one would risk killing a legitimate scan.
-# That is a known gap awaiting data, not an oversight — add it here once a real
-# run records a duration.
-TIME_BOUNDED_WORKFLOWS = ("autorefine-evaluate.yml", "pr-ready-cards.yml")
+TIME_BOUNDED_WORKFLOWS = (
+    "autorefine-evaluate.yml", "pr-ready-cards.yml", "autorefine-health-scan.yml",
+)
 
 # The one that holds a Foundry agent open for the whole run, so the one where two
 # at once is two bills for one answer.
@@ -130,6 +126,12 @@ def test_job_is_time_bounded(workflow_name: str) -> None:
             f"job '{job_name}' timeout of {timeout!r} is not a sane bound "
             f"(expected 1..{MAX_REASONABLE_TIMEOUT_MINUTES} minutes)."
         )
+
+
+def test_health_scan_timeout_limits_hung_calls_to_thirty_minutes() -> None:
+    job = _load(WORKFLOW_DIR / "autorefine-health-scan.yml")["jobs"]["health-scan"]
+
+    assert job.get("timeout-minutes") == 30
 
 
 def test_evaluate_workflow_serialises_its_runs() -> None:
@@ -398,4 +400,3 @@ def test_azure_login_is_followed_by_a_prewarm(path: Path) -> None:
         f"{path.name} has an azure/login whose token pre-warm is missing or unsafe "
         "(Azure/azure-cli#28708):\n  " + "\n  ".join(offenders)
     )
-

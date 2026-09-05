@@ -140,6 +140,51 @@ def test_none_is_unknown_not_green() -> None:
     assert pr_cards._runs_verdict(None) == (pr_cards.UNKNOWN, [])
 
 
+def _workflow_run(number: int, conclusion: str, **overrides: object) -> dict:
+    return {
+        "workflow_id": 123, "run_number": number, "run_attempt": 1,
+        "event": "pull_request", "head_branch": "copilot/change",
+        "pull_requests": [{"number": 7}], "name": "Tests",
+        "status": "completed", "conclusion": conclusion, **overrides,
+    }
+
+
+@pytest.mark.parametrize("old_conclusion", ["cancelled", "failure", "action_required"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_successful_replacement_supersedes_the_same_workflow_context(
+    old_conclusion: str, reverse: bool,
+) -> None:
+    runs = [_workflow_run(1, old_conclusion), _workflow_run(2, "success")]
+    assert pr_cards._runs_verdict(runs[::-1] if reverse else runs) == (pr_cards.GREEN, [])
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        {"workflow_id": 456},
+        {"event": "push"},
+        {"head_branch": "other-branch"},
+        {"pull_requests": [{"number": 8}]},
+    ],
+)
+def test_success_does_not_supersede_another_workflow_or_pr_context(context: dict) -> None:
+    runs = [_workflow_run(1, "action_required"), _workflow_run(2, "success", **context)]
+    assert pr_cards._runs_verdict(runs)[0] == pr_cards.BLOCKED
+
+
+def test_newer_blocked_run_cannot_be_hidden_by_older_success() -> None:
+    runs = [_workflow_run(1, "success"), _workflow_run(2, "action_required")]
+    assert pr_cards._runs_verdict(runs)[0] == pr_cards.BLOCKED
+
+
+def test_missing_workflow_identity_does_not_allow_supersession() -> None:
+    runs = [
+        _workflow_run(1, "action_required", workflow_id=None),
+        _workflow_run(2, "success", workflow_id=None),
+    ]
+    assert pr_cards._runs_verdict(runs)[0] == pr_cards.BLOCKED
+
+
 # --- _workflow_runs: no failure may look clean ------------------------------
 
 
@@ -364,8 +409,8 @@ def test_invisible_failed_run_is_not_carded(sweep) -> None:
     assert sent["green"] == []
 
 
-def test_non_empty_rollup_skips_the_runs_call(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Cost guard: a PR with real checks must not pay for an extra API call."""
+def test_successful_rollup_also_checks_workflow_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A visible check does not account for workflows that produced no jobs."""
     calls: list[str] = []
     monkeypatch.setattr(
         pr_cards, "_list_open_prs",
@@ -379,7 +424,29 @@ def test_non_empty_rollup_skips_the_runs_call(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(pr_cards, "_mark_carded", lambda *a, **k: None)
 
     assert pr_cards.sweep_pr_cards(["samoletovs/era"]) == 1
-    assert calls == []
+    assert calls == ["0" * 40]
+
+
+@pytest.mark.parametrize(
+    "conclusion", ["action_required", "failure", "startup_failure"],
+)
+def test_successful_check_cannot_hide_an_unrun_or_failed_workflow(sweep, conclusion: str) -> None:
+    pr = _pr(1, rollup=[{"status": "COMPLETED", "conclusion": "SUCCESS"}])
+    sent = sweep([pr], [{"name": "Tests", "status": "completed", "conclusion": conclusion}])
+
+    assert pr_cards.sweep_pr_cards(["samoletovs/era"]) == 0
+    assert sent["green"] == []
+
+
+def test_non_green_rollup_does_not_need_an_extra_api_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_lookup(*_args: object) -> None:
+        pytest.fail("a non-green check already blocks the card")
+
+    monkeypatch.setattr(pr_cards, "_workflow_runs", unexpected_lookup)
+    pr = _pr(1, rollup=[{"status": "IN_PROGRESS"}])
+    assert pr_cards._pr_verdict("samoletovs/era", pr)[0] == pr_cards.NOT_GREEN
 
 
 def test_sweep_cards_only_eligible_prs(sweep) -> None:
@@ -429,3 +496,74 @@ def test_list_open_prs_requests_the_head_sha(monkeypatch: pytest.MonkeyPatch) ->
     pr_cards._list_open_prs("samoletovs/atlas")
     assert "headRefOid" in seen[0][seen[0].index("--json") + 1]
 
+
+@pytest.mark.parametrize("returncode,stdout", [(1, ""), (0, "not-json"), (0, "{}")])
+def test_failed_pr_listing_is_not_an_empty_repository(
+    monkeypatch: pytest.MonkeyPatch, returncode: int, stdout: str,
+) -> None:
+    monkeypatch.setattr(
+        pr_cards.subprocess, "run",
+        lambda *a, **kw: subprocess.CompletedProcess(a, returncode, stdout, "failed"),
+    )
+    assert pr_cards._list_open_prs("owner/repo") is None
+
+
+def test_label_write_failure_fails_the_sweep(sweep, monkeypatch: pytest.MonkeyPatch) -> None:
+    sent = sweep([_pr(7)], [])
+
+    def fail_mark(*_args: object, **_kwargs: object) -> None:
+        raise pr_cards.PRCardDeliveryError("could not persist marker")
+
+    monkeypatch.setattr(pr_cards, "_mark_carded", fail_mark)
+
+    with pytest.raises(pr_cards.PRCardDeliveryError, match="persist marker"):
+        pr_cards.sweep_pr_cards(["owner/repo"])
+    assert sent["green"] == [7]
+
+
+def test_marker_edit_failure_is_not_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        pr_cards.subprocess, "run",
+        lambda *a, **kw: subprocess.CompletedProcess(a, 1, "", "permission denied"),
+    )
+    with pytest.raises(pr_cards.PRCardDeliveryError, match="pr-card-sent"):
+        pr_cards._mark_carded("owner/repo", 7)
+
+
+def test_existing_label_does_not_make_successful_marking_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def command(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+        calls.append(cmd)
+        assert kwargs["timeout"] == 60
+        return subprocess.CompletedProcess(cmd, 1 if cmd[1] == "label" else 0, "", "")
+
+    monkeypatch.setattr(pr_cards.subprocess, "run", command)
+    pr_cards._mark_carded("owner/repo", 7)
+    assert len(calls) == 2
+
+
+def test_failed_repository_does_not_hide_successful_repository(
+    sweep, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sent = sweep([_pr(7)], [])
+    monkeypatch.setattr(
+        pr_cards, "_list_open_prs", lambda repo: None if repo == "owner/broken" else [_pr(7)],
+    )
+    with pytest.raises(pr_cards.PRCardDeliveryError, match="owner/broken"):
+        pr_cards.sweep_pr_cards(["owner/broken", "owner/healthy"])
+    assert sent["green"] == [7]
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_failed_sender_is_not_a_successful_empty_sweep(
+    sweep, monkeypatch: pytest.MonkeyPatch, blocked: bool,
+) -> None:
+    sent = sweep([_pr(7)], ATLAS_4_RUNS if blocked else [])
+    sender = "send_pr_blocked_card" if blocked else "send_pr_card"
+    monkeypatch.setattr(pr_cards, sender, lambda *a, **kw: False)
+    with pytest.raises(pr_cards.PRCardDeliveryError, match="send"):
+        pr_cards.sweep_pr_cards(["owner/repo"])
+    assert sent["labels"] == []

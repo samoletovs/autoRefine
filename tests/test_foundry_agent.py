@@ -562,7 +562,9 @@ def test_run_agent_handles_failed_status() -> None:
         max_prompt_tokens: int | None = None,
         truncation_strategy: object = None,
     ) -> SimpleNamespace:
-        return SimpleNamespace(id="run-1", status="failed", last_error="boom")
+        return SimpleNamespace(
+            id="run-1", status="failed", last_error=SimpleNamespace(code="server_error")
+        )
 
     runs_api = SimpleNamespace(create=create_run)
     client = SimpleNamespace(threads=thread_api, messages=messages_api, runs=runs_api)
