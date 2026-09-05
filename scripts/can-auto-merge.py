@@ -245,6 +245,7 @@ class GateResult:
     risky_labels_found: list[str] = field(default_factory=list)
     high_risk_files: list[str] = field(default_factory=list)
     non_low_risk_files: list[str] = field(default_factory=list)
+    head_sha: str = ""
 
 
 def review_and_ci_gates_pass(
@@ -569,6 +570,7 @@ def fetch_actions_checks(repo: str, head_sha: str) -> list[dict]:
             "name": run.get("name") or "unnamed",
             "status": run.get("status") or "",
             "conclusion": run.get("conclusion") or "",
+            "detailsUrl": run.get("html_url") or "",
         })
     return nodes
 
@@ -602,7 +604,9 @@ def runs_awaiting_approval(repo: str, pr_number: int) -> list[str]:
     })
 
 
-def evaluate(repo: str, pr_number: int) -> GateResult:
+def evaluate(repo: str, pr_number: int, *, allow_product_files: bool = False,
+             ignore_run_id: str | None = None) -> GateResult:
+    """Evaluate every invariant; product builders may bypass only the file allowlist."""
     pr_obj = _gh_json(["api", f"/repos/{repo}/pulls/{pr_number}"])
     assert isinstance(pr_obj, dict)
 
@@ -715,6 +719,10 @@ def evaluate(repo: str, pr_number: int) -> GateResult:
     # merge however low-risk its files look.
     rollup, checks_source = resolve_checks(
         repo, pr_number, head_sha=(pr_obj.get("head") or {}).get("sha"))
+    if ignore_run_id:
+        own_run = re.compile(rf"/actions/runs/{re.escape(ignore_run_id)}(?:/|$)")
+        rollup = [node for node in rollup
+                  if not own_run.search(node.get("detailsUrl") or "")]
     checks_ok, checks_reason = classify_checks(
         rollup, repo=repo,
         awaiting_approval=runs_awaiting_approval(repo, pr_number) if not rollup else None)
@@ -773,7 +781,7 @@ def evaluate(repo: str, pr_number: int) -> GateResult:
             high_risk_files=high_risk,
             non_low_risk_files=non_low_risk,
         )
-    if not low_risk_only:
+    if not low_risk_only and not allow_product_files:
         return GateResult(
             can_merge=False,
             gate_failed="file-tier",
@@ -811,7 +819,7 @@ def evaluate(repo: str, pr_number: int) -> GateResult:
                     ] if part
                 )
             ),
-            low_risk_only=True,
+            low_risk_only=low_risk_only,
             has_risky_label=False,
             under_daily_cap=False,
             under_org_daily_cap=under_org_daily_cap,
@@ -824,7 +832,7 @@ def evaluate(repo: str, pr_number: int) -> GateResult:
         can_merge=True,
         gate_failed=None,
         reason="all pre-flight gates passed",
-        low_risk_only=True,
+        low_risk_only=low_risk_only,
         has_risky_label=False,
         under_daily_cap=True,
         under_org_daily_cap=True,
@@ -832,6 +840,7 @@ def evaluate(repo: str, pr_number: int) -> GateResult:
         merged_today=merged_today,
         merged_today_org=merged_today_org,
         files_count=len(filenames),
+        head_sha=(pr_obj.get("head") or {}).get("sha") or "",
     )
 
 
@@ -864,6 +873,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--repo", required=True, help="OWNER/NAME of the repo")
     parser.add_argument("--pr", required=True, type=int, help="PR number")
+    parser.add_argument("--ignore-run-id", help="Exclude only this merge workflow's own checks")
     parser.add_argument(
         "--format",
         choices=("json", "github"),
@@ -875,7 +885,7 @@ def main(argv: list[str] | None = None) -> int:
     if "/" not in args.repo:
         parser.error("--repo must be OWNER/NAME")
 
-    result = evaluate(args.repo, args.pr)
+    result = evaluate(args.repo, args.pr, ignore_run_id=args.ignore_run_id)
     if args.format == "github":
         _emit_github(result)
     else:

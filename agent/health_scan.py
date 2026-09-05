@@ -1190,7 +1190,11 @@ def run_health_scan(repos: list[str], assign_copilot: bool = True) -> dict[str, 
         github_data, cost_data, analysis, app_insights_data, url_health_data
     )
 
-    report_path = commit_report(github_token, report)
+    try:
+        report_path = commit_report(github_token, report)
+    except httpx.HTTPError as exc:
+        log.error("Report persistence failed: %s", exc)
+        report_path = None
     try:
         enforce_report_retention(github_token)
     except Exception as exc:  # never let pruning kill notifications
@@ -1206,7 +1210,16 @@ def run_health_scan(repos: list[str], assign_copilot: bool = True) -> dict[str, 
     summary = build_telegram_summary(
         analysis, report_path, created_issues, cost_data=cost_data
     )
-    send_telegram(summary, parse_mode="HTML")
+    telegram_sent = send_telegram(summary, parse_mode="HTML")
+    failed_stages: list[str] = []
+    if analysis_failed(analysis):
+        failed_stages.append("analysis")
+    if not report_path:
+        failed_stages.append("report")
+    if not telegram_sent:
+        failed_stages.append("telegram")
+    if failed_stages:
+        log.error("Health scan incomplete: failed stages=%s", ", ".join(failed_stages))
 
     log.info(
         "Health scan complete: report=%s, issues_created=%d",
@@ -1221,4 +1234,5 @@ def run_health_scan(repos: list[str], assign_copilot: bool = True) -> dict[str, 
         "urls_checked": len(url_health_data),
         "telegram_summary": summary,
         "analysis_failed": analysis_failed(analysis),
+        "failed_stages": failed_stages,
     }

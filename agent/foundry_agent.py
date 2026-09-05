@@ -179,6 +179,15 @@ class FoundryRunAbortedError(FoundryRunIncompleteError):
         RuntimeError.__init__(self, f"Foundry run {run_id} aborted: {detail}")
 
 
+class FoundryRunFailedError(FoundryRunIncompleteError):
+    """A failed run that must not be replayed or publish partially applied edits."""
+
+    def __init__(self, run_id: str, reason: str) -> None:
+        self.run_id = run_id
+        self.reason = reason
+        RuntimeError.__init__(self, f"Foundry run {run_id} failed (reason={reason}).")
+
+
 def _positive_int_from_env(name: str, default: int, minimum: int) -> int:
     """Read a positive-int knob from the environment, validating explicitly.
 
@@ -1286,7 +1295,18 @@ def run_agent(
 
         if run.status == "failed":
             log.error("Run failed: %s", run.last_error)
-            return None
+            error = run.last_error
+            code = error.get("code") if isinstance(error, dict) else getattr(error, "code", None)
+            code = str(getattr(code, "value", code) or "unknown")
+            try:
+                _call_foundry_with_retry(
+                    "client.threads.delete", client.threads.delete, thread.id
+                )
+            except (AzureError, OSError) as exc:
+                log.warning("Could not clean up failed run %s: %s", run.id, exc)
+            if code in {"server_error", "rate_limit_exceeded"} and mode != "refine":
+                return None
+            raise FoundryRunFailedError(run.id, code)
 
         if run.status == "incomplete":
             details = getattr(run, "incomplete_details", None)

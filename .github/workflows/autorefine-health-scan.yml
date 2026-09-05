@@ -18,6 +18,7 @@ permissions:
 jobs:
   health-scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     # Honor budget tier (set by .github/azure-budget-tier.yml):
     #   - "critical" → skip scheduled runs (workflow_dispatch still works)
     #   - cadence_per_day=1 → skip the 18:00 UTC slot, keep 06:00 only
@@ -62,6 +63,23 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Validate Azure OIDC prerequisites
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          missing=()
+          for name in AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID; do
+            if [ -z "${!name:-}" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "::error::Missing Azure OIDC repository secrets: ${missing[*]}. Configure the identity and federated credential before rerunning."
+            exit 1
+          fi
+
       # OIDC, not a service-principal secret. See the matching step in
       # autorefine-evaluate.yml — the AZURE_CREDENTIALS secret this used to read has
       # never existed. Still inert until AZURE_CLIENT_ID and AZURE_TENANT_ID are created.
@@ -96,13 +114,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
+          scan_status=0
           python -m agent.main \
             --manifest .github-gov/config/workspace-manifest.json \
             --mode health-scan \
-            > /tmp/autorefine-health.json 2>&1 || true
+            > autorefine-health.json 2>&1 || scan_status=$?
 
           echo "--- health-scan output ---"
-          cat /tmp/autorefine-health.json
+          cat autorefine-health.json
+          exit "$scan_status"
 
       # Free ride. The PR-approval sweep is a few seconds of GitHub API calls, but as
       # its own scheduled workflow every run pays a whole billed minute — 230 runs cost
@@ -129,5 +149,6 @@ jobs:
           curl -sf -X POST "https://api.telegram.org/bot${NAURO_BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${NAURO_CHAT_ID}" \
             --data-urlencode "parse_mode=HTML" \
+            --data-urlencode "disable_web_page_preview=true" \
             --data-urlencode "text=❌ <b>autoRefine daily scan</b> failed (health-scan or PR-card sweep) — see GitHub Actions log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             || echo "::warning::Telegram failure notification did not send"

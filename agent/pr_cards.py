@@ -16,8 +16,8 @@ from check runs, and a workflow run that never produced a job produces no check 
 run GitHub is holding for approval (``conclusion: action_required``, which is the default
 for Copilot's own PRs in a repo with CI) is invisible in the rollup, exactly like a repo
 with no CI at all. Reading that as green sends a card claiming "CI is green" for a PR whose
-CI has never run, and a 👍 on it squash-merges untested code. When the rollup is empty the
-sweep therefore asks the Actions API what ran on the head SHA — see ``_runs_verdict``.
+CI has never run, and a 👍 on it squash-merges untested code. Before declaring CI green
+the sweep asks the Actions API what ran on the head SHA — see ``_runs_verdict``.
 """
 from __future__ import annotations
 
@@ -50,6 +50,10 @@ GREEN = "green"
 BLOCKED = "blocked"
 NOT_GREEN = "not-green"
 UNKNOWN = "unknown"
+
+
+class PRCardDeliveryError(RuntimeError):
+    """A card could not be delivered or its sent marker could not be persisted."""
 
 
 def _checks_green(rollup: list[dict]) -> bool:
@@ -113,6 +117,35 @@ def _workflow_runs(repo: str, sha: str) -> list[dict] | None:
         return None
 
 
+def _current_workflow_runs(runs: list[dict]) -> list[dict]:
+    """Ignore superseded runs only within the same workflow and trigger/PR context."""
+    current: dict[tuple, dict] = {}
+    unidentified: list[dict] = []
+    for run in runs:
+        workflow_id = run.get("workflow_id")
+        run_number = run.get("run_number")
+        event, branch = run.get("event"), run.get("head_branch")
+        prs = run.get("pull_requests")
+        if (
+            not isinstance(workflow_id, int)
+            or not isinstance(run_number, int)
+            or not event
+            or not branch
+            or not isinstance(prs, list)
+            or any(not isinstance(pr, dict) or not isinstance(pr.get("number"), int) for pr in prs)
+        ):
+            unidentified.append(run)
+            continue
+        key = (workflow_id, event, branch, tuple(sorted(pr["number"] for pr in prs)))
+        previous = current.get(key)
+        rank = (run_number, run.get("run_attempt") or 1)
+        if previous is None or rank > (
+            previous["run_number"], previous.get("run_attempt") or 1
+        ):
+            current[key] = run
+    return [*unidentified, *current.values()]
+
+
 def _runs_verdict(runs: list[dict] | None) -> tuple[str, list[str]]:
     """Read the head SHA's workflow runs as GREEN / BLOCKED / NOT_GREEN / UNKNOWN.
 
@@ -127,6 +160,7 @@ def _runs_verdict(runs: list[dict] | None) -> tuple[str, list[str]]:
     """
     if runs is None:
         return UNKNOWN, []
+    runs = _current_workflow_runs(runs)
     blocked = [
         str(run.get("name") or "workflow")
         for run in runs
@@ -165,8 +199,8 @@ def _already_nudged(pr: dict) -> bool:
     return _has_label(pr, PR_BLOCKED_CARD_SENT_LABEL)
 
 
-def _list_open_prs(repo: str) -> list[dict]:
-    """Open PRs for a repo with the fields the sweep needs. Returns [] on any gh failure."""
+def _list_open_prs(repo: str) -> list[dict] | None:
+    """Return open PRs, or None when the repository could not be scanned."""
     try:
         proc = subprocess.run(
             ["gh", "pr", "list", "--repo", repo, "--state", "open", "--limit", "50",
@@ -175,34 +209,46 @@ def _list_open_prs(repo: str) -> list[dict]:
         )
         if proc.returncode != 0:
             log.warning("gh pr list failed for %s: %s", repo, proc.stderr.strip())
-            return []
-        return json.loads(proc.stdout or "[]")
+            return None
+        prs = json.loads(proc.stdout or "[]")
+        if not isinstance(prs, list):
+            log.warning("gh pr list returned no PR list for %s", repo)
+            return None
+        return prs
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         log.warning("gh pr list error for %s: %s", repo, exc)
-        return []
+        return None
 
 
 def _mark_carded(repo: str, number: int, label: str = PR_CARD_SENT_LABEL) -> None:
-    """Best-effort: create the label if missing, then add it to the PR."""
-    subprocess.run(
-        ["gh", "label", "create", label, "--repo", repo, "--color", "0e8a16"],
-        capture_output=True, text=True,
-    )
-    subprocess.run(
-        ["gh", "pr", "edit", str(number), "--repo", repo, "--add-label", label],
-        capture_output=True, text=True,
-    )
+    """Persist the marker; an unrecorded send must not be reported as success."""
+    try:
+        # Creation may fail because the shared label already exists. The edit is
+        # authoritative: it succeeds only if the marker was actually attached.
+        subprocess.run(
+            ["gh", "label", "create", label, "--repo", repo, "--color", "0e8a16"],
+            capture_output=True, text=True, timeout=60,
+        )
+        result = subprocess.run(
+            ["gh", "pr", "edit", str(number), "--repo", repo, "--add-label", label],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise PRCardDeliveryError(f"Could not record {label} for {repo}#{number}") from exc
+    if result.returncode != 0:
+        raise PRCardDeliveryError(f"Could not record {label} for {repo}#{number}")
 
 
 def _pr_verdict(repo: str, pr: dict) -> tuple[str, list[str]]:
     """GREEN / BLOCKED / NOT_GREEN / UNKNOWN for one PR, plus any blocking workflow names.
 
-    A non-empty rollup is authoritative and costs no extra API call. Only an empty rollup
-    — the ambiguous case — falls through to the head SHA's workflow runs.
+    A failing rollup can block immediately. A successful check cannot account for a
+    different workflow held before creating any jobs, so positive verdicts also need
+    the head SHA's workflow runs.
     """
     rollup = pr.get("statusCheckRollup") or []
-    if rollup:
-        return (GREEN, []) if _checks_green(rollup) else (NOT_GREEN, [])
+    if rollup and not _checks_green(rollup):
+        return NOT_GREEN, []
     sha = str(pr.get("headRefOid") or "")
     return _runs_verdict(_workflow_runs(repo, sha))
 
@@ -215,8 +261,13 @@ def sweep_pr_cards(repos: list[str], dry_run: bool = False) -> int:
     be determined gets nothing at all and is retried on the next sweep.
     """
     carded = 0
+    failures: list[str] = []
     for repo in repos:
-        for pr in _list_open_prs(repo):
+        prs = _list_open_prs(repo)
+        if prs is None:
+            failures.append(f"could not scan {repo}")
+            continue
+        for pr in prs:
             number = pr.get("number")
             if not _is_copilot(pr) or pr.get("isDraft") or _already_carded(pr):
                 continue
@@ -225,7 +276,10 @@ def sweep_pr_cards(repos: list[str], dry_run: bool = False) -> int:
             url = str(pr.get("url", ""))
             if verdict == BLOCKED:
                 if not _already_nudged(pr):
-                    _nudge_blocked(repo, int(number), title, url, blocking, dry_run=dry_run)
+                    try:
+                        _nudge_blocked(repo, int(number), title, url, blocking, dry_run=dry_run)
+                    except PRCardDeliveryError as exc:
+                        failures.append(str(exc))
                 continue
             if verdict != GREEN:
                 log.info("%s#%s CI %s — skipping", repo, number, verdict)
@@ -235,9 +289,17 @@ def sweep_pr_cards(repos: list[str], dry_run: bool = False) -> int:
                 carded += 1
                 continue
             if send_pr_card(repo, int(number), title, pr_url=url):
-                _mark_carded(repo, int(number))
-                carded += 1
-                log.info("Carded PR %s#%s", repo, number)
+                try:
+                    _mark_carded(repo, int(number))
+                except PRCardDeliveryError as exc:
+                    failures.append(str(exc))
+                else:
+                    carded += 1
+                    log.info("Carded PR %s#%s", repo, number)
+            else:
+                failures.append(f"could not send card for {repo}#{number}")
+    if failures:
+        raise PRCardDeliveryError("PR-card sweep incomplete: " + "; ".join(failures))
     return carded
 
 
@@ -251,4 +313,5 @@ def _nudge_blocked(
         return
     if send_pr_blocked_card(repo, number, title, pr_url=url, workflows=workflows):
         _mark_carded(repo, number, PR_BLOCKED_CARD_SENT_LABEL)
-
+    else:
+        raise PRCardDeliveryError(f"Could not send blocked card for {repo}#{number}")

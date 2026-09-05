@@ -1843,6 +1843,8 @@ def run_health_scan_mode(repos: list[str], assign_copilot: bool = True) -> None:
     short_repos = [r.split("/")[-1] for r in repos]
     summary = run_health_scan(short_repos, assign_copilot=assign_copilot)
     print(json.dumps(summary, indent=2))
+    if summary.get("analysis_failed") or summary.get("failed_stages"):
+        raise SystemExit(1)
 
 
 def load_quality_coverage(report_path: str) -> list[dict]:
