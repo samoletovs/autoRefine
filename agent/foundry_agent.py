@@ -1314,7 +1314,7 @@ def run_agent(
 
         if status != "completed":
             log.error("Run %s ended without completing (status=%s)", run.id, status)
-            raise FoundryRunIncompleteError(run.id, status)
+            raise FoundryRunFailedError(run.id, status)
 
         # Get the final message
         messages = client.messages.list(

@@ -142,10 +142,11 @@ def test_terminal_run_discards_captured_plan(
     )
     config = ProjectConfig(name="demo", purpose="", users="", stage="active")
 
-    with pytest.raises(foundry_agent.FoundryRunIncompleteError) as error:
+    with pytest.raises(foundry_agent.FoundryRunFailedError) as error:
         foundry_agent.run_agent(client, "agent", Path("."), config, "task")
 
     assert error.value.reason == status
+    assert "Raise AUTOREFINE" not in str(error.value)
     client.messages.list.assert_not_called()
     client.threads.delete.assert_called_once_with("thread-1")
 
@@ -155,10 +156,11 @@ def test_cancelling_is_polled_until_terminal() -> None:
     client.runs.get = Mock(return_value=SimpleNamespace(id="run-1", status="cancelled"))
     config = ProjectConfig(name="demo", purpose="", users="", stage="active")
 
-    with pytest.raises(foundry_agent.FoundryRunIncompleteError) as error:
+    with pytest.raises(foundry_agent.FoundryRunFailedError) as error:
         foundry_agent.run_agent(client, "agent", Path("."), config, "task")
 
     assert error.value.reason == "cancelled"
+    assert "Raise AUTOREFINE" not in str(error.value)
     client.runs.get.assert_called_once_with(thread_id="thread-1", run_id="run-1")
     client.messages.list.assert_not_called()
 
@@ -167,10 +169,11 @@ def test_unknown_terminal_status_fails_closed() -> None:
     client = _client(None, status="future_terminal_status")
     config = ProjectConfig(name="demo", purpose="", users="", stage="active")
 
-    with pytest.raises(foundry_agent.FoundryRunIncompleteError) as error:
+    with pytest.raises(foundry_agent.FoundryRunFailedError) as error:
         foundry_agent.run_agent(client, "agent", Path("."), config, "task")
 
     assert error.value.reason == "future_terminal_status"
+    assert "Raise AUTOREFINE" not in str(error.value)
     client.messages.list.assert_not_called()
 
 
