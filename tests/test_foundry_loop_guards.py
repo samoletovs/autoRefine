@@ -21,6 +21,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from azure.core.exceptions import AzureError
 
 from agent import foundry_agent
 from agent.config import ProjectConfig
@@ -442,7 +443,7 @@ def test_cleanup_failure_does_not_mask_the_abort(
     client = _ToolLoopClient(script)
 
     def explode(_thread_id: str) -> None:
-        raise RuntimeError("thread delete exploded")
+        raise AzureError("thread delete failed")
 
     client.threads = SimpleNamespace(
         create=lambda: SimpleNamespace(id="thread-1"),
