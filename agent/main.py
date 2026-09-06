@@ -1640,11 +1640,12 @@ def _worktree_status(project_dir: Path) -> dict[str, str]:
     ``-z`` alone does not fix this; the two defects stack.
     """
     result = subprocess.run(
-        ["git", "status", "--porcelain", "-z"],
+        ["git", "status", "--porcelain", "-z", "--untracked-files=all"],
         cwd=str(project_dir),
         capture_output=True,
         encoding="utf-8",
         errors="surrogateescape",
+        check=True,
     )
 
     entries: dict[str, str] = {}
@@ -1772,6 +1773,7 @@ def refine_project(
             return False
 
     agent_id = create_agent(client, mode="refine", model=model)
+    preserve_changes = False
 
     try:
         task = build_refine_task(plan, config)
@@ -1781,7 +1783,6 @@ def refine_project(
             run_agent(client, agent_id, project_dir, config, task, mode="refine")
         except FoundryRunIncompleteError as exc:
             log.error("Refine run ended incomplete (%s) — rolling back partial changes.", exc.reason)
-            _rollback_agent_changes(project_dir, baseline)
             return False
 
         # Check if agent made any changes. Uses the same parser as the rollback
@@ -1790,12 +1791,14 @@ def refine_project(
         changed_files = sorted(_worktree_status(project_dir))
 
         if not changed_files:
+            preserve_changes = True
             log.info("No files changed — nothing to commit.")
             return False
 
         log.info("Files changed: %s", changed_files)
 
         if dry_run:
+            preserve_changes = True
             log.info("[DRY RUN] Would commit %d files and create PR", len(changed_files))
             return False
 
@@ -1808,7 +1811,6 @@ def refine_project(
                 "publication and rolling back changes.",
                 exc,
             )
-            _rollback_agent_changes(project_dir, baseline)
             return False
 
         if not isinstance(test_result, dict) or test_result.get("passed") is not True:
@@ -1825,9 +1827,9 @@ def refine_project(
                 "and rolling back changes. Runner result: %s",
                 reason,
             )
-            _rollback_agent_changes(project_dir, baseline)
             return False
 
+        preserve_changes = True
         log.info("Final test validation passed; changes are eligible for publication.")
 
         # Commit and push
@@ -1883,8 +1885,15 @@ def refine_project(
         return pr_created
 
     finally:
-        client.delete_agent(agent_id)
-        log.info("Agent cleaned up.")
+        try:
+            if not preserve_changes:
+                try:
+                    _rollback_agent_changes(project_dir, baseline)
+                except (OSError, subprocess.SubprocessError) as exc:
+                    log.error("Could not roll back unvalidated refine changes: %s", exc)
+        finally:
+            client.delete_agent(agent_id)
+            log.info("Agent cleaned up.")
 
 
 def run_health_scan_mode(repos: list[str], assign_copilot: bool = True) -> None:
@@ -2089,6 +2098,7 @@ def main() -> None:
 
     log.info("autoRefine starting — mode=%s, %d repos", config.mode, len(repos))
 
+    failed_repos: list[str] = []
     for repo in repos:
         # A scan of every project must survive any single one of them. Two separate bugs
         # have already ended a run part-way through the list (a missing test runner, a
@@ -2099,6 +2109,12 @@ def main() -> None:
             _process_repo(repo, config)
         except Exception:
             log.exception("%s failed — continuing with the remaining projects", repo)
+            failed_repos.append(repo)
+
+    if failed_repos:
+        print(json.dumps({"run_status": "failed", "failed_repos": failed_repos}, indent=2))
+        log.error("autoRefine incomplete: %d project(s) failed: %s", len(failed_repos), failed_repos)
+        raise SystemExit(1)
 
     log.info("autoRefine complete.")
 
@@ -2110,8 +2126,7 @@ def _process_repo(repo: str, config: AutoRefineConfig) -> None:
 
     # Clone / update
     if not clone_repo(repo, project_dir):
-        log.warning("Failed to clone %s — skipping", repo)
-        return
+        raise RuntimeError(f"Failed to clone or update {repo}")
 
     # Load project.yaml
     project_config = load_config(project_dir)

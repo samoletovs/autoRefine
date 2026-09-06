@@ -190,3 +190,71 @@ def test_refine_refuses_dirty_worktree_before_paid_work_and_preserves_user_edit(
     spies.commit_and_push.assert_not_called()
     spies.create_pr.assert_not_called()
     assert (repo / "tracked.txt").read_text(encoding="utf-8") == "user work in progress\n"
+
+
+def test_failed_final_tests_remove_nested_agent_files_but_not_ignored_files(
+    repo: Path, config: ProjectConfig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (repo / ".git" / "info" / "exclude").write_text("*.local\n", encoding="utf-8")
+    package = repo / "new_package"
+    package.mkdir()
+    user_file = package / "user.local"
+    user_file.write_text("user data\n", encoding="utf-8")
+
+    def write_package(*_args: object, **_kwargs: object) -> dict:
+        (package / "__init__.py").write_text("# partial\n", encoding="utf-8")
+        nested = package / "nested"
+        nested.mkdir()
+        (nested / "code.py").write_text("# partial\n", encoding="utf-8")
+        return {"score": 80}
+
+    spies = _patch_refine(monkeypatch, write_package, {"passed": False})
+    assert not agent_main.refine_project(repo, config, {}, "owner/demo")
+
+    assert not (package / "__init__.py").exists()
+    assert not (package / "nested" / "code.py").exists()
+    assert user_file.read_text(encoding="utf-8") == "user data\n"
+    assert agent_main._worktree_status(repo) == {}
+    spies.commit_and_push.assert_not_called()
+
+
+@pytest.mark.parametrize("phase", ["agent", "validation"])
+@pytest.mark.parametrize("failure", [KeyboardInterrupt(), RuntimeError("unexpected failure")])
+def test_prepublication_exceptions_roll_back_then_propagate(
+    repo: Path,
+    config: ProjectConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    failure: BaseException,
+) -> None:
+    def write_then_stop(*_args: object, **_kwargs: object) -> dict:
+        (repo / "tracked.txt").write_text("unvalidated\n", encoding="utf-8")
+        if phase == "agent":
+            raise failure
+        return {"score": 80}
+
+    spies = _patch_refine(monkeypatch, write_then_stop, {"passed": True})
+    if phase == "validation":
+        spies.final_tests.side_effect = failure
+
+    with pytest.raises(type(failure)) as error:
+        agent_main.refine_project(repo, config, {}, "owner/demo")
+
+    assert error.value is failure
+    assert (repo / "tracked.txt").read_text(encoding="utf-8") == "original\n"
+    spies.commit_and_push.assert_not_called()
+    spies.create_pr.assert_not_called()
+    spies.client.delete_agent.assert_called_once()
+
+
+def test_refine_refuses_unknown_worktree_status_before_paid_work(
+    tmp_path: Path, config: ProjectConfig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spies = _patch_refine(monkeypatch, MagicMock(), {"passed": True})
+
+    with pytest.raises(subprocess.CalledProcessError):
+        agent_main.refine_project(tmp_path, config, {}, "owner/demo")
+
+    spies.create_branch.assert_not_called()
+    spies.create_agent.assert_not_called()
+    spies.commit_and_push.assert_not_called()

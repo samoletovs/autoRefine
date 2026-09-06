@@ -327,13 +327,15 @@ def test_main_refine_passes_model_to_plan_and_refine(
     assert mock_refine.call_args.kwargs["model"] == "gpt-4.1"
 
 
-def test_plan_project_passes_model_to_create_agent(project_config: ProjectConfig, tmp_path: Path) -> None:
+def test_plan_project_passes_model_to_create_agent(
+    project_config: ProjectConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from agent import main as main_module
 
     fake_client = SimpleNamespace(delete_agent=MagicMock())
+    monkeypatch.setenv("FOUNDRY_PROJECT_ENDPOINT", "https://example.test")
 
     with (
-        patch.dict("os.environ", {"FOUNDRY_PROJECT_ENDPOINT": "https://example.test"}),
         patch("azure.ai.agents.AgentsClient", return_value=fake_client),
         patch("azure.identity.DefaultAzureCredential"),
         patch("agent.foundry_agent.create_agent", return_value="agent-1") as mock_create,
@@ -347,13 +349,15 @@ def test_plan_project_passes_model_to_create_agent(project_config: ProjectConfig
     fake_client.delete_agent.assert_called_once_with("agent-1")
 
 
-def test_refine_project_passes_model_to_create_agent(project_config: ProjectConfig, tmp_path: Path) -> None:
+def test_refine_project_passes_model_to_create_agent(
+    project_config: ProjectConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from agent import main as main_module
 
     fake_client = SimpleNamespace(delete_agent=MagicMock())
+    monkeypatch.setenv("FOUNDRY_PROJECT_ENDPOINT", "https://example.test")
 
     with (
-        patch.dict("os.environ", {"FOUNDRY_PROJECT_ENDPOINT": "https://example.test"}),
         patch("azure.ai.agents.AgentsClient", return_value=fake_client),
         patch("azure.identity.DefaultAzureCredential"),
         patch("agent.foundry_agent.create_agent", return_value="agent-2") as mock_create,
