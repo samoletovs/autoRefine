@@ -37,12 +37,14 @@ def config() -> ProjectConfig:
 def _patch_refine(
     monkeypatch: pytest.MonkeyPatch,
     run_agent: object,
-    test_result: dict[str, object],
+    test_result: object,
 ) -> SimpleNamespace:
     client = SimpleNamespace(delete_agent=MagicMock())
     create_branch = MagicMock(return_value=True)
     create_agent = MagicMock(return_value="agent-1")
-    final_tests = MagicMock(return_value=json.dumps(test_result))
+    final_tests = MagicMock(
+        return_value=test_result if isinstance(test_result, str) else json.dumps(test_result)
+    )
     commit_and_push = MagicMock(return_value=True)
     create_pr = MagicMock(return_value=True)
 
@@ -75,14 +77,22 @@ def _patch_refine(
         {"passed": False, "error": "Test run timed out after 300s"},
         {"passed": False, "error": "Could not run tests: access denied"},
         {"passed": 1, "output": "non-boolean result"},
+        {"passed": "true"},
+        {},
+        None,
+        [],
+        "not-json",
     ],
-    ids=["failure", "runner-unavailable", "timeout", "runner-error", "non-boolean"],
+    ids=[
+        "failure", "runner-unavailable", "timeout", "runner-error", "non-boolean",
+        "string-boolean", "missing-pass", "null", "list", "malformed",
+    ],
 )
 def test_refine_rolls_back_and_never_publishes_without_explicit_test_pass(
     repo: Path,
     config: ProjectConfig,
     monkeypatch: pytest.MonkeyPatch,
-    test_result: dict[str, object],
+    test_result: object,
 ) -> None:
     def fake_run_agent(*_args: object, **_kwargs: object) -> dict[str, object]:
         (repo / "agent_change.py").write_text("# generated\n", encoding="utf-8")
@@ -127,19 +137,26 @@ def test_refine_publishes_only_after_final_tests_pass(
     spies.create_pr.assert_called_once()
 
 
-def test_refine_with_no_changes_does_not_run_redundant_final_tests(
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_refine_without_publication_does_not_run_redundant_final_tests(
     repo: Path,
     config: ProjectConfig,
     monkeypatch: pytest.MonkeyPatch,
+    dry_run: bool,
 ) -> None:
+    def fake_run_agent(*_args: object, **_kwargs: object) -> dict[str, object]:
+        if dry_run:
+            (repo / "agent_change.py").write_text("# generated\n", encoding="utf-8")
+        return {"status": "completed"}
+
     spies = _patch_refine(
         monkeypatch,
-        MagicMock(return_value={"status": "completed"}),
+        fake_run_agent,
         {"passed": True, "output": "4 passed"},
     )
 
     result = agent_main.refine_project(
-        repo, config, {"improvements": [], "score": 50}, "owner/demo"
+        repo, config, {"improvements": [], "score": 50}, "owner/demo", dry_run=dry_run,
     )
 
     assert result is False

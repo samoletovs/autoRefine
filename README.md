@@ -79,6 +79,10 @@ any requested `--dry-run` or `--needs-approval` flag; missing capabilities stop 
 rather than silently dropping these safeguards. `health-scan --dry-run` is rejected
 because that mode has no read-only execution path.
 
+`refine` requires a clean worktree before agent work and a passing deterministic
+final test run before publishing. A failed or unavailable test runner blocks publication
+and rolls back the run's edits. Dry runs do not publish or perform this final test gate.
+
 ## Project structure
 
 ```
