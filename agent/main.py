@@ -1727,11 +1727,21 @@ def refine_project(
         log.error("FOUNDRY_PROJECT_ENDPOINT not set — cannot run refine mode.")
         return False
 
+    baseline = _worktree_snapshot(project_dir)
+    if baseline:
+        log.error(
+            "Refine requires a clean worktree so pre-existing edits cannot be published. "
+            "Refusing before agent creation; dirty paths: %s",
+            sorted(baseline),
+        )
+        return False
+
     from azure.ai.agents import AgentsClient
     from azure.identity import DefaultAzureCredential
 
     from agent.foundry_agent import (
         FoundryRunIncompleteError,
+        _handle_run_tests,
         build_refine_task,
         create_agent,
         run_agent,
@@ -1767,7 +1777,6 @@ def refine_project(
         task = build_refine_task(plan, config)
         # Refine writes into the live worktree, so an aborted run must not leave
         # half-applied edits behind for a later run to commit.
-        baseline = _worktree_snapshot(project_dir)
         try:
             run_agent(client, agent_id, project_dir, config, task, mode="refine")
         except FoundryRunIncompleteError as exc:
@@ -1789,6 +1798,37 @@ def refine_project(
         if dry_run:
             log.info("[DRY RUN] Would commit %d files and create PR", len(changed_files))
             return False
+
+        raw_test_result = _handle_run_tests(project_dir, {})
+        try:
+            test_result = json.loads(raw_test_result)
+        except (json.JSONDecodeError, TypeError) as exc:
+            log.error(
+                "Final test validation returned an invalid result (%s) — refusing "
+                "publication and rolling back changes.",
+                exc,
+            )
+            _rollback_agent_changes(project_dir, baseline)
+            return False
+
+        if not isinstance(test_result, dict) or test_result.get("passed") is not True:
+            if isinstance(test_result, dict):
+                reason = (
+                    test_result.get("error")
+                    or test_result.get("output")
+                    or "test runner did not report passed=true"
+                )
+            else:
+                reason = f"unexpected result type {type(test_result).__name__}"
+            log.error(
+                "Final test validation did not explicitly pass — refusing publication "
+                "and rolling back changes. Runner result: %s",
+                reason,
+            )
+            _rollback_agent_changes(project_dir, baseline)
+            return False
+
+        log.info("Final test validation passed; changes are eligible for publication.")
 
         # Commit and push
         improvements = plan.get("improvements", [])
@@ -1821,7 +1861,8 @@ def refine_project(
             pr_body += f"- **{imp.get('title', '')}**: {imp.get('description', '')}\n"
         pr_body += (
             "\n### Safety\n"
-            "All changes were applied by the autoRefine Foundry agent. "
+            "All changes were applied by the autoRefine Foundry agent and the "
+            "project's deterministic final test run passed before publication. "
             "Review carefully before merging.\n"
         )
 
