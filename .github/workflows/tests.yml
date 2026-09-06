@@ -36,6 +36,7 @@ on:
       - "config/**"
       - "infrastructure/**"
       - "requirements.txt"
+      - "pyproject.toml"
       - ".github/workflows/**"
   pull_request:
     paths:
@@ -45,6 +46,7 @@ on:
       - "config/**"
       - "infrastructure/**"
       - "requirements.txt"
+      - "pyproject.toml"
       - ".github/workflows/**"
   workflow_dispatch:
 

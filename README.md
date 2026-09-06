@@ -69,6 +69,16 @@ python -m agent.main --manifest config/workspace-manifest.json --mode file-ideas
 python -m agent.main --repo owner/repo --mode dashboard --output dashboard.html
 ```
 
+`--model` selects the deployment for `plan`, `refine`, and both technical and functional
+planning in `file-ideas`. It overrides `FOUNDRY_DEFAULT_DEPLOYMENT`; the default remains
+`gpt-4o-mini`.
+
+`file-ideas --dry-run` suppresses issue creation and Telegram notifications, but can
+still use Foundry to generate plans. The governance filer must support `--repo` and
+any requested `--dry-run` or `--needs-approval` flag; missing capabilities stop filing
+rather than silently dropping these safeguards. `health-scan --dry-run` is rejected
+because that mode has no read-only execution path.
+
 ## Project structure
 
 ```

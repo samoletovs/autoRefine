@@ -5,12 +5,14 @@ description = "AI agent that continuously evaluates and improves software projec
 requires-python = ">=3.11"
 dependencies = [
     "azure-ai-projects>=1.0.0",
-    "azure-ai-agents>=1.1.0",
+    "azure-ai-agents>=1.1.0,<2.0.0",
     "azure-identity>=1.19.0",
+    "azure-mgmt-costmanagement>=4.0.1",
     "openai>=1.55.0",
     "pyyaml>=6.0.2",
     "python-dotenv>=1.0.1",
     "httpx>=0.27.0",
+    "tenacity>=9.0.0",
     "azure-monitor-opentelemetry>=1.6.0",
 ]
 
