@@ -1120,14 +1120,12 @@ def _abort_run(
     reason: str,
     detail: str,
 ) -> NoReturn:
-    """Tear down a run a cost guard has given up on, then raise.
+    """Cancel a run a cost guard has given up on, then raise.
 
     Cancelling first stops the service holding a run open waiting for tool
-    outputs that are never coming; deleting the thread mirrors the
-    ``incomplete`` path. Both are best-effort and swallow their own failures:
-    the caller needs to see *why* the run was abandoned, not a connection
-    error from the tidy-up. ``cancel`` is probed because the fakes in the test
-    suite — and older SDKs — do not expose it.
+    outputs that are never coming. Thread deletion belongs to ``run_agent``'s
+    single lifecycle cleanup path. ``cancel`` is probed because the fakes in
+    the test suite — and older SDKs — do not expose it.
     """
     run_id = getattr(run, "id", "unknown")
     log.error("Aborting Foundry run %s (%s): %s", run_id, reason, detail)
@@ -1136,15 +1134,23 @@ def _abort_run(
     if callable(cancel):
         try:
             cancel(thread_id=thread_id, run_id=run_id)
-        except Exception as exc:  # noqa: BLE001 - cleanup must not mask the abort
+        except (AzureError, OSError) as exc:
             log.warning("Could not cancel aborted run %s: %s", run_id, exc)
 
+    raise FoundryRunAbortedError(run_id, reason, detail)
+
+
+def _cleanup_thread(client: AgentsClient, thread_id: str) -> None:
+    """Delete one run thread without hiding expected service/OS cleanup failures."""
     try:
         _call_foundry_with_retry("client.threads.delete", client.threads.delete, thread_id)
-    except Exception as exc:  # noqa: BLE001 - cleanup must not mask the abort
-        log.warning("Could not delete thread %s after abort: %s", thread_id, exc)
+    except (AzureError, OSError) as exc:
+        log.warning("Could not delete thread %s: %s", thread_id, exc)
 
-    raise FoundryRunAbortedError(run_id, reason, detail)
+
+def _run_status(run: Any) -> str:
+    status = getattr(run, "status", None)
+    return str(getattr(status, "value", status) or "unknown").lower()
 
 
 def run_agent(
@@ -1176,36 +1182,10 @@ def run_agent(
     stuck_repeats = resolve_stuck_repeats()
     started = time.monotonic()
 
-    # Create a thread
     thread = client.threads.create()
     log.info("Thread: %s", thread.id)
 
-    # Build the user message with project context
-    context = config.to_context()
-    message_text = f"""## Project context
-{context}
-
-## Task
-{task}"""
-
-    client.messages.create(
-        thread_id=thread.id,
-        role=MessageRole.USER,
-        content=message_text,
-    )
-
-    # Run the agent with a bounded prompt so accumulated tool output cannot be
-    # re-sent in full on every round.
-    run = _call_foundry_with_retry(
-        "client.runs.create",
-        client.runs.create,
-        thread_id=thread.id,
-        agent_id=agent_id,
-        **_prompt_budget_kwargs(client.runs.create),
-    )
-    log.info("Run started: %s", run.id)
-
-    # Poll for completion, handling tool calls
+    run: Any = None
     plan_result: dict | None = None
     rounds = 0
     tool_calls = 0
@@ -1214,8 +1194,31 @@ def run_agent(
     repeat_streak = 0
 
     try:
-        while run.status in ("queued", "in_progress", "requires_action"):
-            if run.status == "requires_action":
+        context = config.to_context()
+        message_text = f"""## Project context
+{context}
+
+## Task
+{task}"""
+
+        client.messages.create(
+            thread_id=thread.id,
+            role=MessageRole.USER,
+            content=message_text,
+        )
+
+        # Bound accumulated tool output instead of re-sending it in full each round.
+        run = _call_foundry_with_retry(
+            "client.runs.create",
+            client.runs.create,
+            thread_id=thread.id,
+            agent_id=agent_id,
+            **_prompt_budget_kwargs(client.runs.create),
+        )
+        log.info("Run started: %s", run.id)
+
+        while _run_status(run) in ("queued", "in_progress", "requires_action", "cancelling"):
+            if _run_status(run) == "requires_action":
                 # Counted before the isinstance check below on purpose. A
                 # required action we cannot service falls through to
                 # `continue` without touching the service or sleeping, so
@@ -1293,27 +1296,25 @@ def run_agent(
                 run_id=run.id,
             )
 
-        if run.status == "failed":
+        status = _run_status(run)
+        if status == "failed":
             log.error("Run failed: %s", run.last_error)
             error = run.last_error
             code = error.get("code") if isinstance(error, dict) else getattr(error, "code", None)
             code = str(getattr(code, "value", code) or "unknown")
-            try:
-                _call_foundry_with_retry(
-                    "client.threads.delete", client.threads.delete, thread.id
-                )
-            except (AzureError, OSError) as exc:
-                log.warning("Could not clean up failed run %s: %s", run.id, exc)
             if code in {"server_error", "rate_limit_exceeded"} and mode != "refine":
                 return None
             raise FoundryRunFailedError(run.id, code)
 
-        if run.status == "incomplete":
+        if status == "incomplete":
             details = getattr(run, "incomplete_details", None)
             reason = getattr(details, "reason", None)
             log.error("Run %s incomplete (reason=%s)", run.id, reason)
-            _call_foundry_with_retry("client.threads.delete", client.threads.delete, thread.id)
             raise FoundryRunIncompleteError(run.id, str(reason) if reason is not None else None)
+
+        if status != "completed":
+            log.error("Run %s ended without completing (status=%s)", run.id, status)
+            raise FoundryRunIncompleteError(run.id, status)
 
         # Get the final message
         messages = client.messages.list(
@@ -1333,28 +1334,27 @@ def run_agent(
                         if plan_result:
                             log.info("Parsed plan from text response (submit_plan not called)")
 
-        # Clean up
-        _call_foundry_with_retry("client.threads.delete", client.threads.delete, thread.id)
-
         return plan_result
     finally:
-        _log_run_cost(
-            run,
-            rounds=rounds,
-            tool_calls=tool_calls,
-            guard=guard_fired,
-            plan_captured=plan_result is not None,
-        )
-        _append_cost_row(
-            run,
-            project=config.name,
-            mode=mode,
-            rounds=rounds,
-            tool_calls=tool_calls,
-            guard=guard_fired,
-            plan_captured=plan_result is not None,
-            duration_s=time.monotonic() - started,
-        )
+        if run is not None:
+            _log_run_cost(
+                run,
+                rounds=rounds,
+                tool_calls=tool_calls,
+                guard=guard_fired,
+                plan_captured=plan_result is not None,
+            )
+            _append_cost_row(
+                run,
+                project=config.name,
+                mode=mode,
+                rounds=rounds,
+                tool_calls=tool_calls,
+                guard=guard_fired,
+                plan_captured=plan_result is not None,
+                duration_s=time.monotonic() - started,
+            )
+        _cleanup_thread(client, thread.id)
 
 
 def _parse_plan_from_text(text: str) -> dict | None:
