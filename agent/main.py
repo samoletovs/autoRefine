@@ -775,6 +775,17 @@ def _build_file_idea_command(
     needs_approval: bool = False,
 ) -> list[str]:
     options = _discover_file_idea_options(script_path)
+    required_options = {"--repo"}
+    if dry_run:
+        required_options.add("--dry-run")
+    if needs_approval:
+        required_options.add("--needs-approval")
+    missing = required_options - options
+    if missing:
+        raise RuntimeError(
+            f"Refusing to invoke {script_path}: required safety options are unavailable: "
+            f"{', '.join(sorted(missing))}"
+        )
     title = improvement.get("title", "Untitled improvement").strip()
     description = improvement.get("description", "").strip() or "No description provided."
     category = improvement.get("category", "quality")
@@ -809,10 +820,10 @@ def _build_file_idea_command(
             _add_option(memo_option, memo_body)
             break
 
-    if needs_approval and "--needs-approval" in options:
+    if needs_approval:
         cmd.append("--needs-approval")
 
-    if "--dry-run" in options and dry_run:
+    if dry_run:
         cmd.append("--dry-run")
 
     return cmd
@@ -1559,7 +1570,10 @@ def handle_functional_ideas(
     if mode == "propose":
         summary = _format_functional_summary(repo, selected)
         log.info("Functional ideas (PROPOSE — not filed) for %s:\n%s", repo, summary)
-        (notifier or _notify_functional)(summary)
+        if dry_run:
+            log.info("[dry-run] would notify functional ideas for %s", repo)
+        else:
+            (notifier or _notify_functional)(summary)
         return selected
 
     if mode == "file":
@@ -1939,7 +1953,7 @@ def main() -> None:
         "--model",
         default=os.environ.get("FOUNDRY_DEFAULT_DEPLOYMENT", "gpt-4o-mini"),
         help=(
-            "Foundry deployment name to use for plan/refine modes. "
+            "Foundry deployment name to use for plan/file-ideas/refine modes. "
             "Defaults to FOUNDRY_DEFAULT_DEPLOYMENT env var, then gpt-4o-mini. "
             "Set to a higher-tier deployment (e.g. gpt-5) for deep analysis."
         ),
@@ -1969,6 +1983,11 @@ def main() -> None:
     args = parser.parse_args()
     if args.repo is not None and not _is_valid_repo_slug(args.repo):
         parser.error("--repo must be in the format owner/name")
+    if args.mode == "health-scan" and args.dry_run:
+        parser.error(
+            "--dry-run is not supported for health-scan; it persists reports, "
+            "files issues, and sends notifications"
+        )
 
     # Resolve repo list
     repos: list[str] = []
@@ -2121,7 +2140,9 @@ def _process_repo(repo: str, config: AutoRefineConfig) -> None:
                 return
             log.info("Planning %s — %s", name, reason)
 
-        plan = plan_project(project_dir, project_config, report["findings"])
+        plan = plan_project(
+            project_dir, project_config, report["findings"], model=config.model,
+        )
         if plan:
             filed_count = file_ideas_for_plan(repo, plan, dry_run=config.dry_run)
             log.info("Filed %d technical ideas for %s", filed_count, name)
