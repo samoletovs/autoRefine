@@ -81,7 +81,16 @@ because that mode has no read-only execution path.
 
 `refine` requires a clean worktree before agent work and a passing deterministic
 final test run before publishing. A failed or unavailable test runner blocks publication
-and rolls back the run's edits. Dry runs do not publish or perform this final test gate.
+and rolls back the run's edits, including files in new directories. Interruptions and
+exceptions before validation also attempt rollback before propagating. An unreadable
+Git status is an error, never a clean worktree. Dry runs do not publish or perform this
+final test gate.
+
+Per-project exceptions and failed clones do not stop the remaining projects in a sweep.
+After those attempts, the CLI appends a `run_status: failed` object listing `failed_repos`
+and exits nonzero. Existing score objects remain available, but the evaluate workflow
+labels them as partial when execution failed. This does not change the Container Apps
+entrypoint's separate best-effort exit policy or automatically retry the sweep.
 
 ## Project structure
 
