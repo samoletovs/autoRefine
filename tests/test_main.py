@@ -359,6 +359,10 @@ def test_refine_project_passes_model_to_create_agent(project_config: ProjectConf
         patch("agent.foundry_agent.create_agent", return_value="agent-2") as mock_create,
         patch("agent.foundry_agent.build_refine_task", return_value="refine-task"),
         patch("agent.foundry_agent.run_agent", return_value={"score": 99}),
+        patch(
+            "agent.foundry_agent._handle_run_tests",
+            return_value='{"passed": true, "output": "1 passed"}',
+        ),
         patch("agent.tools.github_tools.create_branch", return_value=True),
         patch(
             "subprocess.run",
