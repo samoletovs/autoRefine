@@ -775,6 +775,17 @@ def _build_file_idea_command(
     needs_approval: bool = False,
 ) -> list[str]:
     options = _discover_file_idea_options(script_path)
+    required_options = {"--repo"}
+    if dry_run:
+        required_options.add("--dry-run")
+    if needs_approval:
+        required_options.add("--needs-approval")
+    missing = required_options - options
+    if missing:
+        raise RuntimeError(
+            f"Refusing to invoke {script_path}: required safety options are unavailable: "
+            f"{', '.join(sorted(missing))}"
+        )
     title = improvement.get("title", "Untitled improvement").strip()
     description = improvement.get("description", "").strip() or "No description provided."
     category = improvement.get("category", "quality")
@@ -809,10 +820,10 @@ def _build_file_idea_command(
             _add_option(memo_option, memo_body)
             break
 
-    if needs_approval and "--needs-approval" in options:
+    if needs_approval:
         cmd.append("--needs-approval")
 
-    if "--dry-run" in options and dry_run:
+    if dry_run:
         cmd.append("--dry-run")
 
     return cmd
@@ -1559,7 +1570,10 @@ def handle_functional_ideas(
     if mode == "propose":
         summary = _format_functional_summary(repo, selected)
         log.info("Functional ideas (PROPOSE — not filed) for %s:\n%s", repo, summary)
-        (notifier or _notify_functional)(summary)
+        if dry_run:
+            log.info("[dry-run] would notify functional ideas for %s", repo)
+        else:
+            (notifier or _notify_functional)(summary)
         return selected
 
     if mode == "file":
@@ -1626,11 +1640,12 @@ def _worktree_status(project_dir: Path) -> dict[str, str]:
     ``-z`` alone does not fix this; the two defects stack.
     """
     result = subprocess.run(
-        ["git", "status", "--porcelain", "-z"],
+        ["git", "status", "--porcelain", "-z", "--untracked-files=all"],
         cwd=str(project_dir),
         capture_output=True,
         encoding="utf-8",
         errors="surrogateescape",
+        check=True,
     )
 
     entries: dict[str, str] = {}
@@ -1713,11 +1728,21 @@ def refine_project(
         log.error("FOUNDRY_PROJECT_ENDPOINT not set — cannot run refine mode.")
         return False
 
+    baseline = _worktree_snapshot(project_dir)
+    if baseline:
+        log.error(
+            "Refine requires a clean worktree so pre-existing edits cannot be published. "
+            "Refusing before agent creation; dirty paths: %s",
+            sorted(baseline),
+        )
+        return False
+
     from azure.ai.agents import AgentsClient
     from azure.identity import DefaultAzureCredential
 
     from agent.foundry_agent import (
         FoundryRunIncompleteError,
+        _handle_run_tests,
         build_refine_task,
         create_agent,
         run_agent,
@@ -1748,17 +1773,16 @@ def refine_project(
             return False
 
     agent_id = create_agent(client, mode="refine", model=model)
+    preserve_changes = False
 
     try:
         task = build_refine_task(plan, config)
         # Refine writes into the live worktree, so an aborted run must not leave
         # half-applied edits behind for a later run to commit.
-        baseline = _worktree_snapshot(project_dir)
         try:
             run_agent(client, agent_id, project_dir, config, task, mode="refine")
         except FoundryRunIncompleteError as exc:
             log.error("Refine run ended incomplete (%s) — rolling back partial changes.", exc.reason)
-            _rollback_agent_changes(project_dir, baseline)
             return False
 
         # Check if agent made any changes. Uses the same parser as the rollback
@@ -1767,14 +1791,46 @@ def refine_project(
         changed_files = sorted(_worktree_status(project_dir))
 
         if not changed_files:
+            preserve_changes = True
             log.info("No files changed — nothing to commit.")
             return False
 
         log.info("Files changed: %s", changed_files)
 
         if dry_run:
+            preserve_changes = True
             log.info("[DRY RUN] Would commit %d files and create PR", len(changed_files))
             return False
+
+        raw_test_result = _handle_run_tests(project_dir, {})
+        try:
+            test_result = json.loads(raw_test_result)
+        except (json.JSONDecodeError, TypeError) as exc:
+            log.error(
+                "Final test validation returned an invalid result (%s) — refusing "
+                "publication and rolling back changes.",
+                exc,
+            )
+            return False
+
+        if not isinstance(test_result, dict) or test_result.get("passed") is not True:
+            if isinstance(test_result, dict):
+                reason = (
+                    test_result.get("error")
+                    or test_result.get("output")
+                    or "test runner did not report passed=true"
+                )
+            else:
+                reason = f"unexpected result type {type(test_result).__name__}"
+            log.error(
+                "Final test validation did not explicitly pass — refusing publication "
+                "and rolling back changes. Runner result: %s",
+                reason,
+            )
+            return False
+
+        preserve_changes = True
+        log.info("Final test validation passed; changes are eligible for publication.")
 
         # Commit and push
         improvements = plan.get("improvements", [])
@@ -1807,7 +1863,8 @@ def refine_project(
             pr_body += f"- **{imp.get('title', '')}**: {imp.get('description', '')}\n"
         pr_body += (
             "\n### Safety\n"
-            "All changes were applied by the autoRefine Foundry agent. "
+            "All changes were applied by the autoRefine Foundry agent and the "
+            "project's deterministic final test run passed before publication. "
             "Review carefully before merging.\n"
         )
 
@@ -1828,8 +1885,15 @@ def refine_project(
         return pr_created
 
     finally:
-        client.delete_agent(agent_id)
-        log.info("Agent cleaned up.")
+        try:
+            if not preserve_changes:
+                try:
+                    _rollback_agent_changes(project_dir, baseline)
+                except (OSError, subprocess.SubprocessError) as exc:
+                    log.error("Could not roll back unvalidated refine changes: %s", exc)
+        finally:
+            client.delete_agent(agent_id)
+            log.info("Agent cleaned up.")
 
 
 def run_health_scan_mode(repos: list[str], assign_copilot: bool = True) -> None:
@@ -1939,7 +2003,7 @@ def main() -> None:
         "--model",
         default=os.environ.get("FOUNDRY_DEFAULT_DEPLOYMENT", "gpt-4o-mini"),
         help=(
-            "Foundry deployment name to use for plan/refine modes. "
+            "Foundry deployment name to use for plan/file-ideas/refine modes. "
             "Defaults to FOUNDRY_DEFAULT_DEPLOYMENT env var, then gpt-4o-mini. "
             "Set to a higher-tier deployment (e.g. gpt-5) for deep analysis."
         ),
@@ -1969,6 +2033,11 @@ def main() -> None:
     args = parser.parse_args()
     if args.repo is not None and not _is_valid_repo_slug(args.repo):
         parser.error("--repo must be in the format owner/name")
+    if args.mode == "health-scan" and args.dry_run:
+        parser.error(
+            "--dry-run is not supported for health-scan; it persists reports, "
+            "files issues, and sends notifications"
+        )
 
     # Resolve repo list
     repos: list[str] = []
@@ -2029,6 +2098,7 @@ def main() -> None:
 
     log.info("autoRefine starting — mode=%s, %d repos", config.mode, len(repos))
 
+    failed_repos: list[str] = []
     for repo in repos:
         # A scan of every project must survive any single one of them. Two separate bugs
         # have already ended a run part-way through the list (a missing test runner, a
@@ -2039,6 +2109,12 @@ def main() -> None:
             _process_repo(repo, config)
         except Exception:
             log.exception("%s failed — continuing with the remaining projects", repo)
+            failed_repos.append(repo)
+
+    if failed_repos:
+        print(json.dumps({"run_status": "failed", "failed_repos": failed_repos}, indent=2))
+        log.error("autoRefine incomplete: %d project(s) failed: %s", len(failed_repos), failed_repos)
+        raise SystemExit(1)
 
     log.info("autoRefine complete.")
 
@@ -2050,8 +2126,7 @@ def _process_repo(repo: str, config: AutoRefineConfig) -> None:
 
     # Clone / update
     if not clone_repo(repo, project_dir):
-        log.warning("Failed to clone %s — skipping", repo)
-        return
+        raise RuntimeError(f"Failed to clone or update {repo}")
 
     # Load project.yaml
     project_config = load_config(project_dir)
@@ -2121,7 +2196,9 @@ def _process_repo(repo: str, config: AutoRefineConfig) -> None:
                 return
             log.info("Planning %s — %s", name, reason)
 
-        plan = plan_project(project_dir, project_config, report["findings"])
+        plan = plan_project(
+            project_dir, project_config, report["findings"], model=config.model,
+        )
         if plan:
             filed_count = file_ideas_for_plan(repo, plan, dry_run=config.dry_run)
             log.info("Filed %d technical ideas for %s", filed_count, name)
