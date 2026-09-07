@@ -205,22 +205,21 @@ def test_main_health_scan_short_circuits_per_repo_flow() -> None:
     ):
         main()
 
-    mock_scan.assert_called_once_with(["owner/repo"], assign_copilot=True)
+    mock_scan.assert_called_once_with(["owner/repo"], assign_copilot=True, dry_run=False)
     mock_clone.assert_not_called()
 
 
-def test_health_scan_rejects_unsupported_dry_run_before_side_effects() -> None:
+def test_health_scan_passes_dry_run_to_side_effect_guard() -> None:
     with (
         patch(
             "sys.argv",
             ["autorefine", "--repo", "owner/repo", "--mode", "health-scan", "--dry-run"],
         ),
         patch("agent.main.run_health_scan_mode") as scan,
-        pytest.raises(SystemExit, match="2"),
     ):
         main()
 
-    scan.assert_not_called()
+    scan.assert_called_once_with(["owner/repo"], assign_copilot=True, dry_run=True)
 
 
 def test_main_plan_passes_model_to_plan_project(

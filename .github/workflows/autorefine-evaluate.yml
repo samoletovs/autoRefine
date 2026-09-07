@@ -15,7 +15,7 @@ on:
   # to rotate or leak. That needs `id-token: write` below, plus two repository secrets,
   # AZURE_CLIENT_ID and AZURE_TENANT_ID, pointing at an Entra app whose federated
   # credential trusts this repository. Until a human creates those two secrets the login
-  # step still fails, with the same message: this workflow is inert, not fixed.
+  # prerequisite check still fails: this workflow is inert, not fixed.
   #
   # The scheduled Container Apps job is unaffected: it authenticates with a
   # system-assigned managed identity and needs no secret at all.
@@ -97,6 +97,26 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Validate Azure OIDC prerequisites
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          missing=()
+          for name in AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID; do
+            if [ -z "${!name:-}" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ -n "${GITHUB_OUTPUT:-}" ]; then
+            printf 'missing=%s\n' "${missing[*]}" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "::error::Missing Azure OIDC repository secrets: ${missing[*]}. Configure the identity and federated credential before rerunning."
+            exit 1
+          fi
 
       # OIDC, not a service-principal secret. With no client-secret supplied, azure/login
       # runs `az login --service-principal --federated-token <github-oidc-jwt>`, which
