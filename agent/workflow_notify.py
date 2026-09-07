@@ -12,6 +12,7 @@ Optional env vars (populated by the workflow):
   AVG        — average score
   MODE       — evaluate mode (file-ideas / plan / evaluate)
   STATUS     — ``steps.parse-scores.outcome``: "success" | "failure" | "skipped"
+  RUN_STATUS — ``steps.run-autorefine.outcome``; a failed run can still have scores
   RUN_URL    — URL of the GitHub Actions run for the failure message
   ISSUE_URL  — URL of the tracking issue, empty when no issue was filed
 """
@@ -28,8 +29,10 @@ import sys
 _INFRASTRUCTURE_STATUSES = frozenset({"skipped", "cancelled"})
 
 
-def _failure_kind(status: str, has_scores: bool) -> str | None:
+def _failure_kind(status: str, has_scores: bool, run_status: str = "") -> str | None:
     """Classify the failure, or ``None`` when the run genuinely succeeded."""
+    if run_status == "failure":
+        return "execution"
     if status in _INFRASTRUCTURE_STATUSES:
         return "infrastructure"
     if status and status != "success":
@@ -54,6 +57,11 @@ def _failure_detail(kind: str, has_issue: bool) -> str:
             "The run stopped before any project was evaluated, so there are no "
             "scores to report — the failure is in the workflow itself."
         )
+    elif kind == "execution":
+        base = (
+            "The autoRefine execution failed. Any scores below are partial evaluation "
+            "results, not evidence that every requested stage completed."
+        )
     else:
         base = "The run finished, but no scores could be parsed from its report."
 
@@ -72,11 +80,12 @@ def build_message() -> str:
     avg = os.environ.get("AVG", "").strip()
     mode = os.environ.get("MODE", "file-ideas").strip() or "file-ideas"
     status = os.environ.get("STATUS", "").strip().lower()
+    run_status = os.environ.get("RUN_STATUS", "").strip().lower()
     run_url = os.environ.get("RUN_URL", "").strip()
     issue_url = os.environ.get("ISSUE_URL", "").strip()
 
     has_scores = bool(scores) and bool(total) and bool(avg)
-    kind = _failure_kind(status, has_scores)
+    kind = _failure_kind(status, has_scores, run_status)
 
     if kind is not None:
         headline = "FAILED before any project was scored" if kind == "infrastructure" else "FAILED"
@@ -87,6 +96,8 @@ def build_message() -> str:
             lines.append(f'🐛 <a href="{issue_url}">Tracking issue</a>')
         lines.append("")
         lines.append(_failure_detail(kind, bool(issue_url)))
+        if kind == "execution" and has_scores:
+            lines.extend(["", f"Partial scores: {total} projects, avg {avg}/100", scores])
         return "\n".join(lines)
 
     msg = f"🔧 <b>autoRefine</b> daily {mode}\n\n"

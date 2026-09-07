@@ -6,6 +6,8 @@ import logging
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from agent import main
 
 
@@ -80,6 +82,61 @@ def _spec(title: str, priority: str, category: str) -> dict:
         "approach": f"Edit src/{category}.ts and cover the new branch in tests/.",
         "success_criteria": "npm test exits 0 with 12 passing specs, up from 10.",
     }
+
+
+@pytest.mark.parametrize(
+    ("cards", "dry_run", "missing"),
+    [
+        (False, False, "--repo"),
+        (False, True, "--dry-run"),
+        (True, False, "--needs-approval"),
+        (True, True, "--dry-run"),
+        (True, False, "--repo"),
+    ],
+)
+def test_filer_cannot_drop_required_safety_options(
+    monkeypatch: pytest.MonkeyPatch, cards: bool, dry_run: bool, missing: str,
+) -> None:
+    script = Path("/tmp/file-idea.py")
+    options = {"--repo", "--dry-run", "--needs-approval"} - {missing}
+    monkeypatch.setattr(main, "_resolve_file_idea_script", lambda: script)
+    monkeypatch.setattr(main, "_discover_file_idea_options", lambda _path: options)
+    monkeypatch.setattr(main, "_open_idea_titles", lambda _repo: [])
+    executed: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+        executed.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+    improvement = _spec("Fix retry backoff", "P1", "reliability")
+
+    with pytest.raises(RuntimeError, match=missing):
+        if cards:
+            main._file_one_idea(script, "owner/repo", improvement, "", dry_run)
+        else:
+            main.file_ideas_for_plan(
+                "owner/repo", {"improvements": [improvement]}, dry_run=dry_run,
+            )
+
+    assert executed == [], "An incompatible filer must never execute without its safety flags"
+
+
+def test_filer_preserves_supported_safety_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        main, "_discover_file_idea_options",
+        lambda _path: {"--repo", "--dry-run", "--needs-approval"},
+    )
+
+    cmd = main._build_file_idea_command(
+        Path("/tmp/file-idea.py"), "owner/repo",
+        _spec("Fix retry backoff", "P1", "reliability"), "",
+        dry_run=True, needs_approval=True,
+    )
+
+    assert cmd[cmd.index("--repo") + 1] == "owner/repo"
+    assert "--dry-run" in cmd
+    assert "--needs-approval" in cmd
 
 
 def test_file_ideas_for_plan_filters_and_deduplicates(monkeypatch) -> None:
@@ -322,7 +379,7 @@ def test_file_ideas_for_plan_actually_skips_an_already_open_duplicate(monkeypatc
     script.write_text("# stub", encoding="utf-8")
     monkeypatch.setattr(main, "_resolve_file_idea_script", lambda: script)
     monkeypatch.setattr(main, "_build_run_references", lambda: "- commit: `abc`")
-    monkeypatch.setattr(main, "_discover_file_idea_options", lambda p: set())
+    monkeypatch.setattr(main, "_discover_file_idea_options", lambda p: {"--repo"})
     monkeypatch.setattr(main.subprocess, "run", _fake_run)
 
     filed = main.file_ideas_for_plan(

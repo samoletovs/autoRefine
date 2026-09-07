@@ -209,6 +209,19 @@ def test_main_health_scan_short_circuits_per_repo_flow() -> None:
     mock_clone.assert_not_called()
 
 
+def test_health_scan_passes_dry_run_to_side_effect_guard() -> None:
+    with (
+        patch(
+            "sys.argv",
+            ["autorefine", "--repo", "owner/repo", "--mode", "health-scan", "--dry-run"],
+        ),
+        patch("agent.main.run_health_scan_mode") as scan,
+    ):
+        main()
+
+    scan.assert_called_once_with(["owner/repo"], assign_copilot=True, dry_run=True)
+
+
 def test_main_plan_passes_model_to_plan_project(
     tmp_path: Path, project_config: ProjectConfig
 ) -> None:
@@ -237,6 +250,49 @@ def test_main_plan_passes_model_to_plan_project(
 
     assert mock_plan.call_count == 1
     assert mock_plan.call_args.kwargs["model"] == "gpt-4.1"
+
+
+@pytest.mark.parametrize(
+    ("deployment", "model_args", "expected"),
+    [
+        (None, [], "gpt-4o-mini"),
+        ("configured-deployment", [], "configured-deployment"),
+        ("configured-deployment", ["--model", "requested-deployment"], "requested-deployment"),
+    ],
+)
+def test_file_ideas_uses_same_model_for_both_planning_passes(
+    tmp_path: Path,
+    project_config: ProjectConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    deployment: str | None,
+    model_args: list[str],
+    expected: str,
+) -> None:
+    monkeypatch.delenv("FOUNDRY_DEFAULT_DEPLOYMENT", raising=False)
+    if deployment is not None:
+        monkeypatch.setenv("FOUNDRY_DEFAULT_DEPLOYMENT", deployment)
+    monkeypatch.setenv("AUTOREFINE_FUNCTIONAL_MODE", "propose")
+    with (
+        patch(
+            "sys.argv",
+            [
+                "autorefine", "--repo", "owner/repo", "--mode", "file-ideas",
+                "--workdir", str(tmp_path), *model_args,
+            ],
+        ),
+        patch("agent.main.clone_repo", return_value=True),
+        patch("agent.main.load_config", return_value=project_config),
+        patch("agent.main.evaluate_project", return_value={"findings": [], "score": 100}),
+        patch("agent.main.plan_project", return_value=None) as technical,
+        patch("agent.main.plan_functional", return_value=None) as functional,
+        patch("builtins.print"),
+    ):
+        main()
+
+    technical.assert_called_once()
+    functional.assert_called_once()
+    assert technical.call_args.kwargs["model"] == expected
+    assert functional.call_args.kwargs["model"] == expected
 
 
 def test_main_refine_passes_model_to_plan_and_refine(
@@ -270,13 +326,15 @@ def test_main_refine_passes_model_to_plan_and_refine(
     assert mock_refine.call_args.kwargs["model"] == "gpt-4.1"
 
 
-def test_plan_project_passes_model_to_create_agent(project_config: ProjectConfig, tmp_path: Path) -> None:
+def test_plan_project_passes_model_to_create_agent(
+    project_config: ProjectConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from agent import main as main_module
 
     fake_client = SimpleNamespace(delete_agent=MagicMock())
+    monkeypatch.setenv("FOUNDRY_PROJECT_ENDPOINT", "https://example.test")
 
     with (
-        patch.dict("os.environ", {"FOUNDRY_PROJECT_ENDPOINT": "https://example.test"}),
         patch("azure.ai.agents.AgentsClient", return_value=fake_client),
         patch("azure.identity.DefaultAzureCredential"),
         patch("agent.foundry_agent.create_agent", return_value="agent-1") as mock_create,
@@ -290,18 +348,24 @@ def test_plan_project_passes_model_to_create_agent(project_config: ProjectConfig
     fake_client.delete_agent.assert_called_once_with("agent-1")
 
 
-def test_refine_project_passes_model_to_create_agent(project_config: ProjectConfig, tmp_path: Path) -> None:
+def test_refine_project_passes_model_to_create_agent(
+    project_config: ProjectConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from agent import main as main_module
 
     fake_client = SimpleNamespace(delete_agent=MagicMock())
+    monkeypatch.setenv("FOUNDRY_PROJECT_ENDPOINT", "https://example.test")
 
     with (
-        patch.dict("os.environ", {"FOUNDRY_PROJECT_ENDPOINT": "https://example.test"}),
         patch("azure.ai.agents.AgentsClient", return_value=fake_client),
         patch("azure.identity.DefaultAzureCredential"),
         patch("agent.foundry_agent.create_agent", return_value="agent-2") as mock_create,
         patch("agent.foundry_agent.build_refine_task", return_value="refine-task"),
         patch("agent.foundry_agent.run_agent", return_value={"score": 99}),
+        patch(
+            "agent.foundry_agent._handle_run_tests",
+            return_value='{"passed": true, "output": "1 passed"}',
+        ),
         patch("agent.tools.github_tools.create_branch", return_value=True),
         patch(
             "subprocess.run",

@@ -164,6 +164,8 @@ jobs:
           done
 
       - name: Run autoRefine
+        id: run-autorefine
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
           # Observe-first: propose functional ideas (log + Telegram, file NOTHING) until a
@@ -183,14 +185,16 @@ jobs:
             set -- --manifest .github-gov/config/workspace-manifest.json
           fi
 
+          status=0
           python -m agent.main "$@" --mode "$MODE" \
             --workdir /tmp/autorefine \
-            > /tmp/autorefine-report.json 2>/tmp/autorefine-logs.txt || true
+            > /tmp/autorefine-report.json 2>/tmp/autorefine-logs.txt || status=$?
 
           echo "--- logs ---"
           cat /tmp/autorefine-logs.txt
           echo "--- report ---"
           cat /tmp/autorefine-report.json
+          exit "$status"
 
       # Writes scores/total/avg to $GITHUB_OUTPUT, or exits 1 when the report holds no
       # score objects. continue-on-error keeps `outcome` truthful (that is the signal the
@@ -201,6 +205,7 @@ jobs:
       # 25-project manifest reported "20 projects" beside an average over all 25.
       - name: Parse scores
         id: parse-scores
+        if: steps.run-autorefine.outcome != 'skipped' && !cancelled()
         continue-on-error: true
         run: python3 -m agent.score_summary /tmp/autorefine-report.json
 
@@ -287,6 +292,7 @@ jobs:
           AVG: ${{ steps.parse-scores.outputs.avg }}
           MODE: ${{ github.event.inputs.mode || 'file-ideas' }}
           STATUS: ${{ steps.parse-scores.outcome }}
+          RUN_STATUS: ${{ steps.run-autorefine.outcome }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           ISSUE_URL: ${{ steps.failure-issue.outputs.url }}
         run: |
@@ -296,8 +302,8 @@ jobs:
           fi
           python3 agent/workflow_notify.py || echo "::warning::Telegram notification failed"
 
-      - name: Fail job if parsing failed
-        if: steps.parse-scores.outcome == 'failure'
+      - name: Fail job if execution or parsing failed
+        if: steps.run-autorefine.outcome == 'failure' || steps.parse-scores.outcome == 'failure'
         run: |
-          echo "::error::Parse scores step failed — see issue ${{ steps.failure-issue.outputs.url }}"
+          echo "::error::autoRefine execution or score parsing failed — inspect the run log"
           exit 1
