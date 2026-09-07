@@ -9,7 +9,7 @@ from agent import workflow_notify
 
 @pytest.fixture(autouse=True)
 def _clear_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    for var in ("SCORES", "TOTAL", "AVG", "MODE", "STATUS", "RUN_URL", "ISSUE_URL"):
+    for var in ("SCORES", "TOTAL", "AVG", "MODE", "STATUS", "RUN_STATUS", "RUN_URL", "ISSUE_URL"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -176,3 +176,26 @@ def test_success_is_unaffected_by_the_failure_classifier(
     assert "FAILED" not in msg
     assert "Copilot" not in msg
     assert "era: 80/100" in msg
+
+
+@pytest.mark.parametrize("has_scores", [False, True])
+def test_failed_execution_cannot_be_hidden_by_parsed_scores(
+    monkeypatch: pytest.MonkeyPatch, has_scores: bool,
+) -> None:
+    monkeypatch.setenv("RUN_STATUS", "failure")
+    monkeypatch.setenv("STATUS", "success" if has_scores else "failure")
+    if has_scores:
+        monkeypatch.setenv("SCORES", "first: 80/100\nlast: 80/100")
+        monkeypatch.setenv("TOTAL", "2")
+        monkeypatch.setenv("AVG", "80")
+
+    msg = workflow_notify.build_message()
+
+    assert "FAILED" in msg
+    assert "execution failed" in msg
+    assert "needs a human" in msg
+    assert "no scores could be parsed" not in msg
+    assert "before any project was scored" not in msg
+    if has_scores:
+        assert "Partial scores" in msg
+        assert "first: 80/100" in msg

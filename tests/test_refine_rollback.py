@@ -7,9 +7,11 @@ a real git repo so the rollback is proven against actual git behaviour.
 """
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -100,3 +102,84 @@ def test_refine_project_rolls_back_and_returns_false_on_incomplete(
     assert result is False
     assert not (repo / "half_done.py").exists(), "partial write survived an incomplete run"
     assert committed == [], "incomplete run must not commit or push"
+
+
+@pytest.mark.parametrize("status", ["cancelled", "expired"])
+def test_terminal_refine_run_rolls_back_and_never_publishes(
+    status: str,
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent import foundry_agent
+    from agent.config import ProjectConfig
+
+    class ToolCall:
+        def __init__(self) -> None:
+            self.id = "call-1"
+            self.function = SimpleNamespace(
+                name="write_project_file",
+                arguments=json.dumps({"path": "half_done.py", "content": "# partial\n"}),
+            )
+
+    class Action:
+        def __init__(self) -> None:
+            self.submit_tool_outputs = SimpleNamespace(tool_calls=[ToolCall()])
+
+    class ToolOutput:
+        def __init__(self, tool_call_id: str, output: str) -> None:
+            self.tool_call_id = tool_call_id
+            self.output = output
+
+    def create_run(
+        *,
+        thread_id: str,
+        agent_id: str,
+        max_prompt_tokens: int | None = None,
+        truncation_strategy: object = None,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(id="run-1", status="requires_action", required_action=Action())
+
+    client = SimpleNamespace(
+        threads=SimpleNamespace(
+            create=Mock(return_value=SimpleNamespace(id="thread-1")),
+            delete=Mock(),
+        ),
+        messages=SimpleNamespace(create=Mock(), list=Mock(return_value=[])),
+        runs=SimpleNamespace(
+            create=create_run,
+            submit_tool_outputs=Mock(return_value=SimpleNamespace(id="run-1", status=status)),
+        ),
+        delete_agent=Mock(),
+    )
+    committed: list[str] = []
+    published: list[str] = []
+
+    monkeypatch.setenv("FOUNDRY_PROJECT_ENDPOINT", "https://example.test/foundry")
+    monkeypatch.setattr("azure.ai.agents.AgentsClient", lambda **_kw: client)
+    monkeypatch.setattr("azure.identity.DefaultAzureCredential", lambda **_kw: object())
+    monkeypatch.setattr(foundry_agent, "RequiredFunctionToolCall", ToolCall)
+    monkeypatch.setattr(foundry_agent, "SubmitToolOutputsAction", Action)
+    monkeypatch.setattr(foundry_agent, "ToolOutput", ToolOutput)
+    monkeypatch.setattr(foundry_agent, "create_agent", lambda *_a, **_kw: "agent-1")
+    monkeypatch.setattr(foundry_agent, "build_refine_task", lambda *_a, **_kw: "task")
+    monkeypatch.setattr("agent.tools.github_tools.create_branch", lambda *_a, **_kw: True)
+    monkeypatch.setattr(
+        "agent.tools.github_tools.commit_and_push",
+        lambda *_a, **_kw: committed.append("pushed") or True,
+    )
+    monkeypatch.setattr(
+        "agent.tools.github_tools.create_pr",
+        lambda *_a, **_kw: published.append("pr") or "url",
+    )
+
+    config = ProjectConfig(name="demo", purpose="", users="", stage="active")
+    result = agent_main.refine_project(
+        repo, config, {"improvements": [], "score": 50}, "owner/demo"
+    )
+
+    assert result is False
+    assert not (repo / "half_done.py").exists()
+    assert committed == []
+    assert published == []
+    client.messages.list.assert_not_called()
+    client.threads.delete.assert_called_once_with("thread-1")

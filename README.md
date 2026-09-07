@@ -69,6 +69,33 @@ python -m agent.main --manifest config/workspace-manifest.json --mode file-ideas
 python -m agent.main --repo owner/repo --mode dashboard --output dashboard.html
 ```
 
+`--model` selects the deployment for `plan`, `refine`, and both technical and functional
+planning in `file-ideas`. It overrides `FOUNDRY_DEFAULT_DEPLOYMENT`; the default remains
+`gpt-4o-mini`.
+
+`file-ideas --dry-run` suppresses issue creation and Telegram notifications, but can
+still use Foundry to generate plans. The governance filer must support `--repo` and
+any requested `--dry-run` or `--needs-approval` flag; missing capabilities stop filing
+rather than silently dropping these safeguards. `health-scan --dry-run` reads services
+and runs AI analysis (still billed), but does not persist/prune reports, create/assign
+issues, or send Telegram. Its JSON includes the proposed report and issues. The health
+workflow's `dry_run` dispatch input also dry-runs the PR sweep and suppresses failure
+notifications. Normal scans remain unchanged; identity configuration still needs
+operator approval.
+
+`refine` requires a clean worktree before agent work and a passing deterministic
+final test run before publishing. A failed or unavailable test runner blocks publication
+and rolls back the run's edits, including files in new directories. Interruptions and
+exceptions before validation also attempt rollback before propagating. An unreadable
+Git status is an error, never a clean worktree. Dry runs do not publish or perform this
+final test gate.
+
+Per-project exceptions and failed clones do not stop the remaining projects in a sweep.
+After those attempts, the CLI appends a `run_status: failed` object listing `failed_repos`
+and exits nonzero. Existing score objects remain available, but the evaluate workflow
+labels them as partial when execution failed. This does not change the Container Apps
+entrypoint's separate best-effort exit policy or automatically retry the sweep.
+
 ## Project structure
 
 ```
