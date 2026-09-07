@@ -7,6 +7,11 @@ on:
     # report is read as.
     - cron: '0 6 * * *'
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Read and analyze only: no report/issue writes or Telegram sends (AI usage still billed)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -29,6 +34,7 @@ jobs:
           || (vars.AUTOREFINE_CADENCE != '2' && startsWith(github.event.schedule, '0 6'))
           || vars.AUTOREFINE_CADENCE == '' )
     env:
+      AUTOREFINE_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
       AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
       AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
       NAURO_BOT_TOKEN: ${{ secrets.NAURO_BOT_TOKEN }}
@@ -64,6 +70,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Validate Azure OIDC prerequisites
+        id: azure-prerequisites
         env:
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
@@ -75,6 +82,9 @@ jobs:
               missing+=("$name")
             fi
           done
+          if [ -n "${GITHUB_OUTPUT:-}" ]; then
+            printf 'missing=%s\n' "${missing[*]}" >> "$GITHUB_OUTPUT"
+          fi
           if [ "${#missing[@]}" -ne 0 ]; then
             echo "::error::Missing Azure OIDC repository secrets: ${missing[*]}. Configure the identity and federated credential before rerunning."
             exit 1
@@ -90,6 +100,7 @@ jobs:
       # in particular happens after all the data gathering, well past the 5 minutes
       # GitHub's federated token lasts (Azure/azure-cli#28708). Pre-warmed below.
       - name: Azure login
+        id: azure-login
         uses: azure/login@v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -111,13 +122,19 @@ jobs:
           done
 
       - name: Run health scan
+        id: health-scan
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
+          set --
+          if [ "${AUTOREFINE_DRY_RUN:-false}" = "true" ]; then
+            set -- --dry-run
+          fi
           scan_status=0
           python -m agent.main \
             --manifest .github-gov/config/workspace-manifest.json \
             --mode health-scan \
+            "$@" \
             > autorefine-health.json 2>&1 || scan_status=$?
 
           echo "--- health-scan output ---"
@@ -131,24 +148,52 @@ jobs:
       # pr-ready-cards.yml drop to a single scheduled sweep a day without doubling the
       # wait for a card. `always()` so a failed scan above still gets the PRs carded.
       - name: Sweep and card ready Copilot PRs
+        id: pr-sweep
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
+          set --
+          if [ "${AUTOREFINE_DRY_RUN:-false}" = "true" ]; then
+            set -- --dry-run
+          fi
           python -m agent.main \
             --manifest .github-gov/config/workspace-manifest.json \
-            --mode pr-cards
+            --mode pr-cards \
+            "$@"
 
       - name: Failure notification
-        if: failure()
+        if: failure() && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
+        env:
+          OIDC_STATUS: ${{ steps.azure-prerequisites.outcome }}
+          AZURE_LOGIN_STATUS: ${{ steps.azure-login.outcome }}
+          SCAN_STATUS: ${{ steps.health-scan.outcome }}
+          PR_SWEEP_STATUS: ${{ steps.pr-sweep.outcome }}
+          AZURE_OIDC_MISSING: ${{ steps.azure-prerequisites.outputs.missing }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           if [ -z "$NAURO_BOT_TOKEN" ] || [ -z "$NAURO_CHAT_ID" ]; then
-            echo "NAURO_BOT_TOKEN or NAURO_CHAT_ID not set; skipping"
-            exit 0
+            echo "::error::Telegram failure notification requires NAURO_BOT_TOKEN and NAURO_CHAT_ID"
+            exit 1
           fi
-          curl -sf -X POST "https://api.telegram.org/bot${NAURO_BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${NAURO_CHAT_ID}" \
-            --data-urlencode "parse_mode=HTML" \
-            --data-urlencode "disable_web_page_preview=true" \
-            --data-urlencode "text=❌ <b>autoRefine daily scan</b> failed (health-scan or PR-card sweep) — see GitHub Actions log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            || echo "::warning::Telegram failure notification did not send"
+          stage_status() {
+            case "$1" in
+              success) echo "succeeded" ;;
+              failure) echo "failed" ;;
+              cancelled) echo "cancelled" ;;
+              skipped|"") echo "not run" ;;
+              *) echo "unknown" ;;
+            esac
+          }
+          message="❌ autoRefine daily scan failed"
+          if [ "$OIDC_STATUS" = "failure" ]; then
+            message+=$'\n'"Missing Azure OIDC settings: ${AZURE_OIDC_MISSING:-unknown}. Operator configuration required."
+          elif [ "$AZURE_LOGIN_STATUS" = "failure" ]; then
+            message+=$'\n'"Azure login failed — verify the configured identity and repository federation."
+          elif [ "$AZURE_LOGIN_STATUS" != "success" ]; then
+            message+=$'\n'"Setup failed before Azure login."
+          fi
+          message+=$'\n'"Health scan: $(stage_status "$SCAN_STATUS")"
+          message+=$'\n'"PR-card sweep: $(stage_status "$PR_SWEEP_STATUS")"
+          message+=$'\n'"Run: $RUN_URL"
+          bash scripts/notify-telegram.sh --plain "$message"

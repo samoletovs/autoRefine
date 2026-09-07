@@ -1304,6 +1304,31 @@ OIDC identity inputs before `azure/login`, naming missing secrets without printi
 Setup remains before that check so an absent identity does not disable the PR-card sweep.
 Credential provisioning and live recovery validation remain operator tasks.
 
+Both Azure workflows validate their inputs before login. Health failure notices name the
+missing settings and distinguish a skipped scan from a successful or failed PR sweep.
+The workflow uses `scripts/notify-telegram.sh`, copied unchanged from governance, so a
+failed governance checkout does not also remove the sender. Keep this copy in sync with
+the canonical helper rather than adding another Telegram client. Missing notification
+settings or a failed send fail the notification step instead of reporting delivery.
+
+`--mode health-scan --dry-run` reads the services and runs AI analysis (which still costs
+money), but does not persist/prune reports, create/assign issues, or send Telegram. Its
+JSON includes the proposed report and issues; failed analysis still exits nonzero. The
+health workflow's optional `dry_run` dispatch input also dry-runs the independent PR sweep
+and suppresses failure notifications. Scheduled runs and normal dispatches are unchanged.
+This is a validation path, not evidence that report persistence or delivery works.
+
+**Activation remains an operator decision.** Verified 2026-09-07: repository settings
+`AZURE_CLIENT_ID` and `AZURE_TENANT_ID` are absent, and the existing enabled Entra app
+`autoRefine-health-scan` has no federated credentials. Reuse that identity with its
+existing roles, not a new password or principal. Its master-branch trust requires issuer
+`https://token.actions.githubusercontent.com`, audience `api://AzureADTokenExchange`, and
+subject `repo:samoletovs/autoRefine:ref:refs/heads/master` while the repository uses its
+current non-immutable default subject. Any auth configuration change needs approval.
+After configuration, validate data access in dry-run before explicitly authorizing report
+writes, issue creation/assignment and Telegram delivery. Normal health scans still have
+no critical-issue dedup/shared-cause grouping; `--no-copilot-assign` alone still files issues.
+
 Failed Foundry runs are replayed only for `server_error` and `rate_limit_exceeded`.
 Permanent/unknown failures raise an incomplete-run subtype so functional planning does
 not buy three identical attempts, and failed refine runs reach the partial-edit rollback
