@@ -76,8 +76,12 @@ planning in `file-ideas`. It overrides `FOUNDRY_DEFAULT_DEPLOYMENT`; the default
 `file-ideas --dry-run` suppresses issue creation and Telegram notifications, but can
 still use Foundry to generate plans. The governance filer must support `--repo` and
 any requested `--dry-run` or `--needs-approval` flag; missing capabilities stop filing
-rather than silently dropping these safeguards. `health-scan --dry-run` is rejected
-because that mode has no read-only execution path.
+rather than silently dropping these safeguards. `health-scan --dry-run` reads services
+and runs AI analysis (still billed), but does not persist/prune reports, create/assign
+issues, or send Telegram. Its JSON includes the proposed report and issues. The health
+workflow's `dry_run` dispatch input also dry-runs the PR sweep and suppresses failure
+notifications. Normal scans remain unchanged; identity configuration still needs
+operator approval.
 
 `refine` requires a clean worktree before agent work and a passing deterministic
 final test run before publishing. A failed or unavailable test runner blocks publication

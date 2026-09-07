@@ -1147,9 +1147,12 @@ def build_telegram_summary(
 
 
 # ── Entry point ────────────────────────────────────────────────────────────
-def run_health_scan(repos: list[str], assign_copilot: bool = True) -> dict[str, Any]:
+def run_health_scan(
+    repos: list[str], assign_copilot: bool = True, *, dry_run: bool = False,
+) -> dict[str, Any]:
     """Execute the full health scan pipeline.
 
+    Dry runs still read services and buy AI analysis, but never write or notify.
     Returns a summary dict with report_path, created_issues, scan stats.
     Raises ValueError if GH_TOKEN is missing.
     """
@@ -1189,6 +1192,23 @@ def run_health_scan(repos: list[str], assign_copilot: bool = True) -> dict[str, 
     report = generate_report(
         github_data, cost_data, analysis, app_insights_data, url_health_data
     )
+
+    if dry_run:
+        return {
+            "dry_run": True,
+            "report": report,
+            "report_path": None,
+            "planned_issues": analysis.get("issues_to_create", []),
+            "created_issues": [],
+            "github_repos_scanned": len(github_data),
+            "urls_checked": len(url_health_data),
+            "telegram_summary": (
+                "DRY RUN — no report saved, issues filed, or notifications sent.\n"
+                + build_telegram_summary(analysis, None, [], cost_data=cost_data)
+            ),
+            "analysis_failed": analysis_failed(analysis),
+            "failed_stages": ["analysis"] if analysis_failed(analysis) else [],
+        }
 
     try:
         report_path = commit_report(github_token, report)

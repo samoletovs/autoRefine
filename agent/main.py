@@ -1896,7 +1896,9 @@ def refine_project(
             log.info("Agent cleaned up.")
 
 
-def run_health_scan_mode(repos: list[str], assign_copilot: bool = True) -> None:
+def run_health_scan_mode(
+    repos: list[str], assign_copilot: bool = True, *, dry_run: bool = False,
+) -> None:
     """Run the NauroLabs health scan (GitHub + Azure cost + App Insights + URLs).
 
     Sends a Telegram summary via agent.notify and commits a markdown
@@ -1905,7 +1907,7 @@ def run_health_scan_mode(repos: list[str], assign_copilot: bool = True) -> None:
     from agent.health_scan import run_health_scan
 
     short_repos = [r.split("/")[-1] for r in repos]
-    summary = run_health_scan(short_repos, assign_copilot=assign_copilot)
+    summary = run_health_scan(short_repos, assign_copilot=assign_copilot, dry_run=dry_run)
     print(json.dumps(summary, indent=2))
     if summary.get("analysis_failed") or summary.get("failed_stages"):
         raise SystemExit(1)
@@ -2033,12 +2035,6 @@ def main() -> None:
     args = parser.parse_args()
     if args.repo is not None and not _is_valid_repo_slug(args.repo):
         parser.error("--repo must be in the format owner/name")
-    if args.mode == "health-scan" and args.dry_run:
-        parser.error(
-            "--dry-run is not supported for health-scan; it persists reports, "
-            "files issues, and sends notifications"
-        )
-
     # Resolve repo list
     repos: list[str] = []
     swept_manifest = False
@@ -2061,7 +2057,9 @@ def main() -> None:
     # health-scan mode short-circuits the per-project clone+evaluate loop.
     if args.mode == "health-scan":
         log.info("autoRefine starting — mode=health-scan, %d repos", len(repos))
-        run_health_scan_mode(repos, assign_copilot=not args.no_copilot_assign)
+        run_health_scan_mode(
+            repos, assign_copilot=not args.no_copilot_assign, dry_run=args.dry_run,
+        )
         log.info("autoRefine complete.")
         return
     # pr-cards mode also short-circuits the clone loop: it only talks to GitHub + Telegram,
