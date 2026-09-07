@@ -117,6 +117,17 @@ def test_handle_propose_notifies_and_does_not_file():
     assert notified and not filed
 
 
+def test_handle_propose_dry_run_does_not_notify() -> None:
+    notified: list[str] = []
+    selected = m.handle_functional_ideas(
+        "owner/repo", _plan(("Add CSV export", "P1")), mode="propose", dry_run=True,
+        notifier=notified.append,
+    )
+
+    assert len(selected) == 1
+    assert notified == []
+
+
 def test_handle_file_files_capped_selection_with_priorities():
     # Arrange
     plan = _plan(("A", "P1"), ("B", "P2"), ("C", "P1"))

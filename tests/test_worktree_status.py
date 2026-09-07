@@ -56,6 +56,19 @@ def test_modified_and_untracked_are_reported(repo: Path) -> None:
     assert status == {"tracked.txt": " M", "new.py": "??"}
 
 
+def test_rollback_preserves_baseline_files_in_an_untracked_directory(repo: Path) -> None:
+    package = repo / "new_package"
+    package.mkdir()
+    (package / "user.py").write_text("user edit\n", encoding="utf-8")
+    baseline = agent_main._worktree_snapshot(repo)
+    (package / "agent.py").write_text("partial\n", encoding="utf-8")
+
+    agent_main._rollback_agent_changes(repo, baseline)
+
+    assert (package / "user.py").read_text(encoding="utf-8") == "user edit\n"
+    assert not (package / "agent.py").exists()
+
+
 def test_staged_and_unstaged_share_one_path_entry(repo: Path) -> None:
     """The code changes when a file is staged; the path does not."""
     (repo / "tracked.txt").write_text("changed\n", encoding="utf-8")
