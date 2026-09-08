@@ -1295,8 +1295,9 @@ committed script, for the reason given under "What the score actually measures".
 
 ## Test
 
-Health-scan CLI success requires successful analysis, a persisted report, and a delivered
-Telegram summary. The pipeline still attempts notification when report persistence fails;
+Health-scan CLI success requires a successful Azure cost read and analysis, a persisted
+report, and a delivered Telegram summary. The pipeline still attempts notification
+when report persistence fails;
 it emits `failed_stages` in its JSON result and exits nonzero after those attempts. The
 workflow preserves that exit code while printing its log, and the independent PR-card
 sweep still runs with `always()`. The job has a 30-minute ceiling and checks the three

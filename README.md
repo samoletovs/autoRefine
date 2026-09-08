@@ -145,3 +145,50 @@ autoRefine is a **Foundry hosted agent** with function-calling tools:
 ## Cost
 
 Target: < €5/month on Azure consumption plan.
+
+### Subscription budget reporting
+
+Health scans and dashboards read the subscription named by `AZURE_SUBSCRIPTION_ID`
+using the existing `DefaultAzureCredential` chain. `AUTOREFINE_AZURE_BUDGET_NAME`
+selects the Azure subscription budget (default `naurolabs-credit-cycle-eur-100`).
+This is a reporting selection, not budget provisioning or a credit allowance.
+The selected budget must be an unfiltered **Cost / BillingMonth** budget that is
+active on the query date and does not expire before the billing period ends.
+Azure requires a first-of-calendar-month budget lifetime start even for
+`BillingMonth`; that date can fall inside the current billing cycle. It must not
+replace the authoritative billing-period start when querying or projecting costs.
+
+The scanner reads current dates from Azure's **Billing Periods** API, the budget amount
+and currency unit from the selected **Consumption Budget**, and paginated daily
+**ActualCost** rows from Cost Management. It maps columns by name and requires one
+reported currency matching the budget's `currentSpend.unit`. The budget's
+`currentSpend.amount` is never used for costs or freshness: it may be zero before
+budget evaluation or stale afterward. Costs are always queried independently.
+No calendar-month, currency or budget defaults substitute for failed reads. Missing/unsupported
+billing periods, inaccessible budgets, absent units, malformed data and empty cost
+results without a currency make the cost scan unavailable. A zero-cost row with a
+known currency is valid. Cost failures mark health-scan results incomplete
+(`failed_stages: ["cost"]`, alongside any other failures) without preventing other
+scans, report/notification attempts or dry-run output. Billing Periods is a
+subscription-type-dependent preview API; unsupported subscriptions fail visibly.
+
+Reports carry `currency`, `budget_name`, `budget_currency`, `budget_time_grain`,
+inclusive `period_start`/`period_end`, `next_reset` (the following day), `query_end`,
+`remaining_budget` and `latest_usage_date`. The legacy `remaining` key aliases
+**remaining budget**, never actual remaining credit. There is no credit-ledger
+integration; remaining credit is explicitly unavailable.
+
+`projected` is an explicitly labelled **linear cycle-end projection**, not an Azure
+forecast: reported actual cost × inclusive cycle days ÷ inclusive elapsed cycle
+days through the UTC query date. Actual and forecast rows are never added together.
+Budget notification names do not establish forecast semantics; this projection
+remains linear regardless of any notification's name or `thresholdType`.
+The current day can be partial and ingestion can lag. `latest_usage_date` is only
+the latest usage day returned by Azure, **not** an ingestion refresh timestamp or
+proof that all costs through that day have arrived. Ingestion freshness is unknown.
+Older stored reports still render amounts, but missing metadata is labelled unknown
+and cannot produce a green budget verdict.
+
+Successful cost summaries log at DEBUG; unavailable reads remain WARNING. No model,
+scan-frequency, credential, live budget, Function App or infrastructure settings are
+changed by this reporting code.

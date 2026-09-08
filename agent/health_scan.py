@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import datetime
+import html
 import json
 import logging
 import os
@@ -26,6 +27,8 @@ from typing import Any
 
 import httpx
 
+from agent.azure_costs import budget_status, cost_details, format_cost, scan_azure_costs
+
 log = logging.getLogger(__name__)
 
 # ── Configuration ──────────────────────────────────────────────────────────
@@ -34,9 +37,6 @@ REPORT_REPO = "nauroLabs-github"
 REPORT_PATH_PREFIX = "reports/run"
 REPORT_BRANCH = "master"
 MAX_REPORTS = 10
-
-AZURE_BUDGET_MONTHLY = 150.0  # VS Enterprise monthly credit
-BUDGET_WARNING_THRESHOLD_PCT = 70  # yellow 🟡 when spend reaches this % of budget
 
 MANIFEST_URL = (
     "https://raw.githubusercontent.com/samoletovs/nauroLabs-github/master"
@@ -343,70 +343,6 @@ def scan_github(token: str, repos: list[str]) -> dict[str, Any]:
     return results
 
 
-# ── Azure Cost Scanner ─────────────────────────────────────────────────────
-def scan_azure_costs() -> dict[str, Any]:
-    """Query Azure Cost Management for current month spend."""
-    subscription_id = os.environ.get("AZURE_SUBSCRIPTION_ID", "")
-    if not subscription_id:
-        return {"error": "AZURE_SUBSCRIPTION_ID not set", "total": -1}
-
-    try:
-        from azure.identity import DefaultAzureCredential
-        from azure.mgmt.costmanagement import CostManagementClient
-
-        credential = DefaultAzureCredential()
-        cost_client = CostManagementClient(credential)
-        scope = f"/subscriptions/{subscription_id}"
-
-        now = datetime.datetime.now(datetime.timezone.utc)
-        start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-
-        query = {
-            "type": "ActualCost",
-            "timeframe": "Custom",
-            "time_period": {
-                "from": start_of_month.strftime("%Y-%m-%dT00:00:00+00:00"),
-                "to": now.strftime("%Y-%m-%dT23:59:59+00:00"),
-            },
-            "dataset": {
-                "granularity": "None",
-                "aggregation": {
-                    "totalCost": {"name": "Cost", "function": "Sum"},
-                },
-                "grouping": [
-                    {"type": "Dimension", "name": "ResourceGroupName"},
-                ],
-            },
-        }
-
-        result = cost_client.query.usage(scope=scope, parameters=query)
-
-        costs_by_rg: dict[str, float] = {}
-        total = 0.0
-        if result.rows:
-            for row in result.rows:
-                rg_name = row[1] if len(row) > 1 else "unknown"
-                cost = float(row[0]) if row[0] else 0.0
-                costs_by_rg[rg_name] = round(cost, 2)
-                total += cost
-
-        days_elapsed = max((now - start_of_month).days, 1)
-        days_in_month = 30
-        projected = round(total / days_elapsed * days_in_month, 2)
-
-        return {
-            "total": round(total, 2),
-            "projected": projected,
-            "budget": AZURE_BUDGET_MONTHLY,
-            "remaining": round(AZURE_BUDGET_MONTHLY - total, 2),
-            "by_resource_group": costs_by_rg,
-            "days_elapsed": days_elapsed,
-        }
-    except Exception as e:
-        log.warning("Azure cost scan failed: %s", e)
-        return {"error": str(e), "total": -1}
-
-
 # ── App Insights Scanner ───────────────────────────────────────────────────
 def scan_app_insights() -> dict[str, Any]:
     """Query App Insights for exceptions, failed requests and page views (24h)."""
@@ -706,8 +642,12 @@ RULES:
 - Bugs with open issues = lower health
 - Failed CI = critical alert
 - Projects with 0 commits in 7 days = momentum = 1
-- Cost > $20/project/month = flag for review
-- Total projected > $150 = budget alert
+- Use only the supplied Azure currency, billing-period dates and selected budget.
+- Compare actual costs and the explicitly labelled cycle-end projection with that budget.
+- The projection is linear over elapsed billing-cycle days, not an Azure forecast; costs may lag.
+- Remaining budget is spending headroom, NOT remaining credit; no credit ledger is available.
+- Missing/error cost data or missing currency/period/budget metadata means unavailable, not zero.
+- Do not invent currency conversions, calendar-month allowances or fixed per-project cost limits.
 - SELF-IMPROVEMENT: Recurring exceptions or failed requests = create an issue with the error details so Copilot can fix it
 - URL returning non-200 or response time > 3000ms = critical alert
 - Page views = 0 for a deployed app = flag (nobody using it)
@@ -817,6 +757,8 @@ def generate_report(
         for a in alerts:
             report.append(f"- {a}")
         report.append("")
+    elif not failed and cost_data.get("error"):
+        report.append("## ⚠️ No analysis alerts — Azure cost scan unavailable\n")
     elif not failed:
         # Say the healthy case out loud, so silence is never the only evidence.
         report.append("## ✅ No alerts — analysis ran and found nothing critical\n")
@@ -863,18 +805,17 @@ def generate_report(
         report.append("")
 
     report.append("## Azure Costs\n")
-    if cost_data.get("total", -1) >= 0:
-        report.append(f"- **Month-to-date:** ${cost_data['total']}")
-        report.append(f"- **Projected:** ${cost_data.get('projected', '?')}")
-        report.append(f"- **Budget:** ${cost_data.get('budget', 150)}")
-        report.append(f"- **Remaining:** ${cost_data.get('remaining', '?')}")
+    if not cost_data.get("error") and cost_data.get("total", -1) >= 0:
+        report.append(f"- **Billing-cycle spend:** {format_cost(cost_data['total'], cost_data)}")
+        report.extend(f"- **{label}:** {value}" for label, value in cost_details(cost_data))
+        report.append(f"- **Status:** {budget_status(cost_data)[1]}")
         report.append("")
         by_rg = cost_data.get("by_resource_group", {})
         if by_rg:
             report.append("| Resource Group | Cost |")
             report.append("|---------------|------|")
             for rg, cost in sorted(by_rg.items(), key=lambda x: -x[1]):
-                report.append(f"| {rg} | ${cost} |")
+                report.append(f"| {rg} | {format_cost(cost, cost_data)} |")
             report.append("")
     else:
         report.append(f"- Cost scan unavailable: {cost_data.get('error', 'unknown')}\n")
@@ -1088,10 +1029,8 @@ def build_telegram_summary(
     was always available; the report text is no longer an input at all, which
     is what makes the bug unreintroducible rather than merely fixed.
 
-    When *cost_data* is provided (and not an error), a one-line Azure
-    cost/budget summary is included so the recipient can see spending without
-    opening the full report. It is labelled and rendered as a single line, so
-    it cannot be mistaken for a finding.
+    When *cost_data* is provided, a labelled Azure budget summary includes the
+    billing cycle and available usage recency. Failed reads are shown explicitly.
 
     Three outcomes must stay visibly distinct here, because this message is the
     only part a human reliably reads: the analysis failed, the analysis ran and
@@ -1109,21 +1048,20 @@ def build_telegram_summary(
     if focus and not failed:
         parts.append(f"🎯 This Week: {focus}")
 
-    if cost_data and cost_data.get("total", -1) >= 0:
-        total = cost_data["total"]
-        budget = cost_data.get("budget", AZURE_BUDGET_MONTHLY)
-        projected = cost_data.get("projected")
-        remaining = cost_data.get("remaining")
-        budget_pct = round(total / budget * 100) if budget > 0 else 0
-        over_budget = projected is not None and projected > budget
-        cost_icon = "🔴" if over_budget else ("🟡" if budget_pct >= BUDGET_WARNING_THRESHOLD_PCT else "💰")
-        cost_line = f"{cost_icon} Azure: ${total} used"
-        if projected is not None:
-            cost_line += f" (projected ${projected})"
-        cost_line += f" / ${budget} budget"
-        if over_budget or (remaining is not None and remaining < 0):
-            cost_line += " — <b>⚠️ OVER BUDGET</b>"
-        parts.append(cost_line)
+    if cost_data is not None:
+        if cost_data.get("error") or cost_data.get("total", -1) < 0:
+            parts.append(
+                "⚠️ Azure cost scan unavailable: "
+                + html.escape(str(cost_data.get("error", "unknown")))
+            )
+        else:
+            parts.append(
+                f"Azure billing-cycle spend: {html.escape(format_cost(cost_data['total'], cost_data))}"
+                f" — {html.escape(budget_status(cost_data)[1])}"
+            )
+            parts.extend(
+                f"{label}: {html.escape(value)}" for label, value in cost_details(cost_data)
+            )
 
     if not failed:
         alerts = analysis.get("alerts", []) or []
@@ -1134,6 +1072,8 @@ def build_telegram_summary(
             parts.extend(f"🚨 {a}" for a in alerts[:3])
             if len(alerts) > 3:
                 parts.append(f"…and {len(alerts) - 3} more — see the full report")
+        elif cost_data and cost_data.get("error"):
+            parts.append("⚠️ No analysis alerts; Azure costs unavailable")
         else:
             parts.append("✅ No alerts")
 
@@ -1168,7 +1108,14 @@ def run_health_scan(
     log.info("GitHub scan complete: %d repos", len(github_data))
 
     cost_data = scan_azure_costs()
-    log.info("Azure cost scan complete: total=$%s", cost_data.get("total", "?"))
+    if cost_data.get("error"):
+        log.warning("Azure cost scan unavailable: %s", cost_data["error"])
+    else:
+        log.debug(
+            "Azure billing-cycle spend: %s; %s",
+            format_cost(cost_data.get("total"), cost_data),
+            "; ".join(f"{label}: {value}" for label, value in cost_details(cost_data)),
+        )
 
     app_insights_data = scan_app_insights()
     log.info(
@@ -1207,7 +1154,10 @@ def run_health_scan(
                 + build_telegram_summary(analysis, None, [], cost_data=cost_data)
             ),
             "analysis_failed": analysis_failed(analysis),
-            "failed_stages": ["analysis"] if analysis_failed(analysis) else [],
+            "failed_stages": (
+                (["cost"] if cost_data.get("error") else [])
+                + (["analysis"] if analysis_failed(analysis) else [])
+            ),
         }
 
     try:
@@ -1232,6 +1182,8 @@ def run_health_scan(
     )
     telegram_sent = send_telegram(summary, parse_mode="HTML")
     failed_stages: list[str] = []
+    if cost_data.get("error"):
+        failed_stages.append("cost")
     if analysis_failed(analysis):
         failed_stages.append("analysis")
     if not report_path:
