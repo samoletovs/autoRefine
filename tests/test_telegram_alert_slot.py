@@ -160,7 +160,7 @@ def test_summary_does_not_read_the_rendered_report() -> None:
 
 
 def test_alerts_survive_the_full_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
-    """End to end: an alert the model raised reaches the Telegram message."""
+    """End to end: measured failures survive; unsupported model claims do not."""
     monkeypatch.setenv("GH_TOKEN", "fake-token")
     analysis = _analysis(ALERTS[:2])
     sent: list[str] = []
@@ -176,12 +176,13 @@ def test_alerts_survive_the_full_pipeline(monkeypatch: pytest.MonkeyPatch) -> No
         patch("agent.health_scan.commit_report", return_value="reports/run/r.md"),
         patch("agent.health_scan.enforce_report_retention"),
         patch("agent.health_scan.create_github_issues", return_value=[]),
-        patch("agent.notify.send_telegram", side_effect=lambda m, **_: sent.append(m)),
+        patch("agent.notify.send_telegram", side_effect=lambda m, **_: sent.append(m) or True),
     ):
         result = health_scan.run_health_scan(["era"])
 
     assert len(sent) == 1
+    assert "era: latest workflow" in sent[0]
     for alert in ALERTS[:2]:
-        assert f"🚨 {alert}" in sent[0]
+        assert alert not in sent[0]
     _assert_no_cost_alerts(sent[0])
     assert result["telegram_summary"] == sent[0]

@@ -130,7 +130,7 @@ def test_telegram_summary_reports_the_failure() -> None:
 
     assert "FAILED" in msg
     assert "model returned list" in msg
-    assert "No scores, no alerts, no issues filed this run." in msg
+    assert "No AI scores or advice; no issues filed." in msg
 
 
 def test_telegram_failure_notice_is_near_the_top() -> None:
@@ -151,14 +151,14 @@ def test_telegram_summary_stays_quiet_on_a_clean_analysis() -> None:
 
 
 def test_failed_summary_shows_no_alerts_at_all() -> None:
-    """A failed analysis produced no alerts, so none may be shown."""
+    """No measured alerts were supplied; don't claim a healthy analysis."""
     msg = health_scan.build_telegram_summary(
         FAILED, None, [], cost_data={"total": 5, "budget": 150}
     )
 
     assert "🚨" not in msg
     assert "✅ No alerts" not in msg  # that would claim the analysis ran
-    assert "No scores, no alerts, no issues filed this run." in msg
+    assert "No AI scores or advice; no issues filed." in msg
 
 
 def test_telegram_summary_is_three_distinct_messages() -> None:

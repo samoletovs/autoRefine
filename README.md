@@ -80,8 +80,34 @@ rather than silently dropping these safeguards. `health-scan --dry-run` reads se
 and runs AI analysis (still billed), but does not persist/prune reports, create/assign
 issues, or send Telegram. Its JSON includes the proposed report and issues. The health
 workflow's `dry_run` dispatch input also dry-runs the PR sweep and suppresses failure
-notifications. Normal scans remain unchanged; identity configuration still needs
+notifications. Identity configuration still needs
 operator approval.
+
+### Health alert evidence
+
+Health alerts use measured workflow outcomes, confirmed URL checks and numeric
+budget comparisons. AI still supplies scores, focus and advice, but cannot invent
+alert text or automatic issue bodies. Repair proposals must reference an exact
+finding ID; unknown IDs and budget-only work are rejected. Open findings are
+deduplicated before filing, and a majority failure affecting at least three URLs
+becomes one monitor investigation rather than one paid agent assignment per app.
+
+URL checks retry slow responses (over 3,000ms), HTTP 5xx and transport errors up
+to three attempts, two seconds apart. Reports and dashboards keep all samples:
+recovery is visible, not silently discarded or claimed to prove a cold start.
+Persistent errors/slowness still alert; HTTP 4xx is not retried. No minimum replica
+count, credentials, schedule or spending limit is changed.
+
+The workflow column describes the **latest workflow**, with its actual name,
+not aggregate CI health. A failed scheduled check-in is still reported as a
+failure, but is not called a failed build. Health probes only cover the URL or
+`health_path` declared in the manifest; a working homepage does not prove every
+backend dependency is healthy.
+
+Measured alerts also survive an AI outage; scores/advice and automatic issue
+creation remain unavailable until analysis recovers. Repeated HTTP 5xx telemetry
+(at least two requests for a recorded endpoint/status) alerts even if the homepage
+works. Exception counts remain observations in the report, not proof of an outage.
 
 `refine` requires a clean worktree before agent work and a passing deterministic
 final test run before publishing. A failed or unavailable test runner blocks publication

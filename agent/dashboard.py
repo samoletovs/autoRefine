@@ -39,6 +39,7 @@ import logging
 from typing import Any
 
 from agent.azure_costs import budget_status, cost_details, cost_scan_error, format_cost
+from agent.health_evidence import describe_probes
 
 log = logging.getLogger(__name__)
 
@@ -97,7 +98,7 @@ def _render_project_table(
             f"<td>{_esc(data.get('bug_count', '?'))}</td>"
             f"<td>{_esc(data.get('open_prs', '?'))}</td>"
             f"<td>{_esc(data.get('commits_7d', '?'))}</td>"
-            f"<td>{ci}</td>"
+            f"<td>{ci} {_esc(data.get('ci_name', ''))}</td>"
             f"<td>{_esc(s.get('R', '?'))}</td>"
             f"<td>{_esc(s.get('L', '?'))}</td>"
             f"<td>{_esc(s.get('M', '?'))}</td>"
@@ -109,7 +110,7 @@ def _render_project_table(
         "<table class=\"project-health-table\">"
         "<thead><tr>"
         "<th>Project</th><th>Issues</th><th>Bugs</th><th>PRs</th>"
-        "<th>Commits (7d)</th><th>CI</th>"
+        "<th>Commits (7d)</th><th>Latest workflow</th>"
         "<th>R</th><th>L</th><th>M</th><th>Health</th>"
         "</tr></thead>"
         "<tbody>" + "".join(rows) + "</tbody>"
@@ -236,11 +237,13 @@ def _render_url_health(url_health_data: dict[str, Any]) -> str:
             f"<td>{icon} {_esc(data.get('status', '?'))}</td>"
             f"<td>{_esc(data.get('response_ms', '?'))} ms</td>"
             f"<td>{_esc(data.get('size_kb', '?'))} KB</td>"
+            f"<td>{_esc(describe_probes(data))}</td>"
             f"</tr>"
         )
     return (
         "<table>"
-        "<thead><tr><th>App</th><th>Status</th><th>Response</th><th>Size</th></tr></thead>"
+        "<thead><tr><th>App</th><th>Status</th><th>Response</th><th>Size</th>"
+        "<th>Probe observations</th></tr></thead>"
         "<tbody>" + "".join(rows) + "</tbody>"
         "</table>"
     )
@@ -468,6 +471,12 @@ def render_html_dashboard(
     url_section = _render_url_health(url_health_data or {})
     telemetry_section = _render_telemetry(app_insights_data or {})
     alerts_html = _render_list(alerts)
+    if analysis.get("error"):
+        alerts_html = (
+            '<p class="warning">AI ANALYSIS FAILED: '
+            f"{_esc(analysis['error'])}. Scores and advice are unavailable; "
+            "measured alerts remain below.</p>" + alerts_html
+        )
     recs_html = _render_list(recs, ordered=True)
     suggestions_html = _render_feature_suggestions(feature_suggestions)
     progress_html = _render_progress_tracking(github_data)
