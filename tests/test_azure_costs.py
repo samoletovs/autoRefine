@@ -126,10 +126,13 @@ def test_cycle_spanning_months_reads_budget_currency_columns_and_both_pages(
     }
     queries = [r for r in azure["requests"] if r.method == "POST"]
     assert len(queries) == 2
-    assert all(r.headers["ClientType"] == "GitHubCopilotForAzure" for r in queries)
+    assert all(
+        r.headers["ClientType"] == "samoletovs-autorefine" for r in azure["requests"]
+    )
     body = json.loads(queries[0].content)
     assert body == json.loads(queries[1].content)
     assert body["timeframe"] == "Custom"
+    assert "time_period" not in body
     assert body["timePeriod"] == {
         "from": "2026-08-21T00:00:00Z", "to": "2026-09-08T23:59:59Z",
     }

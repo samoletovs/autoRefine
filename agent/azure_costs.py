@@ -194,7 +194,7 @@ def scan_azure_costs() -> dict[str, Any]:
             with httpx.Client(
                 headers={
                     "Authorization": f"Bearer {token}",
-                    "ClientType": "GitHubCopilotForAzure",
+                    "ClientType": "samoletovs-autorefine",
                 },
                 timeout=30,
             ) as client:
