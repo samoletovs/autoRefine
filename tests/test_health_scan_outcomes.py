@@ -23,7 +23,7 @@ def scan_io(monkeypatch: pytest.MonkeyPatch) -> dict[str, Mock]:
     mocks: dict[str, Mock] = {}
     for name, result in {
         "scan_github": {},
-        "scan_azure_costs": {},
+        "scan_azure_costs": {"total": 0},
         "scan_app_insights": {},
         "check_deployed_urls": {},
         "analyze_with_ai": {"alerts": [], "issues_to_create": []},

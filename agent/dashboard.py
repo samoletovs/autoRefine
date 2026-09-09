@@ -38,7 +38,7 @@ import html as html_lib
 import logging
 from typing import Any
 
-from agent.azure_costs import budget_status, cost_details, format_cost
+from agent.azure_costs import budget_status, cost_details, cost_scan_error, format_cost
 
 log = logging.getLogger(__name__)
 
@@ -193,9 +193,9 @@ def _render_quality_coverage(evaluations: list[Any]) -> str:
 
 
 def _render_cost_section(cost_data: dict[str, Any]) -> str:
-    if cost_data.get("error") or cost_data.get("total", -1) < 0:
-        error = _esc(cost_data.get("error", "unknown"))
-        return f"<p class=\"muted\">Cost scan unavailable: {error}</p>"
+    error = cost_scan_error(cost_data)
+    if error is not None:
+        return f"<p class=\"muted\">Cost scan unavailable: {_esc(error)}</p>"
 
     cost_class, badge = budget_status(cost_data)
     rows = [

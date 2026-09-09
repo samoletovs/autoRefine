@@ -471,13 +471,24 @@ def test_ai_prompt_uses_only_reported_currency_period_budget(
 
 
 @pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize(
+    "cost_failure",
+    [
+        {"total": -1, "error": "403"},
+        {"total": -1, "error": ""},
+        {"total": -1},
+        {"total": 0, "error": " \t "},
+        {"total": 0, "error": None},
+        {},
+    ],
+)
 def test_cost_read_failure_is_an_incomplete_scan_but_other_stages_still_run(
-    monkeypatch: pytest.MonkeyPatch, dry_run: bool,
+    monkeypatch: pytest.MonkeyPatch, dry_run: bool, cost_failure: dict[str, Any],
 ) -> None:
     monkeypatch.setenv("GH_TOKEN", "fake-token")
     with (
         patch.object(health_scan, "scan_github", return_value={}),
-        patch.object(health_scan, "scan_azure_costs", return_value={"total": -1, "error": "403"}),
+        patch.object(health_scan, "scan_azure_costs", return_value=cost_failure),
         patch.object(health_scan, "scan_app_insights", return_value={}) as telemetry,
         patch.object(health_scan, "check_deployed_urls", return_value={}),
         patch.object(health_scan, "analyze_with_ai", return_value={}) as analysis,
@@ -489,9 +500,72 @@ def test_cost_read_failure_is_an_incomplete_scan_but_other_stages_still_run(
         result = health_scan.run_health_scan(["demo"], dry_run=dry_run)
     assert result["failed_stages"] == ["cost"]
     assert "Azure cost scan unavailable" in result["telegram_summary"]
+    assert "✅ No alerts" not in result["telegram_summary"]
+    report = result["report"] if dry_run else persist.call_args.args[1]
+    assert "✅ No alerts" not in report
     telemetry.assert_called_once()
     analysis.assert_called_once()
     assert persist.call_count == send.call_count == (0 if dry_run else 1)
+
+
+@pytest.mark.parametrize("message", ["", " \t\n "])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_empty_message_timeout_fails_cli_after_other_stages_and_never_claims_all_clear(
+    azure: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], message: str, dry_run: bool,
+) -> None:
+    from agent.main import run_health_scan_mode
+
+    azure["responses"][_QUERY_URL] = httpx.ReadTimeout(message)
+    cost_data = health_scan.scan_azure_costs()
+    assert cost_data["total"] == -1
+    assert cost_data["error"] == "ReadTimeout"
+
+    monkeypatch.setenv("GH_TOKEN", "fake-token")
+    with (
+        patch.object(health_scan, "scan_github", return_value={}),
+        patch.object(health_scan, "scan_app_insights", return_value={}) as telemetry,
+        patch.object(health_scan, "check_deployed_urls", return_value={}),
+        patch.object(health_scan, "analyze_with_ai", return_value={}) as analysis,
+        patch.object(health_scan, "commit_report", return_value="report.md") as persist,
+        patch.object(health_scan, "enforce_report_retention"),
+        patch.object(health_scan, "create_github_issues", return_value=[]),
+        patch("agent.notify.send_telegram", return_value=True) as send,
+    ):
+        with pytest.raises(SystemExit) as exit_info:
+            run_health_scan_mode(["demo"], assign_copilot=False, dry_run=dry_run)
+
+    assert exit_info.value.code == 1
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["failed_stages"] == ["cost"]
+    report = summary["report"] if dry_run else persist.call_args.args[1]
+    for rendered in (report, summary["telegram_summary"], _render_cost_section(cost_data)):
+        assert "unavailable" in rendered
+        assert "ReadTimeout" in rendered
+        assert "✅ No alerts" not in rendered
+        assert "cost-green" not in rendered
+    telemetry.assert_called_once()
+    analysis.assert_called_once()
+    assert persist.call_count == send.call_count == (0 if dry_run else 1)
+
+
+@pytest.mark.parametrize("message", ["", " \t ", None])
+def test_explicit_error_never_renders_verified_costs_as_healthy(
+    azure: dict[str, Any], message: str | None,
+) -> None:
+    cost_data = health_scan.scan_azure_costs()
+    cost_data["error"] = message
+
+    assert azure_costs.budget_status(cost_data)[0] == "muted"
+    for rendered in (
+        _render_cost_section(cost_data),
+        health_scan.generate_report({}, cost_data, {}),
+        health_scan.build_telegram_summary({}, None, [], cost_data),
+    ):
+        assert "unavailable" in rendered
+        assert "✅ No alerts" not in rendered
+        assert "cost-green" not in rendered
+        assert "Within budget" not in rendered
 
 
 def test_cost_success_log_is_debug_and_uses_reported_metadata(

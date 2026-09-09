@@ -227,8 +227,20 @@ def scan_azure_costs() -> dict[str, Any]:
             "by_resource_group": {rg: float(round(cost, 2)) for rg, cost in by_rg.items()},
         }
     except (AzureError, httpx.HTTPError, OSError, ValueError, TypeError, KeyError, ArithmeticError) as exc:
-        log.warning("Azure cost scan unavailable: %s", exc)
-        return {"error": str(exc), "total": -1, "budget_name": name}
+        error = str(exc).strip() or type(exc).__name__
+        log.warning("Azure cost scan unavailable: %s", error)
+        return {"error": error, "total": -1, "budget_name": name}
+
+
+def cost_scan_error(data: dict[str, Any]) -> str | None:
+    """Classify unavailable costs independently of diagnostic message truthiness."""
+    if "error" in data:
+        return str(data["error"] or "").strip() or "Azure cost scan failed"
+    try:
+        total = _money(data.get("total"))
+    except (ArithmeticError, TypeError, ValueError):
+        return "Azure cost total missing or invalid"
+    return "Azure cost total unavailable" if total < 0 else None
 
 
 def format_cost(amount: Any, data: dict[str, Any]) -> str:
@@ -245,7 +257,7 @@ def format_cost(amount: Any, data: dict[str, Any]) -> str:
 def budget_status(data: dict[str, Any]) -> tuple[str, str]:
     """Never paint an unverified legacy budget comparison green."""
     try:
-        if data.get("error") or _money(data["total"]) < 0:
+        if cost_scan_error(data) is not None:
             raise ValueError("Unavailable")
         currency = _currency(data["currency"])
         if data["budget_currency"] != currency or data["budget_time_grain"] != "BillingMonth":

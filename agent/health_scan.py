@@ -27,7 +27,13 @@ from typing import Any
 
 import httpx
 
-from agent.azure_costs import budget_status, cost_details, format_cost, scan_azure_costs
+from agent.azure_costs import (
+    budget_status,
+    cost_details,
+    cost_scan_error,
+    format_cost,
+    scan_azure_costs,
+)
 
 log = logging.getLogger(__name__)
 
@@ -737,6 +743,7 @@ def generate_report(
         f"# NauroLabs Health Report — {now.strftime('%Y-%m-%d %H:%M UTC')}\n"
     ]
 
+    cost_error = cost_scan_error(cost_data)
     failed = analysis_failed(analysis)
     if failed:
         # Immediately under the title, before anything that looks like data.
@@ -757,7 +764,7 @@ def generate_report(
         for a in alerts:
             report.append(f"- {a}")
         report.append("")
-    elif not failed and cost_data.get("error"):
+    elif not failed and cost_error is not None:
         report.append("## ⚠️ No analysis alerts — Azure cost scan unavailable\n")
     elif not failed:
         # Say the healthy case out loud, so silence is never the only evidence.
@@ -805,7 +812,7 @@ def generate_report(
         report.append("")
 
     report.append("## Azure Costs\n")
-    if not cost_data.get("error") and cost_data.get("total", -1) >= 0:
+    if cost_error is None:
         report.append(f"- **Billing-cycle spend:** {format_cost(cost_data['total'], cost_data)}")
         report.extend(f"- **{label}:** {value}" for label, value in cost_details(cost_data))
         report.append(f"- **Status:** {budget_status(cost_data)[1]}")
@@ -818,7 +825,7 @@ def generate_report(
                 report.append(f"| {rg} | {format_cost(cost, cost_data)} |")
             report.append("")
     else:
-        report.append(f"- Cost scan unavailable: {cost_data.get('error', 'unknown')}\n")
+        report.append(f"- Cost scan unavailable: {cost_error}\n")
 
     if url_health_data:
         report.append("## Deployed Apps\n")
@@ -1038,6 +1045,7 @@ def build_telegram_summary(
     """
     parts: list[str] = ["🤖 <b>NauroLabs Health Report</b>"]
 
+    cost_error = cost_scan_error(cost_data) if cost_data is not None else None
     failed = analysis_failed(analysis)
     if failed:
         parts.append("⚠️ <b>AI analysis FAILED — report is incomplete</b>")
@@ -1049,10 +1057,10 @@ def build_telegram_summary(
         parts.append(f"🎯 This Week: {focus}")
 
     if cost_data is not None:
-        if cost_data.get("error") or cost_data.get("total", -1) < 0:
+        if cost_error is not None:
             parts.append(
                 "⚠️ Azure cost scan unavailable: "
-                + html.escape(str(cost_data.get("error", "unknown")))
+                + html.escape(cost_error)
             )
         else:
             parts.append(
@@ -1072,7 +1080,7 @@ def build_telegram_summary(
             parts.extend(f"🚨 {a}" for a in alerts[:3])
             if len(alerts) > 3:
                 parts.append(f"…and {len(alerts) - 3} more — see the full report")
-        elif cost_data and cost_data.get("error"):
+        elif cost_error is not None:
             parts.append("⚠️ No analysis alerts; Azure costs unavailable")
         else:
             parts.append("✅ No alerts")
@@ -1108,8 +1116,9 @@ def run_health_scan(
     log.info("GitHub scan complete: %d repos", len(github_data))
 
     cost_data = scan_azure_costs()
-    if cost_data.get("error"):
-        log.warning("Azure cost scan unavailable: %s", cost_data["error"])
+    cost_error = cost_scan_error(cost_data)
+    if cost_error is not None:
+        log.warning("Azure cost scan unavailable: %s", cost_error)
     else:
         log.debug(
             "Azure billing-cycle spend: %s; %s",
@@ -1155,7 +1164,7 @@ def run_health_scan(
             ),
             "analysis_failed": analysis_failed(analysis),
             "failed_stages": (
-                (["cost"] if cost_data.get("error") else [])
+                (["cost"] if cost_error is not None else [])
                 + (["analysis"] if analysis_failed(analysis) else [])
             ),
         }
@@ -1182,7 +1191,7 @@ def run_health_scan(
     )
     telegram_sent = send_telegram(summary, parse_mode="HTML")
     failed_stages: list[str] = []
-    if cost_data.get("error"):
+    if cost_error is not None:
         failed_stages.append("cost")
     if analysis_failed(analysis):
         failed_stages.append("analysis")
