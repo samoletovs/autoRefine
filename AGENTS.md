@@ -237,6 +237,24 @@ cannot clear is a permanent penalty, which is what the paragraph above says neve
 to weight. Archived repositories and repositories with no default branch are
 `not-applicable`.
 
+### The cost query
+
+`scan_azure_costs` identifies all its requests with the stable
+`ClientType: samoletovs-autorefine` header. Omitting it shares the unnamed-client
+quota with other callers, so a daily scan can be throttled even when its own
+subscription and tenant still have capacity. Do not rotate this identifier per
+request or run; it identifies the application, not a way to evade rate limits.
+
+Use the SDK's typed query models: `time_period` is a Python attribute, but the
+wire field must be `timePeriod`. A plain dictionary with the Python spelling
+reaches the API unchanged in newer SDKs and makes a `Custom` query invalid.
+`tests/test_health_scan_costs.py` inspects real SDK HTTP requests through a fake
+transport so neither a missing header nor a dropped date range can hide behind
+a mocked successful query result.
+
+Real failures still return `{"error": ..., "total": -1}` rather than zero cost.
+Both health-scan and dashboard mode use this same function.
+
 ### The dependency check
 
 `measure_dependencies` reads **Dependabot alerts over the API**. It used to shell
