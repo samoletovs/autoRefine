@@ -353,31 +353,41 @@ def scan_azure_costs() -> dict[str, Any]:
     try:
         from azure.identity import DefaultAzureCredential
         from azure.mgmt.costmanagement import CostManagementClient
+        from azure.mgmt.costmanagement.models import (
+            QueryAggregation,
+            QueryDataset,
+            QueryDefinition,
+            QueryGrouping,
+            QueryTimePeriod,
+        )
 
         credential = DefaultAzureCredential()
-        cost_client = CostManagementClient(credential)
+        # An omitted ClientType shares Azure's quota with other unidentified callers.
+        cost_client = CostManagementClient(
+            credential, headers={"ClientType": "samoletovs-autorefine"},
+        )
         scope = f"/subscriptions/{subscription_id}"
 
         now = datetime.datetime.now(datetime.timezone.utc)
         start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
-        query = {
-            "type": "ActualCost",
-            "timeframe": "Custom",
-            "time_period": {
-                "from": start_of_month.strftime("%Y-%m-%dT00:00:00+00:00"),
-                "to": now.strftime("%Y-%m-%dT23:59:59+00:00"),
-            },
-            "dataset": {
-                "granularity": "None",
-                "aggregation": {
-                    "totalCost": {"name": "Cost", "function": "Sum"},
+        query = QueryDefinition(
+            type="ActualCost",
+            timeframe="Custom",
+            time_period=QueryTimePeriod(
+                from_property=start_of_month,
+                to=now.replace(hour=23, minute=59, second=59, microsecond=0),
+            ),
+            dataset=QueryDataset(
+                granularity="None",
+                aggregation={
+                    "totalCost": QueryAggregation(name="Cost", function="Sum"),
                 },
-                "grouping": [
-                    {"type": "Dimension", "name": "ResourceGroupName"},
+                grouping=[
+                    QueryGrouping(type="Dimension", name="ResourceGroupName"),
                 ],
-            },
-        }
+            ),
+        )
 
         result = cost_client.query.usage(scope=scope, parameters=query)
 
