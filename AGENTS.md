@@ -245,15 +245,19 @@ quota with other callers, so a daily scan can be throttled even when its own
 subscription and tenant still have capacity. Do not rotate this identifier per
 request or run; it identifies the application, not a way to evade rate limits.
 
-Use the SDK's typed query models: `time_period` is a Python attribute, but the
-wire field must be `timePeriod`. A plain dictionary with the Python spelling
-reaches the API unchanged in newer SDKs and makes a `Custom` query invalid.
-`tests/test_health_scan_costs.py` inspects real SDK HTTP requests through a fake
-transport so neither a missing header nor a dropped date range can hide behind
-a mocked successful query result.
+The billing-cycle reader in `agent/azure_costs.py` sends REST requests with the
+wire field `timePeriod`, not the SDK's Python attribute `time_period`. The old
+SDK reader required typed models to serialize that field correctly; copying its
+Python spelling into REST JSON makes a `Custom` query invalid. The date range
+comes from Azure's billing period, not the calendar month.
+`tests/test_health_scan_costs.py` inspects actual HTTP requests through a fake
+transport so neither a missing header nor a dropped or reset date range can hide
+behind a mocked successful query result.
 
 Real failures still return `{"error": ..., "total": -1}` rather than zero cost.
-Both health-scan and dashboard mode use this same function.
+Empty rows cannot establish a currency and are unavailable; an explicit zero-cost
+row with a verified currency remains valid. Both health-scan and dashboard mode
+use this same function.
 
 ### The dependency check
 
@@ -1313,8 +1317,9 @@ committed script, for the reason given under "What the score actually measures".
 
 ## Test
 
-Health-scan CLI success requires successful analysis, a persisted report, and a delivered
-Telegram summary. The pipeline still attempts notification when report persistence fails;
+Health-scan CLI success requires a successful Azure cost read and analysis, a persisted
+report, and a delivered Telegram summary. The pipeline still attempts notification
+when report persistence fails;
 it emits `failed_stages` in its JSON result and exits nonzero after those attempts. The
 workflow preserves that exit code while printing its log, and the independent PR-card
 sweep still runs with `always()`. The job has a 30-minute ceiling and checks the three

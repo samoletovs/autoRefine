@@ -15,6 +15,15 @@ import pytest
 
 from agent import health_scan
 
+_BILLING_METADATA = {
+    "currency": "EUR",
+    "budget_currency": "EUR",
+    "budget_name": "test-budget",
+    "budget_time_grain": "BillingMonth",
+    "period_start": "2026-08-21",
+    "period_end": "2026-09-20",
+}
+
 
 # ── improvement tracking dashboard ──────────────────────────────────────────
 def test_build_improvement_items_tracks_status_and_actions() -> None:
@@ -113,6 +122,7 @@ def test_build_summary_no_issues_no_focus() -> None:
 
 def test_build_summary_includes_azure_cost() -> None:
     cost_data: dict[str, Any] = {
+        **_BILLING_METADATA,
         "total": 42.5,
         "projected": 80.0,
         "budget": 150.0,
@@ -120,15 +130,16 @@ def test_build_summary_includes_azure_cost() -> None:
     }
     msg = health_scan.build_telegram_summary({}, None, [], cost_data=cost_data)
     assert "Azure" in msg
-    assert "$42.5" in msg
-    assert "projected $80.0" in msg
-    assert "$150.0 budget" in msg
+    assert "EUR 42.50" in msg
+    assert "Cycle-end projection (linear, not an Azure forecast): EUR 80.00" in msg
+    assert "Budget: EUR 150.00" in msg
     assert "OVER BUDGET" not in msg
     assert "💰" in msg  # below 70 % threshold
 
 
 def test_build_summary_azure_cost_yellow_warning() -> None:
     cost_data: dict[str, Any] = {
+        **_BILLING_METADATA,
         "total": 110.0,
         "projected": 140.0,
         "budget": 150.0,
@@ -140,6 +151,7 @@ def test_build_summary_azure_cost_yellow_warning() -> None:
 
 def test_build_summary_azure_cost_over_budget() -> None:
     cost_data: dict[str, Any] = {
+        **_BILLING_METADATA,
         "total": 130.0,
         "projected": 160.0,
         "budget": 150.0,
@@ -152,6 +164,7 @@ def test_build_summary_azure_cost_over_budget() -> None:
 
 def test_build_summary_azure_cost_negative_remaining() -> None:
     cost_data: dict[str, Any] = {
+        **_BILLING_METADATA,
         "total": 160.0,
         "projected": 190.0,
         "budget": 150.0,
@@ -161,11 +174,12 @@ def test_build_summary_azure_cost_negative_remaining() -> None:
     assert "OVER BUDGET" in msg
 
 
-def test_build_summary_azure_cost_error_skipped() -> None:
-    """When cost_data signals an error (total=-1), no cost line is added."""
+def test_build_summary_azure_cost_error_is_visible() -> None:
+    """Failed cost reads must not disappear from a seemingly healthy summary."""
     cost_data: dict[str, Any] = {"error": "no creds", "total": -1}
     msg = health_scan.build_telegram_summary({}, None, [], cost_data=cost_data)
-    assert "Azure" not in msg
+    assert "Azure cost scan unavailable: no creds" in msg
+    assert "✅ No alerts" not in msg
 
 
 def test_build_summary_cost_data_none_skipped() -> None:
@@ -187,6 +201,7 @@ def test_generate_report_includes_project_table() -> None:
         }
     }
     cost_data: dict[str, Any] = {
+        **_BILLING_METADATA,
         "total": 12.5,
         "projected": 50,
         "budget": 150,
@@ -202,7 +217,7 @@ def test_generate_report_includes_project_table() -> None:
     report = health_scan.generate_report(github_data, cost_data, analysis)
     assert "| era |" in report
     assert "✅" in report  # ci_status=success
-    assert "$12.5" in report
+    assert "EUR 12.50" in report
     assert "rg-era" in report
     assert "test rec" in report
 

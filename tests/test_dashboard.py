@@ -19,6 +19,15 @@ from agent.dashboard import (
     render_html_dashboard,
 )
 
+_BILLING_METADATA = {
+    "currency": "EUR",
+    "budget_currency": "EUR",
+    "budget_name": "test-budget",
+    "budget_time_grain": "BillingMonth",
+    "period_start": "2026-08-21",
+    "period_end": "2026-09-20",
+}
+
 
 # ── _health_colour ─────────────────────────────────────────────────────────
 
@@ -182,6 +191,7 @@ def test_coverage_colour(measured: int, total: int, expected: str) -> None:
 
 def test_render_cost_section_on_track() -> None:
     cost_data: dict[str, Any] = {
+        **_BILLING_METADATA,
         "total": 30.0,
         "projected": 60.0,
         "budget": 150.0,
@@ -196,6 +206,7 @@ def test_render_cost_section_on_track() -> None:
 
 def test_render_cost_section_yellow_warning() -> None:
     cost_data: dict[str, Any] = {
+        **_BILLING_METADATA,
         "total": 110.0,
         "projected": 140.0,
         "budget": 150.0,
@@ -208,6 +219,7 @@ def test_render_cost_section_yellow_warning() -> None:
 
 def test_render_cost_section_over_budget() -> None:
     cost_data: dict[str, Any] = {
+        **_BILLING_METADATA,
         "total": 130.0,
         "projected": 160.0,  # > budget of 150
         "budget": 150.0,
@@ -262,6 +274,7 @@ _GITHUB_DATA: dict[str, Any] = {
     }
 }
 _COST_DATA: dict[str, Any] = {
+    **_BILLING_METADATA,
     "total": 20.0,
     "projected": 40.0,
     "budget": 150.0,

@@ -38,14 +38,14 @@ import html as html_lib
 import logging
 from typing import Any
 
+from agent.azure_costs import budget_status, cost_details, cost_scan_error, format_cost
+
 log = logging.getLogger(__name__)
 
 # Health score thresholds (max = 15: R+L+M)
 _HEALTH_GREEN = 10
 _HEALTH_YELLOW = 6
 
-# Azure budget warning threshold (matches health_scan.BUDGET_WARNING_THRESHOLD_PCT)
-_BUDGET_WARNING_PCT = 70
 _SUGGESTION_COMMENT_MAXLEN = 300
 _STATUS_CLASS_MAXLEN = 50
 
@@ -193,42 +193,27 @@ def _render_quality_coverage(evaluations: list[Any]) -> str:
 
 
 def _render_cost_section(cost_data: dict[str, Any]) -> str:
-    if cost_data.get("total", -1) < 0:
-        error = _esc(cost_data.get("error", "unknown"))
-        return f"<p class=\"muted\">Cost scan unavailable: {error}</p>"
+    error = cost_scan_error(cost_data)
+    if error is not None:
+        return f"<p class=\"muted\">Cost scan unavailable: {_esc(error)}</p>"
 
-    total = cost_data["total"]
-    budget = cost_data.get("budget", 150)
-    projected = cost_data.get("projected")
-    remaining = cost_data.get("remaining")
-    budget_pct = round(total / budget * 100) if budget > 0 else 0
-    over_budget = projected is not None and projected > budget
-
-    if over_budget or (remaining is not None and remaining < 0):
-        cost_class = "cost-red"
-        badge = "🔴 OVER BUDGET"
-    elif budget_pct >= _BUDGET_WARNING_PCT:
-        cost_class = "cost-yellow"
-        badge = "🟡 Warning"
-    else:
-        cost_class = "cost-green"
-        badge = "💰 On track"
-
-    proj_str = f" (projected: ${_esc(projected)})" if projected is not None else ""
-    rem_str = f"Remaining: ${_esc(remaining)}" if remaining is not None else ""
-
+    cost_class, badge = budget_status(cost_data)
     rows = [
-        f"<tr><td>Month-to-date</td><td><span class=\"{cost_class}\">${_esc(total)}</span></td></tr>",
-        f"<tr><td>Budget</td><td>${_esc(budget)}{proj_str}</td></tr>",
+        (
+            f'<tr><td>Billing-cycle spend</td><td><span class="{cost_class}">'
+            f'{_esc(format_cost(cost_data["total"], cost_data))}</span></td></tr>'
+        ),
     ]
-    if rem_str:
-        rows.append(f"<tr><td>Remaining</td><td>{rem_str}</td></tr>")
+    rows.extend(
+        f"<tr><td>{_esc(label)}</td><td>{_esc(value)}</td>"
+        "</tr>" for label, value in cost_details(cost_data)
+    )
     rows.append(f"<tr><td>Status</td><td>{badge}</td></tr>")
 
     by_rg = cost_data.get("by_resource_group", {})
     if by_rg:
         rg_rows = "".join(
-            f"<tr><td>{_esc(rg)}</td><td>${_esc(cost)}</td></tr>"
+            f"<tr><td>{_esc(rg)}</td><td>{_esc(format_cost(cost, cost_data))}</td></tr>"
             for rg, cost in sorted(by_rg.items(), key=lambda x: -x[1])
         )
         rows.append(

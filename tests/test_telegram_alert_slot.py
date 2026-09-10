@@ -37,6 +37,9 @@ GITHUB_DATA: dict[str, Any] = {
 }
 COST_DATA: dict[str, Any] = {
     "total": 5, "projected": 12, "budget": 150, "remaining": 145,
+    "currency": "EUR", "budget_currency": "EUR", "budget_name": "test-budget",
+    "budget_time_grain": "BillingMonth", "period_start": "2026-08-21",
+    "period_end": "2026-09-20",
     "by_resource_group": {"rg-era": 5},
 }
 ALERTS = [
@@ -46,7 +49,14 @@ ALERTS = [
     "folio: build red",
 ]
 # The exact strings the cost section renders as bullets.
-COST_BULLET_MARKERS = ("Month-to-date", "Projected:", "Budget:", "Remaining")
+COST_BULLET_MARKERS = ("Billing-cycle spend", "Cycle-end projection", "Budget:", "Remaining")
+
+
+def _assert_no_cost_alerts(message: str) -> None:
+    assert not any(line.startswith("- ") for line in message.splitlines())
+    alerts = "\n".join(line for line in message.splitlines() if line.startswith("🚨"))
+    for marker in COST_BULLET_MARKERS:
+        assert marker not in alerts, f"cost bullet {marker!r} leaked into the alerts"
 
 
 def _analysis(alerts: list[str]) -> dict[str, Any]:
@@ -66,8 +76,7 @@ def test_cost_figures_never_appear_as_alerts(n_alerts: int) -> None:
         _analysis(ALERTS[:n_alerts]), "reports/run/r.md", [], cost_data=COST_DATA
     )
 
-    for marker in COST_BULLET_MARKERS:
-        assert marker not in msg, f"cost bullet {marker!r} leaked into the summary"
+    _assert_no_cost_alerts(msg)
 
 
 def test_quiet_week_is_not_reported_as_three_findings() -> None:
@@ -78,8 +87,7 @@ def test_quiet_week_is_not_reported_as_three_findings() -> None:
 
     assert "✅ No alerts" in msg
     assert "🚨" not in msg
-    for marker in COST_BULLET_MARKERS:
-        assert marker not in msg
+    _assert_no_cost_alerts(msg)
 
 
 def test_four_alerts_with_a_cost_section_shows_alerts_only() -> None:
@@ -97,8 +105,7 @@ def test_four_alerts_with_a_cost_section_shows_alerts_only() -> None:
     for alert in ALERTS[:3]:
         assert f"🚨 {alert}" in msg
     assert "and 1 more" in msg
-    for marker in COST_BULLET_MARKERS:
-        assert marker not in msg
+    _assert_no_cost_alerts(msg)
 
 
 def test_single_alert_reaches_the_summary_intact() -> None:
@@ -109,8 +116,7 @@ def test_single_alert_reaches_the_summary_intact() -> None:
 
     assert "🚨 era: error rate up 4x" in msg
     assert msg.count("🚨") == 2  # the count header plus the one alert
-    for marker in COST_BULLET_MARKERS:
-        assert marker not in msg
+    _assert_no_cost_alerts(msg)
 
 
 def test_cost_line_is_still_present_and_labelled() -> None:
@@ -119,8 +125,8 @@ def test_cost_line_is_still_present_and_labelled() -> None:
         _analysis(ALERTS[:2]), None, [], cost_data=COST_DATA
     )
 
-    assert "Azure: $5 used" in msg
-    assert "/ $150 budget" in msg
+    assert "Azure billing-cycle spend: EUR 5.00" in msg
+    assert "Budget: EUR 150.00" in msg
     cost_line = next(line for line in msg.split("\n") if "Azure" in line)
     assert "🚨" not in cost_line
 
@@ -177,6 +183,5 @@ def test_alerts_survive_the_full_pipeline(monkeypatch: pytest.MonkeyPatch) -> No
     assert len(sent) == 1
     for alert in ALERTS[:2]:
         assert f"🚨 {alert}" in sent[0]
-    for marker in COST_BULLET_MARKERS:
-        assert marker not in sent[0]
+    _assert_no_cost_alerts(sent[0])
     assert result["telegram_summary"] == sent[0]
