@@ -204,6 +204,27 @@ inclusive `period_start`/`period_end`, `next_reset` (the following day), `query_
 **remaining budget**, never actual remaining credit. There is no credit-ledger
 integration; remaining credit is explicitly unavailable.
 
+The Visual Studio Enterprise benefit is **USD 150 per month**, configured through
+`AUTOREFINE_AZURE_MONTHLY_CREDIT_USD` (default `150`). This allowance is separate
+from the native-currency Azure alert budget. Separate daily queries request
+**CostUSD** and **Cost**: USD spending is supplied by Azure, never obtained
+by relabelling EUR or applying a guessed exchange rate. Missing or malformed
+CostUSD data fails visibly rather than substituting native-currency costs.
+The metrics are deliberately not combined: on 2026-09-11 a live combined query
+with CostUSD first labelled its two totals inconsistently with single-metric
+queries. Each metric's amount is now unambiguous even when Currency is EUR
+(that column still describes the subscription's native billing unit).
+
+Reports retain the native costs and budget for audit, and add `total_usd`,
+`projected_usd`, `monthly_credit_usd`, `estimated_credit_remaining_usd` and
+`cost_usd_source`, `latest_usage_date_usd` and `by_resource_group_usd`.
+Estimated credit left is the configured allowance minus
+reported USD usage; it is **not an authoritative remaining-credit balance**.
+Telegram leads with the USD benefit, spend, estimated headroom, cycle and reset,
+with blank lines between sections. Budget IDs and query diagnostics stay in the
+full report; independent alert-budget warnings remain visible on the phone.
+No Azure budgets, billing currency, spending limit or credentials are changed.
+
 `projected` is an explicitly labelled **linear cycle-end projection**, not an Azure
 forecast: reported actual cost × inclusive cycle days ÷ inclusive elapsed cycle
 days through the UTC query date. Actual and forecast rows are never added together.

@@ -7,6 +7,8 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
+from agent.azure_costs import budget_status, credit_status
+
 log = logging.getLogger(__name__)
 
 SLOW_RESPONSE_MS = 3000
@@ -70,14 +72,25 @@ def collect_findings(
         ))
 
     budget = cost_data.get("budget")
-    currency = cost_data.get("currency", "USD")
-    if _known_amount(budget) and budget > 0:
-        for key, label in (("total", "Month-to-date"), ("projected", "Projected")):
+    currency = cost_data.get("currency")
+    if budget_status(cost_data)[0] != "muted" and _known_amount(budget) and budget > 0:
+        for key, label in (("total", "Billing-cycle"), ("projected", "Projected cycle-end")):
             amount = cost_data.get(key)
             if _known_amount(amount) and amount > budget:
                 findings.append(HealthFinding(
                     f"budget:{key}", f"{label} Azure cost {currency} {amount:.2f} exceeds "
                     f"the {currency} {budget:.2f} budget.",
+                ))
+
+    allowance = cost_data.get("monthly_credit_usd")
+    if credit_status(cost_data)[0] != "muted" and _known_amount(allowance):
+        for key, label in (("total_usd", "Billing-cycle"), ("projected_usd", "Projected cycle-end")):
+            amount = cost_data[key]
+            if _known_amount(amount) and amount > allowance:
+                findings.append(HealthFinding(
+                    f"credit:{key}", f"{label} Azure cost USD {amount:.2f} exceeds "
+                    f"the configured USD {allowance:.2f} monthly credit (usage estimate, "
+                    "not a credit balance).",
                 ))
 
     url_findings: list[HealthFinding] = []

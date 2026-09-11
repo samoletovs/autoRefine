@@ -60,7 +60,13 @@ class CostTransport(httpx.MockTransport):
             })
         assert request.url.path.endswith("/providers/Microsoft.CostManagement/query")
         assert request.method == "POST"
-        return httpx.Response(self.status, json=self.payload)
+        payload = json.loads(json.dumps(self.payload))
+        metric = json.loads(request.content)["dataset"]["aggregation"]["totalCost"]["name"]
+        if metric == "CostUSD" and self.status == 200:
+            payload["properties"]["columns"][0]["name"] = "CostUSD"
+            for row in payload["properties"]["rows"]:
+                row[0] *= 2
+        return httpx.Response(self.status, json=payload)
 
     @property
     def queries(self) -> list[httpx.Request]:
@@ -94,7 +100,7 @@ def cost_transport(monkeypatch: pytest.MonkeyPatch) -> CostTransport:
 def test_cost_requests_identify_application_on_wire(cost_transport: CostTransport) -> None:
     assert health_scan.scan_azure_costs()["total"] == 20.0
 
-    assert len(cost_transport.requests) == 3
+    assert len(cost_transport.requests) == 4
     assert all(
         request.headers["ClientType"] == "samoletovs-autorefine"
         for request in cost_transport.requests
@@ -104,7 +110,7 @@ def test_cost_requests_identify_application_on_wire(cost_transport: CostTranspor
 def test_custom_billing_date_range_reaches_api(cost_transport: CostTransport) -> None:
     assert health_scan.scan_azure_costs()["total"] == 20.0
 
-    assert len(cost_transport.queries) == 1
+    assert len(cost_transport.queries) == 2
     request = cost_transport.queries[0]
     assert request.method == "POST"
     assert request.url.path == (
@@ -146,6 +152,13 @@ def test_cost_results_keep_failure_sentinel_and_use_reported_eur_cycle(
         "by_resource_group": {"rg-one": 12.34, "rg-two": 7.66, "rg-empty": 0.0},
         "days_elapsed": 20,
         "days_in_period": 31,
+        "total_usd": 40.0,
+        "projected_usd": 62.0,
+        "monthly_credit_usd": 150.0,
+        "estimated_credit_remaining_usd": 110.0,
+        "cost_usd_source": "CostUSD",
+        "latest_usage_date_usd": "2026-09-08",
+        "by_resource_group_usd": {"rg-one": 24.68, "rg-two": 15.32, "rg-empty": 0.0},
     }
 
 
@@ -220,7 +233,7 @@ def test_dashboard_uses_same_billing_scanner_and_preserves_unavailable_results(
         assert "429" in cost_data["error"]
         assert "Cost scan unavailable" in html
         assert 'class="cost-green"' not in html
-    assert len(cost_transport.queries) == 1
+    assert len(cost_transport.queries) == (2 if status == 200 else 1)
     assert cost_transport.queries[0].headers["ClientType"] == "samoletovs-autorefine"
 
 

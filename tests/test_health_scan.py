@@ -94,7 +94,7 @@ def test_build_improvement_items_ignores_non_autorefine_ideas() -> None:
 # ── build_telegram_summary ────────────────────────────────────────────────
 def test_build_summary_minimal() -> None:
     msg = health_scan.build_telegram_summary({}, None, [])
-    assert "NauroLabs Health Report" in msg
+    assert "nauroLabs health report" in msg
     assert "<b>" in msg  # HTML parse mode
 
 
@@ -131,8 +131,8 @@ def test_build_summary_includes_azure_cost() -> None:
     msg = health_scan.build_telegram_summary({}, None, [], cost_data=cost_data)
     assert "Azure" in msg
     assert "EUR 42.50" in msg
-    assert "Cycle-end projection (linear, not an Azure forecast): EUR 80.00" in msg
-    assert "Budget: EUR 150.00" in msg
+    assert "USD credit estimate unavailable" in msg
+    assert "Separate alert budget: EUR 150.00" in msg
     assert "OVER BUDGET" not in msg
     assert "💰" in msg  # below 70 % threshold
 

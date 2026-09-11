@@ -126,7 +126,7 @@ def test_cost_line_is_still_present_and_labelled() -> None:
     )
 
     assert "Azure billing-cycle spend: EUR 5.00" in msg
-    assert "Budget: EUR 150.00" in msg
+    assert "Separate alert budget: EUR 150.00" in msg
     cost_line = next(line for line in msg.split("\n") if "Azure" in line)
     assert "🚨" not in cost_line
 

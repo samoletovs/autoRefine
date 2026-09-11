@@ -99,7 +99,12 @@ def test_transport_failures_keep_diagnostics(probe: Mock) -> None:
 def test_budget_alert_uses_numbers_not_model_claims(projected: float, expected: bool) -> None:
     analysis = health_scan.ground_analysis(
         {"alerts": ["Budget alert: Projected Azure costs exceed $150."]},
-        {}, {"total": 10.87, "projected": projected, "budget": 150}, {}, {},
+        {}, {
+            "total": 10.87, "projected": projected, "budget": 150,
+            "currency": "USD", "budget_currency": "USD",
+            "budget_time_grain": "BillingMonth", "budget_name": "test",
+            "period_start": "2026-08-21", "period_end": "2026-09-20",
+        }, {}, {},
     )
 
     assert bool(analysis["alerts"]) is expected
@@ -323,7 +328,7 @@ def test_issue_read_failure_does_not_silence_notification(
     )
     for name, value in {
         "scan_github": {},
-        "scan_azure_costs": {},
+        "scan_azure_costs": {"total": 0, "currency": "EUR"},
         "scan_app_insights": {},
         "check_deployed_urls": {
             "era": {"url": "https://era.example", "status": 503, "ok": False, "response_ms": 200},
@@ -369,7 +374,11 @@ def test_filing_failure_preserves_already_created_issue_urls(probe: Mock) -> Non
 
 def test_budget_finding_respects_reported_currency() -> None:
     analysis = health_scan.ground_analysis(
-        {}, {}, {"total": 35.99, "projected": 101, "budget": 100, "currency": "EUR"}, {}, {},
+        {}, {}, {
+            "total": 35.99, "projected": 101, "budget": 100, "currency": "EUR",
+            "budget_currency": "EUR", "budget_time_grain": "BillingMonth", "budget_name": "test",
+            "period_start": "2026-08-21", "period_end": "2026-09-20",
+        }, {}, {},
     )
 
     assert "EUR 101.00" in analysis["alerts"][0]

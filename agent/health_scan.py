@@ -33,6 +33,8 @@ from agent.azure_costs import (
     budget_status,
     cost_details,
     cost_scan_error,
+    credit_details,
+    credit_status,
     format_cost,
     scan_azure_costs,
 )
@@ -675,6 +677,9 @@ RULES:
 - Compare actual costs and the explicitly labelled cycle-end projection with that budget.
 - The projection is linear over elapsed billing-cycle days, not an Azure forecast; costs may lag.
 - Remaining budget is spending headroom, NOT remaining credit; no credit ledger is available.
+- CostUSD is Azure's USD cost, separate from native-currency Cost and the alert budget.
+- Compare total_usd/projected_usd only with monthly_credit_usd (the configured benefit).
+- Estimated credit left is allowance minus USD usage, not an authoritative credit balance.
 - Missing/error cost data or missing currency/period/budget metadata means unavailable, not zero.
 - Do not invent currency conversions, calendar-month allowances or fixed per-project cost limits.
 - SELF-IMPROVEMENT: Recurring exceptions or failed requests = create an issue with the error details so Copilot can fix it
@@ -1118,7 +1123,7 @@ def build_telegram_summary(
     only part a human reliably reads: the analysis failed, the analysis ran and
     found nothing, and the analysis ran and found alerts.
     """
-    parts: list[str] = ["🤖 <b>NauroLabs Health Report</b>"]
+    parts: list[str] = ["<b>nauroLabs health report</b>"]
 
     cost_error = cost_scan_error(cost_data) if cost_data is not None else None
     failed = analysis_failed(analysis)
@@ -1129,23 +1134,60 @@ def build_telegram_summary(
 
     focus = analysis.get("focus_project", "")
     if focus and not failed:
-        parts.append(f"🎯 This Week: {html.escape(str(focus))}")
+        parts.extend(["", f"🎯 This week: {html.escape(str(focus))}"])
 
     if cost_data is not None:
+        parts.extend(["", "<b>Azure - monthly credit</b>"])
         if cost_error is not None:
             parts.append(
                 "⚠️ Azure cost scan unavailable: "
                 + html.escape(cost_error)
             )
         else:
-            parts.append(
-                f"Azure billing-cycle spend: {html.escape(format_cost(cost_data['total'], cost_data))}"
-                f" — {html.escape(budget_status(cost_data)[1])}"
-            )
-            parts.extend(
-                f"{label}: {html.escape(value)}" for label, value in cost_details(cost_data)
-            )
+            credit_class, credit_badge = credit_status(cost_data)
+            budget_class, budget_badge = budget_status(cost_data)
+            if credit_class != "muted":
+                details = dict(credit_details(cost_data))
+                spent = html.escape(details["Billing-cycle spend (USD)"])
+                allowance = html.escape(details["Monthly credit allowance (configured)"])
+                parts.extend([
+                    f"Spent: <b>{spent}</b> / {allowance} monthly credit",
+                    "Estimated credit left: <b>"
+                    + html.escape(details["Estimated credit left"]) + "</b>",
+                    "Cycle-end estimate (linear): "
+                    + html.escape(details["Cycle-end estimate (USD, linear)"]),
+                ])
+                if credit_class != "cost-green":
+                    parts.append(html.escape(credit_badge))
+            else:
+                parts.extend([
+                    html.escape(credit_badge),
+                    "Azure billing-cycle spend: "
+                    + html.escape(format_cost(cost_data["total"], cost_data)),
+                ])
+            if credit_class == "muted" or budget_class != "cost-green":
+                parts.append(
+                    "Separate alert budget: "
+                    + html.escape(format_cost(
+                        cost_data.get("budget"), {"currency": cost_data.get("budget_currency")},
+                    ))
+                    + " | " + html.escape(budget_badge)
+                )
+            parts.extend([
+                "Cycle: " + html.escape(
+                    f"{cost_data.get('period_start', 'unknown')} to "
+                    f"{cost_data.get('period_end', 'unknown')}"
+                ),
+                "Resets: " + html.escape(str(cost_data.get("next_reset", "unknown")))
+                + " | Usage: " + html.escape(str(cost_data.get(
+                    "latest_usage_date_usd" if credit_class != "muted" else "latest_usage_date",
+                    cost_data.get("latest_usage_date", "unavailable"),
+                )))
+                + " (may lag)",
+                "<i>Usage estimate, not a credit balance.</i>",
+            ])
 
+    parts.append("")
     alerts = analysis.get("alerts", []) or []
     if alerts:
         parts.append(f"🚨 <b>{len(alerts)} alert(s)</b>")
@@ -1161,6 +1203,7 @@ def build_telegram_summary(
     if created_issues:
         parts.append(f"📋 Created {len(created_issues)} tech-debt issue(s)")
     if report_path:
+        parts.append("")
         parts.append(
             f'<a href="https://github.com/{GITHUB_OWNER}/{REPORT_REPO}/blob/{REPORT_BRANCH}/{report_path}">Full report</a>'
         )
