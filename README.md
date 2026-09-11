@@ -80,8 +80,34 @@ rather than silently dropping these safeguards. `health-scan --dry-run` reads se
 and runs AI analysis (still billed), but does not persist/prune reports, create/assign
 issues, or send Telegram. Its JSON includes the proposed report and issues. The health
 workflow's `dry_run` dispatch input also dry-runs the PR sweep and suppresses failure
-notifications. Normal scans remain unchanged; identity configuration still needs
+notifications. Identity configuration still needs
 operator approval.
+
+### Health alert evidence
+
+Health alerts use measured workflow outcomes, confirmed URL checks and numeric
+budget comparisons. AI still supplies scores, focus and advice, but cannot invent
+alert text or automatic issue bodies. Repair proposals must reference an exact
+finding ID; unknown IDs and budget-only work are rejected. Open findings are
+deduplicated before filing, and a majority failure affecting at least three URLs
+becomes one monitor investigation rather than one paid agent assignment per app.
+
+URL checks retry slow responses (over 3,000ms), HTTP 5xx and transport errors up
+to three attempts, two seconds apart. Reports and dashboards keep all samples:
+recovery is visible, not silently discarded or claimed to prove a cold start.
+Persistent errors/slowness still alert; HTTP 4xx is not retried. No minimum replica
+count, credentials, schedule or spending limit is changed.
+
+The workflow column describes the **latest workflow**, with its actual name,
+not aggregate CI health. A failed scheduled check-in is still reported as a
+failure, but is not called a failed build. Health probes only cover the URL or
+`health_path` declared in the manifest; a working homepage does not prove every
+backend dependency is healthy.
+
+Measured alerts also survive an AI outage; scores/advice and automatic issue
+creation remain unavailable until analysis recovers. Repeated HTTP 5xx telemetry
+(at least two requests for a recorded endpoint/status) alerts even if the homepage
+works. Exception counts remain observations in the report, not proof of an outage.
 
 `refine` requires a clean worktree before agent work and a passing deterministic
 final test run before publishing. A failed or unavailable test runner blocks publication
@@ -177,6 +203,27 @@ inclusive `period_start`/`period_end`, `next_reset` (the following day), `query_
 `remaining_budget` and `latest_usage_date`. The legacy `remaining` key aliases
 **remaining budget**, never actual remaining credit. There is no credit-ledger
 integration; remaining credit is explicitly unavailable.
+
+The Visual Studio Enterprise benefit is **USD 150 per month**, configured through
+`AUTOREFINE_AZURE_MONTHLY_CREDIT_USD` (default `150`). This allowance is separate
+from the native-currency Azure alert budget. Separate daily queries request
+**CostUSD** and **Cost**: USD spending is supplied by Azure, never obtained
+by relabelling EUR or applying a guessed exchange rate. Missing or malformed
+CostUSD data fails visibly rather than substituting native-currency costs.
+The metrics are deliberately not combined: on 2026-09-11 a live combined query
+with CostUSD first labelled its two totals inconsistently with single-metric
+queries. Each metric's amount is now unambiguous even when Currency is EUR
+(that column still describes the subscription's native billing unit).
+
+Reports retain the native costs and budget for audit, and add `total_usd`,
+`projected_usd`, `monthly_credit_usd`, `estimated_credit_remaining_usd` and
+`cost_usd_source`, `latest_usage_date_usd` and `by_resource_group_usd`.
+Estimated credit left is the configured allowance minus
+reported USD usage; it is **not an authoritative remaining-credit balance**.
+Telegram leads with the USD benefit, spend, estimated headroom, cycle and reset,
+with blank lines between sections. Budget IDs and query diagnostics stay in the
+full report; independent alert-budget warnings remain visible on the phone.
+No Azure budgets, billing currency, spending limit or credentials are changed.
 
 `projected` is an explicitly labelled **linear cycle-end projection**, not an Azure
 forecast: reported actual cost × inclusive cycle days ÷ inclusive elapsed cycle

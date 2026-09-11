@@ -76,13 +76,13 @@ def azure(
                 },
             },
             _QUERY_URL: _query_page(
-                ["Currency", "ResourceGroupName", "UsageDate", "Cost"],
-                [["EUR", "rg-demo", 20260821, 24.25]],
+                ["Currency", "ResourceGroupName", "UsageDate", "Cost", "CostUSD"],
+                [["EUR", "rg-demo", 20260821, 24.25, 20]],
                 nextLink=_QUERY_URL + "&$skiptoken=next",
             ),
             _QUERY_URL + "&$skiptoken=next": _query_page(
-                ["UsageDate", "Cost", "Currency", "ResourceGroupName"],
-                [[20260907, 13.75, "EUR", "rg-demo"]],
+                ["CostUSD", "UsageDate", "Cost", "Currency", "ResourceGroupName"],
+                [[11, 20260907, 13.75, "EUR", "rg-demo"]],
             ),
         },
         "budget_url": budget_url,
@@ -96,6 +96,17 @@ def azure(
             return httpx.Response(response, json={"error": "unavailable"})
         if isinstance(response, Exception):
             raise response
+        if request.method == "POST" and isinstance(response, dict) and "properties" in response:
+            metric = json.loads(request.content)["dataset"]["aggregation"]["totalCost"]["name"]
+            response = deepcopy(response)
+            props = response["properties"]
+            if "columns" in props and "rows" in props:
+                indices = [
+                    i for i, column in enumerate(props["columns"])
+                    if column["name"] not in {"Cost", "CostUSD"} or column["name"] == metric
+                ]
+                props["columns"] = [props["columns"][i] for i in indices]
+                props["rows"] = [[row[i] for i in indices if i < len(row)] for row in props["rows"]]
         return httpx.Response(200, json=response)
 
     class AzureClient(httpx.Client):
@@ -123,9 +134,12 @@ def test_cycle_spanning_months_reads_budget_currency_columns_and_both_pages(
         "query_end": "2026-09-08", "latest_usage_date": "2026-09-07",
         "projected": 62.0, "projection_method": "linear_elapsed_cycle_days",
         "days_elapsed": 19, "days_in_period": 31, "by_resource_group": {"rg-demo": 38.0},
+        "total_usd": 31.0, "projected_usd": 50.58, "monthly_credit_usd": 150.0,
+        "estimated_credit_remaining_usd": 119.0, "cost_usd_source": "CostUSD",
+        "latest_usage_date_usd": "2026-09-07", "by_resource_group_usd": {"rg-demo": 31.0},
     }
     queries = [r for r in azure["requests"] if r.method == "POST"]
-    assert len(queries) == 2
+    assert len(queries) == 4
     assert all(
         r.headers["ClientType"] == "samoletovs-autorefine" for r in azure["requests"]
     )
@@ -138,6 +152,12 @@ def test_cycle_spanning_months_reads_budget_currency_columns_and_both_pages(
     }
     assert body["type"] == "ActualCost"
     assert body["dataset"]["granularity"] == "Daily"
+    assert body["dataset"]["aggregation"] == {"totalCost": {"name": "Cost", "function": "Sum"}}
+    usd_body = json.loads(queries[2].content)
+    assert usd_body["dataset"]["aggregation"] == {
+        "totalCost": {"name": "CostUSD", "function": "Sum"},
+    }
+    assert usd_body["timePeriod"] == body["timePeriod"]
 
 
 def test_budget_lifetime_start_is_not_the_billing_cycle_start(azure: dict[str, Any]) -> None:
@@ -174,7 +194,7 @@ def test_budget_current_spend_never_supplies_costs_or_freshness(
     assert result["query_end"] == "2026-09-08"
     details = dict(azure_costs.cost_details(result))
     assert details["Latest reported usage"] == "2026-09-07; ingestion freshness unavailable"
-    assert len([r for r in azure["requests"] if r.method == "POST"]) == 2
+    assert len([r for r in azure["requests"] if r.method == "POST"]) == 4
 
 
 def test_zero_budget_current_spend_never_masks_a_failed_cost_query(azure: dict[str, Any]) -> None:
@@ -200,7 +220,7 @@ def test_notification_names_do_not_turn_a_projection_into_a_forecast(
     result = health_scan.scan_azure_costs()
     assert result["projection_method"] == "linear_elapsed_cycle_days"
     assert result["projected"] == 62
-    assert "not an Azure forecast" in health_scan.build_telegram_summary({}, None, [], result)
+    assert "Cycle-end estimate (linear)" in health_scan.build_telegram_summary({}, None, [], result)
 
 
 @pytest.mark.parametrize(("day", "elapsed"), [(21, 1), (20, 31)])
@@ -209,8 +229,8 @@ def test_inclusive_cycle_first_and_last_day(
 ) -> None:
     clock.today = dt.datetime(2026, 8 if day == 21 else 9, day, tzinfo=dt.UTC)
     azure["responses"][_QUERY_URL] = _query_page(
-        ["Cost", "UsageDate", "ResourceGroupName", "Currency"],
-        [[31, 20260821, "", "EUR"]],
+        ["Cost", "UsageDate", "ResourceGroupName", "Currency", "CostUSD"],
+        [[31, 20260821, "", "EUR", 27]],
     )
     result = health_scan.scan_azure_costs()
     assert result["days_elapsed"] == elapsed
@@ -266,8 +286,8 @@ def test_selected_budget_is_configurable(
 def test_currency_is_not_hardcoded(azure: dict[str, Any], currency: str) -> None:
     azure["responses"][azure["budget_url"]]["properties"]["currentSpend"]["unit"] = currency
     azure["responses"][_QUERY_URL] = _query_page(
-        ["Cost", "UsageDate", "ResourceGroupName", "Currency"],
-        [[38, 20260907, "rg-demo", currency]],
+        ["Cost", "UsageDate", "ResourceGroupName", "Currency", "CostUSD"],
+        [[38, 20260907, "rg-demo", currency, 31]],
     )
     result = health_scan.scan_azure_costs()
     assert result["currency"] == currency
@@ -340,7 +360,8 @@ def test_unknown_currency_malformed_or_out_of_period_costs_fail_closed(
     azure: dict[str, Any], rows: list[list[Any]],
 ) -> None:
     azure["responses"][_QUERY_URL] = _query_page(
-        ["Cost", "UsageDate", "ResourceGroupName", "Currency"], rows,
+        ["Cost", "UsageDate", "ResourceGroupName", "Currency", "CostUSD"],
+        [row + [1] for row in rows],
     )
     result = health_scan.scan_azure_costs()
     assert result["total"] == -1
@@ -361,13 +382,67 @@ def test_invalid_column_metadata_is_not_a_clean_scan(
 
 def test_zero_cost_with_known_currency_is_valid(azure: dict[str, Any]) -> None:
     azure["responses"][_QUERY_URL] = _query_page(
-        ["Cost", "UsageDate", "ResourceGroupName", "Currency"],
-        [[0, 20260907, None, "EUR"]],
+        ["Cost", "UsageDate", "ResourceGroupName", "Currency", "CostUSD"],
+        [[0, 20260907, None, "EUR", 0]],
     )
     result = health_scan.scan_azure_costs()
     assert result["total"] == 0
     assert result["remaining_budget"] == 100
     assert result["currency"] == "EUR"
+
+
+@pytest.mark.parametrize("usd", [None, True, "NaN", "Infinity"])
+def test_invalid_usd_meter_cannot_fall_back_to_native_currency(
+    azure: dict[str, Any], usd: Any,
+) -> None:
+    azure["responses"][_QUERY_URL] = _query_page(
+        ["Cost", "CostUSD", "UsageDate", "ResourceGroupName", "Currency"],
+        [[38, usd, 20260907, "rg-demo", "EUR"]],
+    )
+    result = health_scan.scan_azure_costs()
+    assert result["total"] == -1
+    assert "total_usd" not in result
+
+
+def test_missing_usd_column_fails_instead_of_relabelling_native_cost(azure: dict[str, Any]) -> None:
+    azure["responses"][_QUERY_URL] = _query_page(
+        ["Cost", "UsageDate", "ResourceGroupName", "Currency"],
+        [[38, 20260907, "rg-demo", "EUR"]],
+    )
+    result = health_scan.scan_azure_costs()
+    assert result["total"] == -1
+    assert "CostUSD" in result["error"]
+
+
+def test_configured_credit_does_not_change_azure_alert_budget(
+    azure: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AUTOREFINE_AZURE_MONTHLY_CREDIT_USD", "50")
+    result = health_scan.scan_azure_costs()
+    assert result["monthly_credit_usd"] == 50
+    assert result["estimated_credit_remaining_usd"] == 19
+    assert result["budget"] == 100
+    assert result["remaining_budget"] == 62
+
+
+@pytest.mark.parametrize("credit", ["0", "-1", "NaN", "Infinity", "not-money"])
+def test_invalid_allowance_is_visible_before_any_azure_read(
+    azure: dict[str, Any], monkeypatch: pytest.MonkeyPatch, credit: str,
+) -> None:
+    monkeypatch.setenv("AUTOREFINE_AZURE_MONTHLY_CREDIT_USD", credit)
+    assert health_scan.scan_azure_costs()["total"] == -1
+    assert not azure["requests"]
+
+
+def test_usd_rounding_happens_after_aggregation_not_per_row(azure: dict[str, Any]) -> None:
+    azure["responses"][_QUERY_URL] = _query_page(
+        ["Cost", "CostUSD", "UsageDate", "ResourceGroupName", "Currency"],
+        [[0, "0.005", 20260907, "rg-demo", "EUR"],
+         [0, "0.005", 20260907, "rg-demo", "EUR"]],
+    )
+    result = health_scan.scan_azure_costs()
+    assert result["total_usd"] == 0.01
+    assert result["estimated_credit_remaining_usd"] == 149.99
 
 
 @pytest.mark.parametrize(
@@ -382,14 +457,13 @@ def test_invalid_pagination_fails_without_following(azure: dict[str, Any], link:
     assert len([r for r in azure["requests"] if r.method == "POST"]) == 1
 
 
-def test_eur_dates_and_remaining_budget_on_all_rendered_surfaces(
+def test_full_reports_keep_eur_audit_details_while_telegram_summarizes_usd(
     azure: dict[str, Any],
 ) -> None:
     result = health_scan.scan_azure_costs()
     for rendered in (
         _render_cost_section(result),
         health_scan.generate_report({}, result, {}),
-        health_scan.build_telegram_summary({}, None, [], result),
     ):
         for expected in (
             "EUR 38.00", "EUR 100.00", "EUR 62.00", "Remaining budget",
@@ -401,6 +475,10 @@ def test_eur_dates_and_remaining_budget_on_all_rendered_surfaces(
         assert "$" not in rendered
         assert "Month-to-date" not in rendered
         assert "Remaining credit: EUR" not in rendered
+    message = health_scan.build_telegram_summary({}, None, [], result)
+    for expected in ("USD 31.00", "USD 150.00", "USD 119.00", "2026-09-21", "2026-09-07"):
+        assert expected in message
+    assert azure_costs.DEFAULT_BUDGET_NAME not in message
 
 
 def test_legacy_reports_render_amounts_but_no_currency_or_green_budget_is_invented() -> None:
@@ -439,12 +517,12 @@ def test_unverified_currency_mismatch_never_relabels_the_budget(
 def test_currency_and_budget_names_are_html_escaped(azure: dict[str, Any]) -> None:
     result = health_scan.scan_azure_costs()
     result["budget_name"] = "<b>test & budget</b>"
-    for rendered in (
-        _render_cost_section(result),
-        health_scan.build_telegram_summary({}, None, [], result),
-    ):
+    for rendered in (_render_cost_section(result),):
         assert "<b>test" not in rendered
         assert "&lt;b&gt;test &amp; budget&lt;/b&gt;" in rendered
+    message = health_scan.build_telegram_summary({}, None, [], result)
+    assert "<b>test" not in message
+    assert "test &amp; budget" not in message
 
 def test_ai_prompt_uses_only_reported_currency_period_budget(
     azure: dict[str, Any], monkeypatch: pytest.MonkeyPatch,

@@ -1957,6 +1957,7 @@ def run_dashboard_mode(
         analyze_with_ai,
         check_deployed_urls,
         generate_report,
+        ground_analysis,
         scan_app_insights,
         scan_azure_costs,
         scan_github,
@@ -1975,6 +1976,7 @@ def run_dashboard_mode(
     app_insights_data = scan_app_insights()
     url_health_data = check_deployed_urls()
     analysis = analyze_with_ai(github_data, cost_data, app_insights_data, url_health_data)
+    analysis = ground_analysis(analysis, github_data, cost_data, app_insights_data, url_health_data)
 
     if report_path:
         analysis["quality_coverage"] = load_quality_coverage(report_path)

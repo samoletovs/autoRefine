@@ -22,6 +22,8 @@ import json
 import logging
 import os
 import subprocess
+import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -31,8 +33,16 @@ from agent.azure_costs import (
     budget_status,
     cost_details,
     cost_scan_error,
+    credit_details,
+    credit_status,
     format_cost,
     scan_azure_costs,
+)
+from agent.health_evidence import (
+    SLOW_RESPONSE_MS,
+    collect_findings,
+    describe_probes,
+    ground_analysis,
 )
 
 log = logging.getLogger(__name__)
@@ -43,6 +53,8 @@ REPORT_REPO = "nauroLabs-github"
 REPORT_PATH_PREFIX = "reports/run"
 REPORT_BRANCH = "master"
 MAX_REPORTS = 10
+URL_PROBE_ATTEMPTS = 3
+URL_RETRY_SECONDS = 2
 
 MANIFEST_URL = (
     "https://raw.githubusercontent.com/samoletovs/nauroLabs-github/master"
@@ -339,6 +351,10 @@ def scan_github(token: str, repos: list[str]) -> dict[str, Any]:
                     latest = runs[0]
                     repo_data["ci_status"] = latest["conclusion"] or latest["status"]
                     repo_data["ci_name"] = latest["name"]
+                    repo_data["ci_event"] = latest.get("event", "unknown")
+                    repo_data["ci_branch"] = latest.get("head_branch", "unknown")
+                    repo_data["ci_url"] = latest.get("html_url", "")
+                    repo_data["ci_workflow_id"] = latest.get("workflow_id", latest["name"])
                 else:
                     repo_data["ci_status"] = "none"
             except httpx.HTTPError:
@@ -491,29 +507,37 @@ def scan_app_insights() -> dict[str, Any]:
 
 # ── URL Health Checker ─────────────────────────────────────────────────────
 def check_deployed_urls() -> dict[str, Any]:
-    """HTTP GET each deployed URL and capture status + latency."""
+    """Bounded confirmation of slow/transient responses, retaining every sample."""
     manifest = fetch_workspace_manifest()
     app_urls = _build_app_urls(manifest)
     results: dict[str, Any] = {}
     with httpx.Client(timeout=30, follow_redirects=True) as client:
         for repo, url in app_urls.items():
-            try:
-                resp = client.get(url)
-                results[repo] = {
-                    "url": url,
-                    "status": resp.status_code,
-                    "ok": 200 <= resp.status_code < 400,
-                    "response_ms": round(resp.elapsed.total_seconds() * 1000),
-                    "size_kb": round(len(resp.content) / 1024, 1),
-                }
-            except httpx.HTTPError as e:
-                results[repo] = {
-                    "url": url,
-                    "status": 0,
-                    "ok": False,
-                    "response_ms": -1,
-                    "error": str(e)[:100],
-                }
+            attempts: list[dict[str, Any]] = []
+            for attempt in range(URL_PROBE_ATTEMPTS):
+                try:
+                    resp = client.get(url)
+                    sample = {
+                        "status": resp.status_code,
+                        "ok": 200 <= resp.status_code < 400,
+                        "response_ms": round(resp.elapsed.total_seconds() * 1000),
+                        "size_kb": round(len(resp.content) / 1024, 1),
+                    }
+                    retry = resp.status_code >= 500 or (
+                        sample["ok"] and sample["response_ms"] > SLOW_RESPONSE_MS
+                    )
+                except httpx.HTTPError as exc:
+                    sample = {
+                        "status": 0, "ok": False, "response_ms": -1,
+                        "error": str(exc)[:100],
+                    }
+                    retry = True
+                attempts.append(sample)
+                if not retry or attempt == URL_PROBE_ATTEMPTS - 1:
+                    break
+                log.info("Confirming URL check for %s: %s", repo, sample)
+                time.sleep(URL_RETRY_SECONDS)
+            results[repo] = {"url": url, **sample, "attempts": attempts}
     return results
 
 
@@ -646,16 +670,21 @@ SCORING (per project):
 
 RULES:
 - Bugs with open issues = lower health
-- Failed CI = critical alert
+- ci_status is the LATEST WORKFLOW of any kind, not an aggregate CI/build verdict.
+  Use its name, event, branch and run URL; never call a scheduled check-in a CI failure.
 - Projects with 0 commits in 7 days = momentum = 1
 - Use only the supplied Azure currency, billing-period dates and selected budget.
 - Compare actual costs and the explicitly labelled cycle-end projection with that budget.
 - The projection is linear over elapsed billing-cycle days, not an Azure forecast; costs may lag.
 - Remaining budget is spending headroom, NOT remaining credit; no credit ledger is available.
+- CostUSD is Azure's USD cost, separate from native-currency Cost and the alert budget.
+- Compare total_usd/projected_usd only with monthly_credit_usd (the configured benefit).
+- Estimated credit left is allowance minus USD usage, not an authoritative credit balance.
 - Missing/error cost data or missing currency/period/budget metadata means unavailable, not zero.
 - Do not invent currency conversions, calendar-month allowances or fixed per-project cost limits.
 - SELF-IMPROVEMENT: Recurring exceptions or failed requests = create an issue with the error details so Copilot can fix it
-- URL returning non-200 or response time > 3000ms = critical alert
+- URL attempts include the initial and confirming measurements. A recovered response
+  is not persistent slowness; cold starts are possible but not proven by retries.
 - Page views = 0 for a deployed app = flag (nobody using it)
 
 Respond with EXACTLY this JSON (no markdown):
@@ -664,10 +693,13 @@ Respond with EXACTLY this JSON (no markdown):
   "alerts": ["critical issues requiring attention"],
   "recommendations": ["top 3 actionable recommendations"],
   "focus_project": "which project to focus on this week and why",
-  "issues_to_create": [{"repo": "repo_name", "title": "issue title", "body": "issue description", "labels": ["label"]}]
+  "issues_to_create": [{"finding_id": "an exact actionable finding_id supplied below"}]
 }
 
-For issues_to_create: include genuinely actionable items that Copilot can auto-implement.
+Alerts are computed from measured evidence, not your prose. Budget comparisons are numeric.
+For issues_to_create: select only genuinely actionable findings from the supplied catalog.
+Only findings with a repo can be selected. Never invent IDs, causes or repair instructions.
+Issue bodies are generated from the observation, not from model text.
 ESPECIALLY create issues for:
 - Recurring JS exceptions with stack traces
 - Failed API endpoints returning 500 errors
@@ -676,6 +708,8 @@ ESPECIALLY create issues for:
 Do NOT create issues for: subjective improvements, architecture decisions, or issues already in the open issues list."""
 
     user_msg = (
+        "Measured finding catalog:\n"
+        f"{json.dumps([asdict(f) for f in collect_findings(github_data, cost_data, app_insights_data or {}, url_health_data or {})], indent=2)}\n\n"
         f"GitHub data:\n{json.dumps(github_data, indent=2)}\n\n"
         f"Azure costs:\n{json.dumps(cost_data, indent=2)}\n\n"
         f"App Insights telemetry (last 24h):\n"
@@ -751,9 +785,9 @@ def generate_report(
         report.append("## ⚠️ AI ANALYSIS FAILED — THIS REPORT IS INCOMPLETE\n")
         report.append(
             "The model call did not return a usable answer, so health scores, "
-            "alerts, recommendations and the focus project are **missing** — "
+            "recommendations and the focus project are **missing** — "
             "not empty. Scores below render as `?` for that reason. The scanned "
-            "GitHub, cost and URL data is still accurate.\n"
+            "GitHub, cost and URL data remains available; measured alerts still appear below.\n"
         )
         report.append(f"> `{analysis.get('error', 'unknown error')}`\n")
         report.append("No issues were filed this run.\n")
@@ -776,7 +810,7 @@ def generate_report(
 
     report.append("## Project Health\n")
     report.append(
-        "| Project | Issues | Bugs | PRs | Commits(7d) | CI | R | L | M | Health |"
+        "| Project | Issues | Bugs | PRs | Commits(7d) | Latest workflow | R | L | M | Health |"
     )
     report.append(
         "|---------|--------|------|-----|-------------|-----|---|---|---|--------|"
@@ -790,11 +824,14 @@ def generate_report(
         report.append(
             f"| {repo} | {data.get('open_issues', '?')} "
             f"| {data.get('bug_count', '?')} | {data.get('open_prs', '?')} "
-            f"| {data.get('commits_7d', '?')} | {ci_emoji} "
+            f"| {data.get('commits_7d', '?')} | {ci_emoji} {data.get('ci_name', '')} "
             f"| {s.get('R', '?')} | {s.get('L', '?')} | {s.get('M', '?')} "
             f"| {s.get('health', '?')} |"
         )
     report.append("")
+    report.append(
+        "Latest workflow is not aggregate CI health; scheduled tasks and automation are included.\n"
+    )
 
     if any(data.get("recent_ideas") for data in github_data.values()):
         report.append("## Improvement Tracking\n")
@@ -829,13 +866,14 @@ def generate_report(
 
     if url_health_data:
         report.append("## Deployed Apps\n")
-        report.append("| App | Status | Response (ms) | Size (KB) |")
-        report.append("|-----|--------|--------------|-----------|")
+        report.append("| App | Status | Response (ms) | Size (KB) | Probe observations |")
+        report.append("|-----|--------|--------------|-----------|--------------------|")
         for repo, data in url_health_data.items():
             status_icon = "✅" if data.get("ok") else "❌"
             report.append(
                 f"| {repo} | {status_icon} {data.get('status', '?')} "
-                f"| {data.get('response_ms', '?')} | {data.get('size_kb', '?')} |"
+                f"| {data.get('response_ms', '?')} | {data.get('size_kb', '?')} "
+                f"| {describe_probes(data)} |"
             )
         report.append("")
 
@@ -880,7 +918,8 @@ def generate_report(
 
     issues = analysis.get("issues_to_create", [])
     if issues:
-        report.append("## Auto-Created Issues\n")
+        report.append("## Proposed Repair Issues\n")
+        report.append("Creation is attempted after report persistence and duplicate checks.\n")
         for iss in issues:
             report.append(f"- [{iss.get('repo')}] {iss.get('title')}")
         report.append("")
@@ -954,6 +993,39 @@ def enforce_report_retention(token: str) -> None:
             log.info("Pruned old report: %s", oldest["name"])
 
 
+def _has_open_health_issue(
+    client: httpx.Client, repo: str, finding_id: str, title: str,
+) -> bool:
+    marker = f"<!-- autorefine-health:{finding_id} -->"
+    titles = {f"🔧 Tech Debt: {title}"}
+    if finding_id.startswith("url:") and finding_id != "url:multiple":
+        titles.add("🔧 Tech Debt: Optimize URL response time")
+    elif finding_id.startswith("workflow:"):
+        titles.add("🔧 Tech Debt: Fix CI pipeline failure")
+    for page in range(1, 11):
+        response = client.get(
+            f"https://api.github.com/repos/{GITHUB_OWNER}/{repo}/issues",
+            params={"state": "open", "per_page": 100, "page": page},
+        )
+        response.raise_for_status()
+        items = response.json()
+        for item in items:
+            if "pull_request" in item:
+                continue
+            if marker in (item.get("body") or "") or item.get("title") in titles:
+                log.info("Health finding %s already tracked: %s", finding_id, item["html_url"])
+                return True
+        if len(items) < 100:
+            return False
+    raise RuntimeError(f"Health issue deduplication exceeded 1000 open items in {repo}")
+
+
+class HealthIssueFilingError(RuntimeError):
+    def __init__(self, message: str, created: list[str]) -> None:
+        super().__init__(message)
+        self.created = list(created)
+
+
 def create_github_issues(
     token: str,
     issues: list[dict[str, Any]],
@@ -967,22 +1039,36 @@ def create_github_issues(
     }
     created: list[str] = []
     with httpx.Client(headers=headers, timeout=30) as client:
-        for issue in issues[:5]:
+        for issue in issues:
+            if len(created) >= 5:
+                break
             repo = issue.get("repo", "")
             if repo not in allowed_repos:
+                log.warning("Health issue target is outside scan scope: %s", repo)
                 continue
-            body = {
-                "title": f"🔧 Tech Debt: {issue.get('title', 'Untitled')}",
-                "body": (
-                    f"{issue.get('body', '')}\n\n"
-                    f"---\n*Auto-created by autoRefine health scan*"
-                ),
-                "labels": issue.get("labels", ["tech-debt", "autorefine"]),
-            }
-            resp = client.post(
-                f"https://api.github.com/repos/{GITHUB_OWNER}/{repo}/issues",
-                json=body,
-            )
+            try:
+                finding_id = issue.get("finding_id")
+                if finding_id and _has_open_health_issue(
+                    client, repo, finding_id, issue["title"],
+                ):
+                    continue
+                body = {
+                    "title": f"🔧 Tech Debt: {issue.get('title', 'Untitled')}",
+                    "body": (
+                        f"{issue.get('body', '')}\n\n"
+                        f"---\n*Auto-created by autoRefine health scan*"
+                    ),
+                    "labels": issue.get("labels", ["tech-debt", "autorefine"]),
+                }
+                resp = client.post(
+                    f"https://api.github.com/repos/{GITHUB_OWNER}/{repo}/issues",
+                    json=body,
+                )
+                resp.raise_for_status()
+                if resp.status_code != 201:
+                    raise RuntimeError(f"Issue creation returned HTTP {resp.status_code} in {repo}")
+            except (httpx.HTTPError, RuntimeError) as exc:
+                raise HealthIssueFilingError(str(exc), created) from exc
             if resp.status_code == 201:
                 issue_data = resp.json()
                 url = issue_data.get("html_url", "")
@@ -1012,10 +1098,6 @@ def create_github_issues(
                             issue_num,
                             (assign_result.stderr or assign_result.stdout or "").strip(),
                         )
-            else:
-                log.warning(
-                    "Failed to create issue in %s: %s", repo, resp.text[:200]
-                )
     return created
 
 
@@ -1043,51 +1125,87 @@ def build_telegram_summary(
     only part a human reliably reads: the analysis failed, the analysis ran and
     found nothing, and the analysis ran and found alerts.
     """
-    parts: list[str] = ["🤖 <b>NauroLabs Health Report</b>"]
+    parts: list[str] = ["<b>nauroLabs health report</b>"]
 
     cost_error = cost_scan_error(cost_data) if cost_data is not None else None
     failed = analysis_failed(analysis)
     if failed:
         parts.append("⚠️ <b>AI analysis FAILED — report is incomplete</b>")
-        parts.append(f"<i>{str(analysis.get('error', 'unknown error'))[:180]}</i>")
-        parts.append("No scores, no alerts, no issues filed this run.")
+        parts.append(f"<i>{html.escape(str(analysis.get('error', 'unknown error'))[:180])}</i>")
+        parts.append("No AI scores or advice; no issues filed. Measured alerts remain available.")
 
     focus = analysis.get("focus_project", "")
     if focus and not failed:
-        parts.append(f"🎯 This Week: {focus}")
+        parts.extend(["", f"🎯 This week: {html.escape(str(focus))}"])
 
     if cost_data is not None:
+        parts.extend(["", "<b>Azure - monthly credit</b>"])
         if cost_error is not None:
             parts.append(
                 "⚠️ Azure cost scan unavailable: "
                 + html.escape(cost_error)
             )
         else:
-            parts.append(
-                f"Azure billing-cycle spend: {html.escape(format_cost(cost_data['total'], cost_data))}"
-                f" — {html.escape(budget_status(cost_data)[1])}"
-            )
-            parts.extend(
-                f"{label}: {html.escape(value)}" for label, value in cost_details(cost_data)
-            )
+            credit_class, credit_badge = credit_status(cost_data)
+            budget_class, budget_badge = budget_status(cost_data)
+            if credit_class != "muted":
+                details = dict(credit_details(cost_data))
+                spent = html.escape(details["Billing-cycle spend (USD)"])
+                allowance = html.escape(details["Monthly credit allowance (configured)"])
+                parts.extend([
+                    f"Spent: <b>{spent}</b> / {allowance} monthly credit",
+                    "Estimated credit left: <b>"
+                    + html.escape(details["Estimated credit left"]) + "</b>",
+                    "Cycle-end estimate (linear): "
+                    + html.escape(details["Cycle-end estimate (USD, linear)"]),
+                ])
+                if credit_class != "cost-green":
+                    parts.append(html.escape(credit_badge))
+            else:
+                parts.extend([
+                    html.escape(credit_badge),
+                    "Azure billing-cycle spend: "
+                    + html.escape(format_cost(cost_data["total"], cost_data)),
+                ])
+            if credit_class == "muted" or budget_class != "cost-green":
+                parts.append(
+                    "Separate alert budget: "
+                    + html.escape(format_cost(
+                        cost_data.get("budget"), {"currency": cost_data.get("budget_currency")},
+                    ))
+                    + " | " + html.escape(budget_badge)
+                )
+            parts.extend([
+                "Cycle: " + html.escape(
+                    f"{cost_data.get('period_start', 'unknown')} to "
+                    f"{cost_data.get('period_end', 'unknown')}"
+                ),
+                "Resets: " + html.escape(str(cost_data.get("next_reset", "unknown")))
+                + " | Usage: " + html.escape(str(cost_data.get(
+                    "latest_usage_date_usd" if credit_class != "muted" else "latest_usage_date",
+                    cost_data.get("latest_usage_date", "unavailable"),
+                )))
+                + " (may lag)",
+                "<i>Usage estimate, not a credit balance.</i>",
+            ])
 
-    if not failed:
-        alerts = analysis.get("alerts", []) or []
-        if alerts:
-            parts.append(f"🚨 <b>{len(alerts)} alert(s)</b>")
-            # Each alert is prefixed, so an alert can never be confused with
-            # the cost line above or with any other bullet in the message.
-            parts.extend(f"🚨 {a}" for a in alerts[:3])
-            if len(alerts) > 3:
-                parts.append(f"…and {len(alerts) - 3} more — see the full report")
-        elif cost_error is not None:
-            parts.append("⚠️ No analysis alerts; Azure costs unavailable")
-        else:
-            parts.append("✅ No alerts")
+    parts.append("")
+    alerts = analysis.get("alerts", []) or []
+    if alerts:
+        parts.append(f"🚨 <b>{len(alerts)} alert(s)</b>")
+        parts.extend(f"🚨 {html.escape(str(a))}" for a in alerts[:3])
+        if len(alerts) > 3:
+            parts.append(f"…and {len(alerts) - 3} more — see the full report")
+    elif not failed:
+        parts.append(
+            "⚠️ No analysis alerts; Azure costs unavailable"
+            if cost_error is not None else "✅ No alerts"
+        )
 
     if created_issues:
         parts.append(f"📋 Created {len(created_issues)} tech-debt issue(s)")
     if report_path:
+        parts.append("")
         parts.append(
             f'<a href="https://github.com/{GITHUB_OWNER}/{REPORT_REPO}/blob/{REPORT_BRANCH}/{report_path}">Full report</a>'
         )
@@ -1136,6 +1254,7 @@ def run_health_scan(
     log.info("URL health check complete: %d URLs", len(url_health_data))
 
     analysis = analyze_with_ai(github_data, cost_data, app_insights_data, url_health_data)
+    analysis = ground_analysis(analysis, github_data, cost_data, app_insights_data, url_health_data)
     if analysis_failed(analysis):
         log.error(
             "AI analysis failed — the report will be marked incomplete and no "
@@ -1179,20 +1298,30 @@ def run_health_scan(
     except Exception as exc:  # never let pruning kill notifications
         log.warning("Report retention skipped: %s", exc)
 
-    created_issues = create_github_issues(
-        github_token,
-        analysis.get("issues_to_create", []),
-        repos,
-        assign_copilot=assign_copilot,
-    )
+    filing_failed = False
+    try:
+        created_issues = create_github_issues(
+            github_token,
+            analysis.get("issues_to_create", []),
+            repos,
+            assign_copilot=assign_copilot,
+        )
+    except (HealthIssueFilingError, httpx.HTTPError) as exc:
+        filing_failed = True
+        created_issues = exc.created if isinstance(exc, HealthIssueFilingError) else []
+        log.error("Health issue filing failed: %s", exc)
 
     summary = build_telegram_summary(
         analysis, report_path, created_issues, cost_data=cost_data
     )
+    if filing_failed:
+        summary += "\n⚠️ Issue filing failed; see the workflow logs. Health alerts are retained."
     telegram_sent = send_telegram(summary, parse_mode="HTML")
     failed_stages: list[str] = []
     if cost_error is not None:
         failed_stages.append("cost")
+    if filing_failed:
+        failed_stages.append("issues")
     if analysis_failed(analysis):
         failed_stages.append("analysis")
     if not report_path:

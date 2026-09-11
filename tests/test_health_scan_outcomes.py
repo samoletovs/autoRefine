@@ -109,7 +109,7 @@ def test_health_scan_cli_dry_run_never_writes_or_sends(
     assert summary["dry_run"] is True
     assert summary["report_path"] is None
     assert summary["created_issues"] == []
-    assert summary["planned_issues"] == ([] if analysis_failed else planned)
+    assert summary["planned_issues"] == []  # No observation supports the model's proposal.
     assert summary["failed_stages"] == (["analysis"] if analysis_failed else [])
     assert "DRY RUN" in summary["telegram_summary"]
     assert summary["report"]

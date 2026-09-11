@@ -17,6 +17,7 @@ from azure.core.exceptions import AzureError
 log = logging.getLogger(__name__)
 
 DEFAULT_BUDGET_NAME = "naurolabs-credit-cycle-eur-100"
+DEFAULT_MONTHLY_CREDIT_USD = "150"
 BUDGET_WARNING_THRESHOLD_PCT = 70
 _ARM = "https://management.azure.com"
 
@@ -128,6 +129,7 @@ def _budget(
 
 def _cost_rows(
     client: httpx.Client, scope_url: str, start: dt.date, today: dt.date,
+    *, metric: str = "Cost",
 ) -> tuple[Decimal, dict[str, Decimal], str, dt.date]:
     query = {
         "type": "ActualCost",
@@ -138,7 +140,7 @@ def _cost_rows(
         },
         "dataset": {
             "granularity": "Daily",
-            "aggregation": {"totalCost": {"name": "Cost", "function": "Sum"}},
+            "aggregation": {"totalCost": {"name": metric, "function": "Sum"}},
             "grouping": [{"type": "Dimension", "name": "ResourceGroupName"}],
         },
     }
@@ -151,9 +153,11 @@ def _cost_rows(
         names = [column["name"] for column in page["columns"]]
         if len(names) != len(set(names)):
             raise ValueError("Duplicate cost query columns")
-        required = {"Cost", "Currency", "ResourceGroupName", "UsageDate"}
+        required = {metric, "Currency", "ResourceGroupName", "UsageDate"}
         if not required.issubset(names):
-            raise ValueError("Missing cost query columns (Cost, Currency, ResourceGroupName, UsageDate)")
+            raise ValueError(
+                f"Missing cost query columns ({metric}, Currency, ResourceGroupName, UsageDate)"
+            )
         rows = page["rows"]
         if not isinstance(rows, list):
             raise TypeError("Invalid cost query rows")
@@ -161,7 +165,7 @@ def _cost_rows(
             if not isinstance(row, list) or len(row) != len(names):
                 raise ValueError("Malformed cost query row")
             values = dict(zip(names, row))
-            cost = _money(values["Cost"])
+            cost = _money(values[metric])
             currencies.add(_currency(values["Currency"]))
             usage_date = dt.date.fromisoformat(str(values["UsageDate"]))
             if not start <= usage_date <= today:
@@ -187,6 +191,11 @@ def scan_azure_costs() -> dict[str, Any]:
     try:
         from azure.identity import DefaultAzureCredential
 
+        monthly_credit = _money(os.environ.get(
+            "AUTOREFINE_AZURE_MONTHLY_CREDIT_USD", DEFAULT_MONTHLY_CREDIT_USD,
+        ))
+        if monthly_credit <= 0:
+            raise ValueError("Configured monthly USD credit must be positive")
         today = dt.datetime.now(dt.UTC).date()
         scope_url = f"{_ARM}/subscriptions/{quote(subscription, safe='')}"
         with DefaultAzureCredential() as credential:
@@ -201,8 +210,15 @@ def scan_azure_costs() -> dict[str, Any]:
                 start, end = _billing_period(client, scope_url, today)
                 budget, budget_currency = _budget(client, scope_url, name, today, end)
                 total, by_rg, currency, latest = _cost_rows(client, scope_url, start, today)
+                # Separate metrics: this subscription returned mislabelled values
+                # when CostUSD preceded Cost in a multi-aggregation request.
+                total_usd, by_rg_usd, usd_billing_currency, latest_usd = _cost_rows(
+                    client, scope_url, start, today, metric="CostUSD",
+                )
         if currency != budget_currency:
             raise ValueError("Cost query currency does not match selected budget currency")
+        if usd_billing_currency != currency:
+            raise ValueError("USD and native cost queries report different billing currencies")
         days_elapsed = (today - start).days + 1
         days_in_period = (end - start).days + 1
         remaining = float(round(budget - total, 2))
@@ -225,6 +241,13 @@ def scan_azure_costs() -> dict[str, Any]:
             "days_elapsed": days_elapsed,
             "days_in_period": days_in_period,
             "by_resource_group": {rg: float(round(cost, 2)) for rg, cost in by_rg.items()},
+            "total_usd": float(round(total_usd, 2)),
+            "projected_usd": float(round(total_usd * days_in_period / days_elapsed, 2)),
+            "monthly_credit_usd": float(monthly_credit),
+            "estimated_credit_remaining_usd": float(round(monthly_credit - total_usd, 2)),
+            "cost_usd_source": "CostUSD",
+            "latest_usage_date_usd": latest_usd.isoformat(),
+            "by_resource_group_usd": {rg: float(round(cost, 2)) for rg, cost in by_rg_usd.items()},
         }
     except (AzureError, httpx.HTTPError, OSError, ValueError, TypeError, KeyError, ArithmeticError) as exc:
         error = str(exc).strip() or type(exc).__name__
@@ -278,8 +301,56 @@ def budget_status(data: dict[str, Any]) -> tuple[str, str]:
         return "muted", "⚠️ Budget status unavailable (currency, period or budget unverified)"
 
 
+def _credit_amounts(data: dict[str, Any]) -> tuple[Decimal, Decimal, Decimal]:
+    if cost_scan_error(data) is not None or data.get("cost_usd_source") != "CostUSD":
+        raise ValueError("USD cost source unverified")
+    if _date(data["period_end"]) < _date(data["period_start"]):
+        raise ValueError("Invalid credit period")
+    if data.get("projection_method") != "linear_elapsed_cycle_days":
+        raise ValueError("USD projection method unverified")
+    total = _money(data["total_usd"])
+    allowance = _money(data["monthly_credit_usd"])
+    projected = _money(data["projected_usd"])
+    if total < 0 or projected < 0 or allowance <= 0:
+        raise ValueError("Invalid USD cost or monthly credit")
+    return total, allowance, projected
+
+
+def credit_status(data: dict[str, Any]) -> tuple[str, str]:
+    """Compare Azure's USD meter with the configured benefit, never the EUR budget."""
+    try:
+        total, allowance, projected = _credit_amounts(data)
+        if total > allowance:
+            return "cost-red", "🔴 OVER MONTHLY CREDIT (estimated)"
+        if projected > allowance:
+            return "cost-red", "🔴 PROJECTED OVER MONTHLY CREDIT (linear estimate)"
+        if total / allowance * 100 >= BUDGET_WARNING_THRESHOLD_PCT:
+            return "cost-yellow", "🟡 Monthly credit running low (estimated)"
+        return "cost-green", "Within monthly credit (estimated)"
+    except (KeyError, ValueError, ArithmeticError, TypeError):
+        return "muted", "⚠️ USD credit estimate unavailable (legacy report or unverified data)"
+
+
+def credit_details(data: dict[str, Any]) -> list[tuple[str, str]]:
+    """The arithmetic estimates headroom; Cost Management is not a credit ledger."""
+    if credit_status(data)[0] == "muted":
+        return [("USD credit estimate", "unavailable (legacy report or unverified data)")]
+    total, allowance, projected = _credit_amounts(data)
+    usd = {"currency": "USD"}
+    return [
+        ("Billing-cycle spend (USD)", format_cost(total, usd)),
+        ("Monthly credit allowance (configured)", format_cost(allowance, usd)),
+        ("Estimated credit left", format_cost(allowance - total, usd)),
+        ("Cycle-end estimate (USD, linear)", format_cost(projected, usd)),
+        ("USD source", "Azure Cost Management CostUSD; no local currency conversion"),
+        ("Latest USD usage", str(data.get("latest_usage_date_usd", "unavailable"))),
+        ("Credit status", credit_status(data)[1]),
+        ("Credit estimate caveat", "Usage estimate, not a credit balance; costs may lag"),
+    ]
+
+
 def cost_details(data: dict[str, Any]) -> list[tuple[str, str]]:
-    """Shared labels and metadata for Markdown, HTML and Telegram."""
+    """Detailed labels and metadata for Markdown and HTML, not the phone summary."""
     period = (
         f"{data['period_start']} through {data['period_end']} (inclusive)"
         if data.get("period_start") and data.get("period_end") else "unknown (legacy report)"
@@ -288,7 +359,7 @@ def cost_details(data: dict[str, Any]) -> list[tuple[str, str]]:
     remaining = data.get("remaining_budget", data.get("remaining"))
     budget_unit = {"currency": data.get("budget_currency")}
     remaining_unit = budget_unit if data.get("budget_currency") == data.get("currency") else {}
-    return [
+    return credit_details(data) + [
         ("Billing period", period),
         ("Next reset", data.get("next_reset", "unknown")),
         ("Budget name", data.get("budget_name", "unknown (legacy report)")),
