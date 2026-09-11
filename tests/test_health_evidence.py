@@ -241,6 +241,36 @@ def test_repeat_finding_does_not_create_or_assign_another_issue(
     assign.assert_not_called()
 
 
+def test_five_existing_issues_do_not_hide_the_next_untracked_finding(probe: Mock) -> None:
+    request = httpx.Request("GET", "https://api.github.com")
+    existing = [
+        httpx.Response(200, request=request, json=[{
+            "body": f"<!-- autorefine-health:url:app{index} -->",
+            "title": "Already tracked", "html_url": f"https://github.com/samoletovs/app{index}/issues/1",
+        }])
+        for index in range(5)
+    ]
+    probe.get.side_effect = existing + [httpx.Response(200, request=request, json=[])]
+    url = "https://github.com/samoletovs/app5/issues/2"
+    probe.post.return_value = httpx.Response(
+        201, request=request, json={"html_url": url, "number": 2},
+    )
+    issues = [
+        {"repo": f"app{index}", "title": "Investigate URL health", "body": "HTTP 503",
+         "finding_id": f"url:app{index}"}
+        for index in range(6)
+    ]
+
+    created = health_scan.create_github_issues(
+        "test-token", issues, [issue["repo"] for issue in issues], False,
+    )
+
+    assert created == [url]
+    assert probe.get.call_count == 6
+    probe.post.assert_called_once()
+    assert "/app5/issues" in probe.post.call_args.args[0]
+
+
 def test_failed_duplicate_read_never_creates_an_issue(probe: Mock) -> None:
     probe.get.return_value = httpx.Response(
         403, request=httpx.Request("GET", "https://api.github.com"),

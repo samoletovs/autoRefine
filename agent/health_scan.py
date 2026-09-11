@@ -1039,7 +1039,9 @@ def create_github_issues(
     }
     created: list[str] = []
     with httpx.Client(headers=headers, timeout=30) as client:
-        for issue in issues[:5]:
+        for issue in issues:
+            if len(created) >= 5:
+                break
             repo = issue.get("repo", "")
             if repo not in allowed_repos:
                 log.warning("Health issue target is outside scan scope: %s", repo)
