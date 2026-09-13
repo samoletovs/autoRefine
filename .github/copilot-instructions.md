@@ -3,6 +3,30 @@
 <!-- CANONICAL — maintained in samoletovs/nauroLabs-github at config/copilot-pr-guard.md.
      Rolled out by scripts/install-pr-guard.ps1. Edit it there, not in the copy. -->
 
+## Save and deliver each coding session
+
+Use one task branch; parallel sessions editing the same repo need separate
+worktrees. Fetch before starting, and never switch or update another session's
+checkout. Commit only your own task changes and push meaningful checkpoints.
+Before pausing, verify the remote contains your commit; an upstream alone is
+not proof of publication.
+
+For already approved work, finish testing and independent review, open a useful
+PR and use the existing checked merge process without asking for the same
+approval again. Do not bypass failed checks or privacy hooks.
+
+If blocked, preserve the reviewed, non-sensitive changes on a pushed branch and
+record the blocker on the issue. Do not open a PR until it is finished. Draft
+status is not a hold: the janitor can un-draft Copilot PRs. An existing PR that
+must remain held should be closed without deleting the saved branch.
+
+Every coding handoff must state: commit, verified push, PR, tests, independent
+review, merge, deployment and remaining work. "Implemented" is not "delivered".
+Where the governance tools are available, run `scripts/session-finish.ps1`
+against the exact checkout (`-RequireMerged` for delivery; `-Held` for a saved
+unfinished branch). Otherwise verify those states with Git and GitHub directly.
+Do not claim merged or deployed without evidence.
+
 ## Before you open a pull request
 
 Measured across 131 merged PRs in this lab: **15% were self-declared `[WIP]` or
