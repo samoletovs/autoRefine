@@ -520,14 +520,17 @@ def plan_project(
     from azure.ai.agents import AgentsClient
     from azure.identity import DefaultAzureCredential
 
-    from agent.foundry_agent import build_plan_task, create_agent, run_agent
+    from agent.foundry_agent import build_plan_task, cleanup_agent, create_agent, run_agent
 
     client = AgentsClient(
         endpoint=endpoint,
         credential=DefaultAzureCredential(),
     )
 
-    agent_id = create_agent(client, mode="plan", model=model)
+    agent_id = create_agent(
+        client, mode="plan", model=model,
+        orphan_client=AgentsClient(endpoint=endpoint, credential=DefaultAzureCredential()),
+    )
 
     try:
         task = build_plan_task(findings, config)
@@ -541,8 +544,7 @@ def plan_project(
             )
         return plan
     finally:
-        client.delete_agent(agent_id)
-        log.info("Agent cleaned up.")
+        cleanup_agent(client, agent_id)
 
 
 def _priority_in_scope(priority: str, allowed: set[str] | None = None) -> bool:
@@ -1099,10 +1101,13 @@ def plan_functional(
     from azure.ai.agents import AgentsClient
     from azure.identity import DefaultAzureCredential
 
-    from agent.foundry_agent import create_agent, run_agent
+    from agent.foundry_agent import cleanup_agent, create_agent, run_agent
 
     client = AgentsClient(endpoint=endpoint, credential=DefaultAzureCredential())
-    agent_id = create_agent(client, mode="plan", model=model)
+    agent_id = create_agent(
+        client, mode="plan", model=model,
+        orphan_client=AgentsClient(endpoint=endpoint, credential=DefaultAzureCredential()),
+    )
     wiki_context = _extract_relevant_wiki_insights(config.name)
     if wiki_context:
         log.info(
@@ -1133,8 +1138,7 @@ def plan_functional(
                 time.sleep(FUNCTIONAL_RETRY_DELAY_S)
         return None
     finally:
-        client.delete_agent(agent_id)
-        log.info("Functional agent cleaned up.")
+        cleanup_agent(client, agent_id)
 
 
 def _normalize_priority(raw: object) -> str:
@@ -1712,6 +1716,7 @@ def refine_project(
         FoundryRunIncompleteError,
         _handle_run_tests,
         build_refine_task,
+        cleanup_agent,
         create_agent,
         run_agent,
     )
@@ -1740,7 +1745,10 @@ def refine_project(
             log.error("Cannot create branch — skipping refine")
             return False
 
-    agent_id = create_agent(client, mode="refine", model=model)
+    agent_id = create_agent(
+        client, mode="refine", model=model,
+        orphan_client=AgentsClient(endpoint=endpoint, credential=DefaultAzureCredential()),
+    )
     preserve_changes = False
 
     try:
@@ -1860,8 +1868,7 @@ def refine_project(
                 except (OSError, subprocess.SubprocessError) as exc:
                     log.error("Could not roll back unvalidated refine changes: %s", exc)
         finally:
-            client.delete_agent(agent_id)
-            log.info("Agent cleaned up.")
+            cleanup_agent(client, agent_id)
 
 
 def run_health_scan_mode(

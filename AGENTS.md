@@ -96,13 +96,32 @@ agents**, *not* the retired Azure OpenAI Assistants API — see
 1800 seconds; a positive integer). It covers setup, every status including
 queued/in_progress/cancelling, tool dispatch, retry waits and final result retrieval.
 SDK requests and the test subprocess receive the remaining budget; SDK-internal
-retries are disabled in favor of the bounded application retries. A synchronous
-operation that ignores its timeout cannot be preempted locally, but an overdue
-result is never accepted. Expiry raises `FoundryRunAbortedError` with
+retries are disabled in favor of the bounded application retries. Socket timeouts
+measure inactivity, not elapsed time: a continuously arriving body can evade them.
+`agent/sdk_boundary.py` therefore imposes an absolute **caller** deadline around
+the whole synchronous SDK operation, including authentication and body consumption.
+One serialized daemon-worker lease owns the client; after timeout it is retired
+against further work and only cleanup can use it. No model tool or publication
+runs on that worker. A late-created agent, thread or run ID is used only for cleanup,
+never delivered into an ended run. Expiry raises `FoundryRunAbortedError` with
 `reason="run_deadline"` so functional planning cannot replay it and refine rolls back.
-Cancellation and thread deletion each have a separate 10-second best-effort grace;
-cleanup failures are logged without hiding the primary failure. Cost rows retain
-the guard, status and elapsed duration.
+Cancellation, thread deletion and agent deletion each have a separate 10-second
+caller grace. Expected Azure/OS cleanup failures are logged without hiding the
+primary result/error; unexpected programming errors still propagate. All three
+plan/functional/refine entrypoints use the same bounded agent-deletion helper.
+Cost rows retain the guard, status and elapsed duration.
+
+Python cannot safely kill an arbitrary synchronous SDK/auth thread. A stalled
+worker may therefore outlive its caller; it is daemonized and cannot hold process
+exit. Its client must **not** be closed or reused by another request while owned.
+Cleanup queues behind the active call rather than racing a closed/deleted client.
+If it never returns, cleanup remains best-effort/unconfirmed (the existing orphan
+sweep is still necessary). This is a bounded caller contract, not a claim that a
+remote request has been cancelled merely because the local deadline expired.
+The three production entrypoints give `create_agent` a separate `orphan_client`
+for best-effort sweeping. A stalled sweep retires only that housekeeping client's
+lease, so healthy work still starts. Direct `create_agent` callers may omit that
+optional client to skip sweeping; never pass the work client itself.
 
 Functional ideation has no idea quota. `submit_plan(outcome="no_gap", improvements=[],
 summary=..., no_gap_evidence=[{"path": ..., "observation": ...}])` is a successful
@@ -113,6 +132,9 @@ and filing. Rejected submissions get one-based item/field errors and at most two
 repair opportunities (three rejected submissions total). Only a wholly acceptable
 plan from a completed run is returned; the final filer still independently rejects
 unspecified memos. Text fallback cannot bypass validation.
+Supplied `category` values must be strings; omission retains the existing
+`quality` default. Invalid values receive the same item-level repair feedback
+and are also refused by the independent filing gate.
 
 ## What the score actually measures
 

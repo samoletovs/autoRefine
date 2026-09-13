@@ -183,10 +183,10 @@ class FakeSweepClient:
         self._undeletable = undeletable or set()
         self.deleted: list[str] = []
 
-    def list_agents(self) -> list[SimpleNamespace]:
+    def list_agents(self, **_kwargs: object) -> list[SimpleNamespace]:
         return self._agents
 
-    def delete_agent(self, agent_id: str) -> None:
+    def delete_agent(self, agent_id: str, **_kwargs: object) -> None:
         if agent_id in self._undeletable:
             raise HttpResponseError("boom")
         self.deleted.append(agent_id)
@@ -251,7 +251,9 @@ def test_create_agent_sweeps_orphans_before_creating(
     monkeypatch.setattr(foundry_agent, "FunctionTool", FakeFunctionTool)
     client = FakeSweepClient([_agent("autorefine", "stale", timedelta(days=3))])
 
-    assert foundry_agent.create_agent(client, mode="plan") == "agent-new"
+    assert foundry_agent.create_agent(
+        FakeSweepClient([]), mode="plan", orphan_client=client,
+    ) == "agent-new"
     assert client.deleted == ["stale"]
 
 
@@ -272,6 +274,10 @@ class TestSweepFailsOpen:
     a sweep that caught only ``HttpResponseError`` let a transient network blip
     during housekeeping abort agent creation and take the whole run with it.
     """
+
+    @pytest.fixture(autouse=True)
+    def no_retry_wait(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(foundry_agent._call_foundry_with_retry.retry, "sleep", lambda _: None)
 
     @pytest.mark.parametrize(
         "error",
@@ -300,7 +306,9 @@ class TestSweepFailsOpen:
 
         client = FakeSweepClient([])
         with patch.object(client, "list_agents", side_effect=error):
-            assert foundry_agent.create_agent(client, mode="plan") == "agent-new"
+            assert foundry_agent.create_agent(
+                FakeSweepClient([]), mode="plan", orphan_client=client,
+            ) == "agent-new"
 
     def test_delete_failure_is_swallowed_and_the_sweep_continues(self) -> None:
         client = FakeSweepClient(
@@ -311,7 +319,7 @@ class TestSweepFailsOpen:
         )
         real_delete = client.delete_agent
 
-        def flaky(agent_id: str) -> None:
+        def flaky(agent_id: str, **_kwargs: object) -> None:
             if agent_id == "unreachable":
                 raise ServiceRequestError("connection reset")
             real_delete(agent_id)
@@ -328,7 +336,9 @@ class TestSweepFailsOpen:
 
         client = FakeSweepClient([])
         with patch.object(client, "list_agents", side_effect=RuntimeError("bad payload")):
-            assert foundry_agent.create_agent(client, mode="plan") == "agent-new"
+            assert foundry_agent.create_agent(
+                FakeSweepClient([]), mode="plan", orphan_client=client,
+            ) == "agent-new"
 
 
 class TestSweepTimestampHandling:

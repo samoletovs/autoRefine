@@ -6,7 +6,7 @@ import json
 import logging
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import ANY, Mock
 
 import pytest
 
@@ -82,7 +82,9 @@ def test_evidenced_no_gap_finishes_without_retry_filer_or_notification(
     ) == []
     assert m.file_ideas_for_plan("owner/fixture", result) == 0
     assert client.threads.create.call_count == 1
-    client.delete_agent.assert_called_once_with("agent-1")
+    client.delete_agent.assert_called_once_with(
+        "agent-1", connection_timeout=ANY, read_timeout=ANY, retry_total=0,
+    )
     assert client.deleted_threads == ["thread-1"]
     filer.assert_not_called()
     notifier.assert_not_called()
@@ -245,3 +247,58 @@ def test_repeating_an_accepted_plan_still_trips_the_existing_stuck_guard(tmp_pat
     assert error.value.reason == "stuck_tool_loop"
     assert client.rounds == f.DEFAULT_STUCK_REPEATS
     assert client.cancelled == ["run-1"]
+
+
+def test_null_category_is_rejected_in_dispatch_and_corrected_before_filing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    invalid = valid_plan()
+    invalid["improvements"][0]["category"] = None
+    client = _ToolLoopClient(lambda n: _submit(invalid) if n == 1 else None)
+    responses: list[dict] = []
+
+    def submit_outputs(**kwargs: object) -> SimpleNamespace:
+        response = json.loads(kwargs["tool_outputs"][0].output)
+        responses.append(response)
+        if len(responses) == 1:
+            assert response["status"] == "plan_rejected"
+            assert response["errors"][0]["field"] == "category"
+            assert response["errors"][0]["item"] == 1
+            return SimpleNamespace(
+                id="run-1", status="requires_action",
+                required_action=f.SubmitToolOutputsAction(_submit(valid_plan())),
+            )
+        return SimpleNamespace(id="run-1", status="completed")
+
+    client.runs.submit_tool_outputs = submit_outputs
+    result = f.run_agent(client, "agent", tmp_path, _config(), "task")
+    assert result["improvements"][0]["category"] == "feature"
+    monkeypatch.setattr(m, "_resolve_file_idea_script", lambda: tmp_path / "file-idea.py")
+    monkeypatch.setattr(m, "_open_idea_titles", lambda _: [])
+    monkeypatch.setattr(m, "_discover_file_idea_options", lambda _: {"--repo"})
+    file_call = Mock(return_value=SimpleNamespace(returncode=0))
+    monkeypatch.setattr(m.subprocess, "run", file_call)
+    assert m.file_ideas_for_plan("owner/fixture", result) == 1
+    file_call.assert_called_once()
+    file_call.reset_mock()
+    assert m.file_ideas_for_plan("owner/fixture", invalid) == 0
+    file_call.assert_not_called()
+
+
+def test_repeated_invalid_category_exhausts_the_existing_repair_budget(tmp_path: Path) -> None:
+    invalid = valid_plan()
+    invalid["improvements"][0]["category"] = None
+    client = _ToolLoopClient(lambda n: _submit(invalid))
+    with pytest.raises(f.FoundryRunAbortedError) as error:
+        f.run_agent(client, "agent", tmp_path, _config(), "task")
+    assert error.value.reason == "invalid_plan"
+    assert client.rounds == f.MAX_PLAN_REJECTIONS
+
+
+def test_omitted_category_keeps_the_existing_default(tmp_path: Path) -> None:
+    plan = valid_plan()
+    del plan["improvements"][0]["category"]
+    client = _ToolLoopClient(lambda n: _submit(plan) if n == 1 else None)
+    result = f.run_agent(client, "agent", tmp_path, _config(), "task")
+    assert is_specified(result["improvements"][0])
+    assert m._map_improvement_type(result["improvements"][0].get("category", "quality")) == "refactor"

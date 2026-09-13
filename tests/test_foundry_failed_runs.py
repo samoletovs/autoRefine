@@ -264,7 +264,9 @@ def test_terminal_failure_is_not_replayed_by_functional_planning(
         agent_main.plan_functional(Path("."), config)
 
     client.threads.create.assert_called_once()
-    client.delete_agent.assert_called_once_with("agent")
+    client.delete_agent.assert_called_once_with(
+        "agent", connection_timeout=ANY, read_timeout=ANY, retry_total=0,
+    )
 
 
 def test_cancelled_run_is_not_replayed_by_functional_planning(
@@ -283,4 +285,6 @@ def test_cancelled_run_is_not_replayed_by_functional_planning(
         agent_main.plan_functional(Path("."), config)
 
     client.runs.create.assert_called_once()
-    client.delete_agent.assert_called_once_with("agent")
+    client.delete_agent.assert_called_once_with(
+        "agent", connection_timeout=ANY, read_timeout=ANY, retry_total=0,
+    )

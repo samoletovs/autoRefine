@@ -82,7 +82,10 @@ def test_refine_project_rolls_back_and_returns_false_on_incomplete(
         (Path(project_dir) / "half_done.py").write_text("# partial\n", encoding="utf-8")
         raise FoundryRunIncompleteError("run-1", "max_prompt_tokens")
 
-    monkeypatch.setattr("azure.ai.agents.AgentsClient", lambda **_kw: SimpleNamespace(delete_agent=lambda _id: None))
+    monkeypatch.setattr(
+        "azure.ai.agents.AgentsClient",
+        lambda **_kw: SimpleNamespace(delete_agent=lambda _id, **kw: None),
+    )
     monkeypatch.setattr("azure.identity.DefaultAzureCredential", lambda **_kw: object())
     monkeypatch.setattr("agent.foundry_agent.create_agent", lambda *_a, **_kw: "agent-1")
     monkeypatch.setattr("agent.foundry_agent.run_agent", fake_run_agent)

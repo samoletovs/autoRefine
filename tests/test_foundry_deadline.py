@@ -6,7 +6,7 @@ import json
 import logging
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import ANY, Mock
 
 import httpx
 import pytest
@@ -240,7 +240,9 @@ def test_deadline_is_not_replayed_by_functional_planning(
 
     assert error.value.reason == "run_deadline"
     assert client.threads.create.call_count == 1
-    client.delete_agent.assert_called_once_with("agent")
+    client.delete_agent.assert_called_once_with(
+        "agent", connection_timeout=ANY, read_timeout=ANY, retry_total=0,
+    )
 
 
 def test_transport_failure_after_expiry_still_has_deadline_outcome(

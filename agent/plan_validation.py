@@ -26,6 +26,8 @@ def specificity_errors(improvement: dict) -> dict[str, str]:
         re.sub(r"[^0-9a-zA-Z]+", " ", str(improvement.get("title", ""))).lower().split()
     )
     errors = {}
+    if "category" in improvement and not isinstance(improvement["category"], str):
+        errors["category"] = "Supply a category string, e.g. 'feature', or omit it for 'quality'."
     for field, guidance in (
         ("approach", "Name the actual files, functions or commands to change."),
         ("success_criteria", "Give an observable pass/fail check a reviewer can run."),

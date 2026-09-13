@@ -52,6 +52,7 @@ from tenacity import (
 
 from agent.config import ProjectConfig
 from agent.plan_validation import plan_errors
+from agent.sdk_boundary import SdkBoundary, SdkDeadlineExceeded, client_boundary
 from agent.tools.quality_tools import plannable_findings
 
 log = logging.getLogger(__name__)
@@ -359,8 +360,7 @@ def _log_retry_attempt(retry_state: RetryCallState) -> None:
     )
 
 
-class _RunDeadlineExceeded(TimeoutError):
-    """Internal deadline signal, translated to the normal incomplete-run contract."""
+_RunDeadlineExceeded = SdkDeadlineExceeded
 
 
 def _remaining_seconds(deadline: float) -> float:
@@ -390,20 +390,27 @@ def _deadline_retry_wait(retry_state: RetryCallState) -> float:
 )
 def _call_foundry_with_retry(
     operation: str, fn: Callable[..., T], *args: Any,
-    deadline: float | None = None, **kwargs: Any,
+    deadline: float | None = None, boundary: SdkBoundary | None = None,
+    cleanup: bool = False, late_result: Callable[[T], None] | None = None, **kwargs: Any,
 ) -> T:
     """Retry transient failures only within the remaining elapsed budget.
 
-    Disable hidden SDK retries; each application retry recomputes transport timeouts.
-    Callers check the deadline again after receiving the result so a late-created
-    run/thread ID remains available for cancellation/cleanup.
+    The worker boundary bounds the entire call, including auth and complete body
+    consumption. Transport timeouts remain helpful inactivity limits, not the gate.
+    Late-created IDs are handed only to cleanup, never back to a stopped run.
     """
     if deadline is not None:
-        remaining = _remaining_seconds(deadline)
-        kwargs.update(
-            connection_timeout=remaining / 2,
-            read_timeout=remaining / 2,
-            retry_total=0,
+        def invoke(call_deadline: float) -> T:
+            remaining = _remaining_seconds(call_deadline)
+            return fn(
+                *args, **kwargs,
+                connection_timeout=remaining / 2,
+                read_timeout=remaining / 2,
+                retry_total=0,
+            )
+
+        return (boundary or SdkBoundary()).call(
+            invoke, deadline=deadline, cleanup=cleanup, late_result=late_result,
         )
     return fn(*args, **kwargs)
 
@@ -1006,17 +1013,22 @@ def sweep_orphaned_agents(
     cutoff = datetime.now(timezone.utc) - max_age
 
     try:
-        orphans = [agent for agent in client.list_agents() if _is_sweepable_orphan(agent, cutoff)]
-    except AzureError as exc:
+        orphans = _call_foundry_with_retry(
+            "client.list_agents",
+            lambda **kw: [
+                agent for agent in client.list_agents(**kw)
+                if _is_sweepable_orphan(agent, cutoff)
+            ],
+            deadline=time.monotonic() + CLEANUP_TIMEOUT_SECONDS,
+            boundary=client_boundary(client),
+        )
+    except (AzureError, OSError, httpx.HTTPError) as exc:
         log.warning("Could not list agents to sweep orphans: %s", exc)
         return 0
 
     swept = 0
     for agent in orphans:
-        try:
-            client.delete_agent(agent.id)
-        except AzureError as exc:
-            log.warning("Could not delete orphaned agent %s: %s", agent.id, exc)
+        if not cleanup_agent(client, agent.id):
             continue
         swept += 1
         log.info("Swept orphaned agent %s (created %s)", agent.id, agent.created_at)
@@ -1030,6 +1042,8 @@ def create_agent(
     client: AgentsClient,
     mode: str = "plan",
     model: str | None = None,
+    *,
+    orphan_client: AgentsClient | None = None,
 ) -> str:
     """Create the autoRefine Foundry agent. In refine mode, includes write tools.
 
@@ -1038,14 +1052,17 @@ def create_agent(
         Pass a deployment name like ``gpt-5-mini`` (cheap tier) or
         ``gpt-5`` (deep reasoning) — the CLI ``--model`` arg threads
         through to here so callers can pick per-run.
+    :param orphan_client: Separate SDK client for fail-open housekeeping. Omit to
+        skip sweeping; an abandoned housekeeping call must not retire the work client.
     """
+    deadline = time.monotonic() + resolve_run_timeout_seconds()
     # Housekeeping only — never allowed to block agent creation. sweep_orphaned_agents
     # already swallows AzureError, so this catches what is left: a generated client can
     # raise anything on a malformed response, and losing the run to a failed *cleanup*
     # would invert the point of the sweep.
-    if hasattr(client, "list_agents"):
+    if orphan_client is not None and orphan_client is not client:
         try:
-            sweep_orphaned_agents(client)
+            sweep_orphaned_agents(orphan_client)
         except Exception as exc:  # noqa: BLE001 - cleanup must never fail the run
             log.warning("Orphan sweep failed, continuing: %s", exc)
 
@@ -1063,13 +1080,21 @@ def create_agent(
     tools = FunctionTool(functions=tool_functions)
     deployment = model or DEFAULT_DEPLOYMENT
 
-    agent = client.create_agent(
-        model=deployment,
-        name=AGENT_NAME,
-        instructions=SYSTEM_PROMPT,
-        tools=tools.definitions,
-        temperature=0.3,
-    )
+    try:
+        agent = _call_foundry_with_retry(
+            "client.create_agent", client.create_agent,
+            deadline=deadline, boundary=client_boundary(client),
+            late_result=lambda late_agent: cleanup_agent(client, late_agent.id),
+            model=deployment,
+            name=AGENT_NAME,
+            instructions=SYSTEM_PROMPT,
+            tools=tools.definitions,
+            temperature=0.3,
+        )
+    except _RunDeadlineExceeded as exc:
+        raise FoundryRunAbortedError(
+            "unknown", "run_deadline", "agent creation exceeded the caller deadline",
+        ) from exc
     log.info("Created agent: %s (mode=%s, model=%s)", agent.id, mode, deployment)
     return agent.id
 
@@ -1207,6 +1232,22 @@ def _log_run_cost(
         log.warning("Could not emit the run cost line.", exc_info=True)
 
 
+def _cancel_run(client: AgentsClient, thread_id: str, run: Any) -> None:
+    """Best-effort cancellation, including cleanup-only handling of late-created IDs."""
+    run_id = getattr(run, "id", "unknown")
+    cancel = getattr(getattr(client, "runs", None), "cancel", None)
+    if run is not None and callable(cancel):
+        try:
+            _call_foundry_with_retry(
+                "client.runs.cancel", cancel,
+                deadline=time.monotonic() + CLEANUP_TIMEOUT_SECONDS,
+                boundary=client_boundary(client), cleanup=True,
+                thread_id=thread_id, run_id=run_id,
+            )
+        except (AzureError, OSError, httpx.HTTPError) as exc:
+            log.warning("Could not cancel aborted run %s: %s", run_id, exc)
+
+
 def _abort_run(
     client: AgentsClient,
     thread_id: str,
@@ -1224,17 +1265,7 @@ def _abort_run(
     run_id = getattr(run, "id", "unknown")
     log.error("Aborting Foundry run %s (%s): %s", run_id, reason, detail)
 
-    cancel = getattr(getattr(client, "runs", None), "cancel", None)
-    if run is not None and callable(cancel):
-        try:
-            _call_foundry_with_retry(
-                "client.runs.cancel", cancel,
-                deadline=time.monotonic() + CLEANUP_TIMEOUT_SECONDS,
-                thread_id=thread_id, run_id=run_id,
-            )
-        except (AzureError, OSError, httpx.HTTPError) as exc:
-            log.warning("Could not cancel aborted run %s: %s", run_id, exc)
-
+    _cancel_run(client, thread_id, run)
     raise FoundryRunAbortedError(run_id, reason, detail)
 
 
@@ -1244,9 +1275,25 @@ def _cleanup_thread(client: AgentsClient, thread_id: str) -> None:
         _call_foundry_with_retry(
             "client.threads.delete", client.threads.delete, thread_id,
             deadline=time.monotonic() + CLEANUP_TIMEOUT_SECONDS,
+            boundary=client_boundary(client), cleanup=True,
         )
     except (AzureError, OSError, httpx.HTTPError) as exc:
         log.warning("Could not delete thread %s: %s", thread_id, exc)
+
+
+def cleanup_agent(client: AgentsClient, agent_id: str) -> bool:
+    """Bound agent deletion without masking a result/primary failure on expected errors."""
+    try:
+        _call_foundry_with_retry(
+            "client.delete_agent", client.delete_agent, agent_id,
+            deadline=time.monotonic() + CLEANUP_TIMEOUT_SECONDS,
+            boundary=client_boundary(client), cleanup=True,
+        )
+    except (AzureError, OSError, httpx.HTTPError) as exc:
+        log.warning("Could not delete agent %s: %s", agent_id, exc)
+        return False
+    log.info("Agent %s cleaned up.", agent_id)
+    return True
 
 
 def _run_status(run: Any) -> str:
@@ -1316,6 +1363,8 @@ def run_agent(
     try:
         thread = _call_foundry_with_retry(
             "client.threads.create", client.threads.create, deadline=deadline,
+            boundary=client_boundary(client),
+            late_result=lambda late_thread: _cleanup_thread(client, late_thread.id),
         )
         log.info("Thread: %s", thread.id)
         context = config.to_context()
@@ -1327,6 +1376,7 @@ def run_agent(
 
         _call_foundry_with_retry(
             "client.messages.create", client.messages.create, deadline=deadline,
+            boundary=client_boundary(client),
             thread_id=thread.id,
             role=MessageRole.USER,
             content=message_text,
@@ -1337,6 +1387,8 @@ def run_agent(
             "client.runs.create",
             client.runs.create,
             deadline=deadline,
+            boundary=client_boundary(client),
+            late_result=lambda late_run: _cancel_run(client, thread.id, late_run),
             thread_id=thread.id,
             agent_id=agent_id,
             **_prompt_budget_kwargs(client.runs.create),
@@ -1448,6 +1500,7 @@ def run_agent(
                         "client.runs.submit_tool_outputs",
                         client.runs.submit_tool_outputs,
                         deadline=deadline,
+                        boundary=client_boundary(client),
                         thread_id=thread.id,
                         run_id=run.id,
                         tool_outputs=tool_outputs,
@@ -1460,6 +1513,7 @@ def run_agent(
                 "client.runs.get",
                 client.runs.get,
                 deadline=deadline,
+                boundary=client_boundary(client),
                 thread_id=thread.id,
                 run_id=run.id,
             )
@@ -1488,6 +1542,7 @@ def run_agent(
         # Get the final message
         msg = _call_foundry_with_retry(
             "client.messages.list", _get_final_message, client, deadline=deadline,
+            boundary=client_boundary(client),
             thread_id=thread.id,
             run_id=run.id,
         )
