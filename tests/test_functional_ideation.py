@@ -8,6 +8,7 @@ API services".
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from unittest.mock import ANY
 
 import agent.main as m
 
@@ -409,7 +410,9 @@ def test_plan_functional_retries_on_transient_none(monkeypatch, tmp_path):
 
     assert calls["n"] == 2  # retried once after the transient None
     assert result == plan
-    fake_client.delete_agent.assert_called_once_with("agent-1")
+    fake_client.delete_agent.assert_called_once_with(
+        "agent-1", connection_timeout=ANY, read_timeout=ANY, retry_total=0,
+    )
 
 
 def test_plan_functional_gives_up_after_all_attempts(monkeypatch, tmp_path):
@@ -427,4 +430,6 @@ def test_plan_functional_gives_up_after_all_attempts(monkeypatch, tmp_path):
 
     assert result is None
     assert calls["n"] == m.FUNCTIONAL_PLAN_ATTEMPTS  # exhausted all attempts
-    fake_client.delete_agent.assert_called_once_with("agent-1")
+    fake_client.delete_agent.assert_called_once_with(
+        "agent-1", connection_timeout=ANY, read_timeout=ANY, retry_total=0,
+    )

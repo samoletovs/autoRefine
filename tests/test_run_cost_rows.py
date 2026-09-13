@@ -24,6 +24,7 @@ import pytest
 
 from agent import foundry_agent
 from agent.config import ProjectConfig
+from tests.plan_fixtures import valid_plan
 from tests.test_foundry_loop_guards import (  # reuse the loop-driving fakes
     _DummyToolCall,
     _ToolLoopClient,
@@ -48,7 +49,7 @@ def _plan_script(round_number: int) -> list[_DummyToolCall] | None:
             _DummyToolCall(
                 "c1",
                 "submit_plan",
-                json.dumps({"score": 71, "summary": "ok", "improvements": []}),
+                json.dumps(valid_plan(71)),
             )
         ]
     return None
@@ -206,7 +207,7 @@ def test_an_unwritable_path_does_not_fail_the_run(
         _ToolLoopClient(_plan_script), "a1", tmp_path, _config(), "task"
     )
 
-    assert result == {"score": 71, "summary": "ok", "improvements": [], "research_insights": []}
+    assert result == {**valid_plan(71), "research_insights": []}
     assert "Could not append a cost row" in caplog.text
 
 

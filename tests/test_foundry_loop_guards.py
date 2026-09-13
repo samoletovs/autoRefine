@@ -29,6 +29,7 @@ from agent.foundry_agent import (
     FoundryRunAbortedError,
     FoundryRunIncompleteError,
 )
+from tests.plan_fixtures import valid_plan
 
 # ── Fakes ────────────────────────────────────────────────────────────────────
 
@@ -69,6 +70,7 @@ class _Runs:
         agent_id: str,
         max_prompt_tokens: int | None = None,
         truncation_strategy: object = None,
+        **_kwargs: object,
     ) -> SimpleNamespace:
         return self._client.next_run()
 
@@ -78,7 +80,7 @@ class _Runs:
     def get(self, **_kwargs: object) -> SimpleNamespace:
         return self._client.next_run()
 
-    def cancel(self, *, thread_id: str, run_id: str) -> None:
+    def cancel(self, *, thread_id: str, run_id: str, **_kwargs: object) -> None:
         self._client.cancelled.append(run_id)
 
 
@@ -97,8 +99,8 @@ class _ToolLoopClient:
         self.cancelled: list[str] = []
         self.deleted_threads: list[str] = []
         self.threads = SimpleNamespace(
-            create=lambda: SimpleNamespace(id="thread-1"),
-            delete=self.deleted_threads.append,
+            create=lambda **_kwargs: SimpleNamespace(id="thread-1"),
+            delete=lambda thread_id, **_kwargs: self.deleted_threads.append(thread_id),
         )
         self.messages = SimpleNamespace(
             create=lambda **_kwargs: None,
@@ -302,6 +304,7 @@ def test_round_budget_counts_unservable_required_actions(
             agent_id: str,
             max_prompt_tokens: int | None = None,
             truncation_strategy: object = None,
+            **_kwargs: object,
         ) -> SimpleNamespace:
             return unservable
 
@@ -360,7 +363,7 @@ def _healthy_script(round_number: int) -> list[_DummyToolCall] | None:
             _DummyToolCall(
                 "c3",
                 "submit_plan",
-                json.dumps({"score": 72, "summary": "ok", "improvements": []}),
+                json.dumps(valid_plan()),
             )
         ]
     return None
@@ -374,7 +377,7 @@ def test_healthy_run_reaching_submit_plan_is_untouched(
 
     result = _run(client, tmp_path)
 
-    assert result == {"score": 72, "summary": "ok", "improvements": [], "research_insights": []}
+    assert result == {**valid_plan(), "research_insights": []}
     assert client.rounds == 4
     assert client.cancelled == [], "a healthy run must never be cancelled"
     assert client.deleted_threads == ["thread-1"]
@@ -420,7 +423,7 @@ def test_abort_never_returns_a_plan(loop_dummies: None, tmp_path: Path) -> None:
                 _DummyToolCall(
                     "c1",
                     "submit_plan",
-                    json.dumps({"score": 51, "summary": "ok", "improvements": []}),
+                    json.dumps(valid_plan(51)),
                 )
             ]
         return None if round_number > 50 else _read_call("README.md")
@@ -442,11 +445,11 @@ def test_cleanup_failure_does_not_mask_the_abort(
 
     client = _ToolLoopClient(script)
 
-    def explode(_thread_id: str) -> None:
+    def explode(_thread_id: str, **_kwargs: object) -> None:
         raise AzureError("thread delete failed")
 
     client.threads = SimpleNamespace(
-        create=lambda: SimpleNamespace(id="thread-1"),
+        create=lambda **_kwargs: SimpleNamespace(id="thread-1"),
         delete=explode,
     )
 

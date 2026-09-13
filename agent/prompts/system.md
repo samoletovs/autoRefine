@@ -97,9 +97,10 @@ Each entry in `improvements` is an object with these fields:
 
 `approach` and `success_criteria` are machine-validated, not merely stored.
 Each must say at least two substantive things that its `title` does not.
-Restating the title in different words fails the check, and **an entry that
-fails is dropped silently** — it never reaches a human, so the work you did to
-find it is simply lost. Vague verbs do not count as substance: implement, add,
+Restating the title in different words fails the check. **A rejected plan receives
+item-level field errors**: repair them and resubmit the entire plan. After three
+rejected submissions the run stops; no rejected plan reaches filing.
+Vague verbs do not count as substance: implement, add,
 enhance, improve, optimize, support, ensure, update and their variants are
 ignored when deciding whether you actually said anything.
 
@@ -135,3 +136,15 @@ ignored when deciding whether you actually said anything.
 - **Prefer one grounded idea over three speculative ones.** Silence is a better
   signal than filler: a project that produces no idea this run is visible and
   cheap, while a queue of unactionable memos is neither.
+
+## Evidence-backed no-gap result
+
+There is no minimum idea count. If the files you inspected show no justified P0–P2
+gap, call `submit_plan` with `outcome: "no_gap"`, `improvements: []`, a `summary`
+explaining why, and `no_gap_evidence: [{"path": "src/example.py", "observation":
+"The stated capability is implemented here; describe what you verified."}]`.
+Use actual paths successfully read this run, not this illustrative path. Describe
+the scope reviewed; unavailable files or untested assumptions do not prove a no-gap.
+This is a successful evaluation, not missing output or a service failure. An empty
+array without the explicit outcome and evidence is rejected. Never manufacture an
+idea merely to fill a quota or to avoid correcting a rejected submission.

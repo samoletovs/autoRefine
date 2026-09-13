@@ -92,6 +92,59 @@ Note the endpoint reads `…/api/projects/{proj}/assistants`. That is **Foundry 
 agents**, *not* the retired Azure OpenAI Assistants API — see
 [PLATFORM.md §15.2](../.github/PLATFORM.md).
 
+`AUTOREFINE_RUN_TIMEOUT_SECONDS` bounds one run's elapsed monotonic time (default
+1800 seconds; a positive integer). It covers setup, every status including
+queued/in_progress/cancelling, tool dispatch, retry waits and final result retrieval.
+SDK requests and the test subprocess receive the remaining budget; SDK-internal
+retries are disabled in favor of the bounded application retries. Socket timeouts
+measure inactivity, not elapsed time: a continuously arriving body can evade them.
+`agent/sdk_boundary.py` therefore imposes an absolute **caller** deadline around
+the whole synchronous SDK operation, including authentication and body consumption.
+One serialized daemon-worker lease owns the client; after timeout it is retired
+against further work and only cleanup can use it. No model tool or publication
+runs on that worker. A late-created agent, thread or run ID is used only for cleanup,
+never delivered into an ended run. Expiry raises `FoundryRunAbortedError` with
+`reason="run_deadline"` so functional planning cannot replay it and refine rolls back.
+Cancellation, thread deletion and agent deletion each have a separate 10-second
+caller grace. Expected Azure/OS cleanup failures are logged without hiding the
+primary result/error; unexpected programming errors still propagate. All three
+plan/functional/refine entrypoints use the same bounded agent-deletion helper.
+Cost rows retain the guard, status and elapsed duration.
+
+Python cannot safely kill an arbitrary synchronous SDK/auth thread. A stalled
+worker may therefore outlive its caller; it is daemonized and cannot hold process
+exit. Its client must **not** be closed or reused by another request while owned.
+Cleanup queues behind the active call rather than racing a closed/deleted client.
+If it never returns, cleanup remains best-effort/unconfirmed (the existing orphan
+sweep is still necessary). This is a bounded caller contract, not a claim that a
+remote request has been cancelled merely because the local deadline expired.
+For known run IDs, the production entrypoints provide an independent cancellation
+SDK client at the same endpoint using the same existing credential configuration.
+It has its own transport/lease, so cancellation need not wait for a stuck poll;
+no Azure resource or auth configuration is created or changed. Other teardown still
+queues behind the owning call. Only a service response with `status="cancelled"`
+confirms cancellation. Missing/failed responses and `cancelling` acknowledgements
+emit `cancellation_unconfirmed`, also exposed on `FoundryRunAbortedError`. A direct
+caller without an independent channel gets bounded serialized best-effort cleanup,
+not a claim that billing stopped.
+The three production entrypoints give `create_agent` a separate `orphan_client`
+for best-effort sweeping. A stalled sweep retires only that housekeeping client's
+lease, so healthy work still starts. Direct `create_agent` callers may omit that
+optional client to skip sweeping; never pass the work client itself.
+
+Functional ideation has no idea quota. `submit_plan(outcome="no_gap", improvements=[],
+summary=..., no_gap_evidence=[{"path": ..., "observation": ...}])` is a successful
+empty result only with an explanation and files successfully read in that run.
+Missing output and transient service failures still have the existing bounded retry.
+`agent/plan_validation.py` supplies the shared specificity check for tool feedback
+and filing. Rejected submissions get one-based item/field errors and at most two
+repair opportunities (three rejected submissions total). Only a wholly acceptable
+plan from a completed run is returned; the final filer still independently rejects
+unspecified memos. Text fallback cannot bypass validation.
+Supplied `category` values must be strings; omission retains the existing
+`quality` default. Invalid values receive the same item-level repair feedback
+and are also refused by the independent filing gate.
+
 ## What the score actually measures
 
 The 0-100 score is **not a quality measure — it is a coverage-weighted one**, and

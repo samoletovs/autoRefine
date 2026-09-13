@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -345,7 +345,9 @@ def test_plan_project_passes_model_to_create_agent(
 
     assert result == {"score": 80, "improvements": []}
     assert mock_create.call_args.kwargs["model"] == "gpt-4.1"
-    fake_client.delete_agent.assert_called_once_with("agent-1")
+    fake_client.delete_agent.assert_called_once_with(
+        "agent-1", connection_timeout=ANY, read_timeout=ANY, retry_total=0,
+    )
 
 
 def test_refine_project_passes_model_to_create_agent(
@@ -385,4 +387,6 @@ def test_refine_project_passes_model_to_create_agent(
 
     assert result is True
     assert mock_create.call_args.kwargs["model"] == "gpt-4.1"
-    fake_client.delete_agent.assert_called_once_with("agent-2")
+    fake_client.delete_agent.assert_called_once_with(
+        "agent-2", connection_timeout=ANY, read_timeout=ANY, retry_total=0,
+    )

@@ -15,6 +15,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from agent.config import AutoRefineConfig, ProjectConfig
+from agent.plan_validation import FILLER_WORDS as _FILLER_WORDS
+from agent.plan_validation import is_specified
 from agent.tools.github_tools import clone_repo, read_project_yaml
 from agent.tools.quality_tools import RepoContext, run_quality_checks_with_coverage
 
@@ -518,14 +520,20 @@ def plan_project(
     from azure.ai.agents import AgentsClient
     from azure.identity import DefaultAzureCredential
 
-    from agent.foundry_agent import build_plan_task, create_agent, run_agent
+    from agent.foundry_agent import build_plan_task, cleanup_agent, create_agent, run_agent
 
     client = AgentsClient(
         endpoint=endpoint,
         credential=DefaultAzureCredential(),
     )
+    client._autorefine_cancel_client = AgentsClient(
+        endpoint=endpoint, credential=DefaultAzureCredential(),
+    )
 
-    agent_id = create_agent(client, mode="plan", model=model)
+    agent_id = create_agent(
+        client, mode="plan", model=model,
+        orphan_client=AgentsClient(endpoint=endpoint, credential=DefaultAzureCredential()),
+    )
 
     try:
         task = build_plan_task(findings, config)
@@ -539,8 +547,7 @@ def plan_project(
             )
         return plan
     finally:
-        client.delete_agent(agent_id)
-        log.info("Agent cleaned up.")
+        cleanup_agent(client, agent_id)
 
 
 def _priority_in_scope(priority: str, allowed: set[str] | None = None) -> bool:
@@ -627,48 +634,6 @@ def _discover_file_idea_options(script_path: Path) -> set[str]:
 def _effort_to_requests(effort: object) -> str:
     """Map an S/M/L effort estimate to a rough Copilot premium-request count."""
     return {"S": "20", "M": "40", "L": "80"}.get(str(effort or "").strip().upper(), "40")
-
-
-def is_specified(improvement: dict) -> bool:
-    """True when the model supplied a real approach and a checkable success criterion.
-
-    We used to synthesize both from the title so file-idea.py's schema check would
-    pass. It passed; the memos were empty. 81 ideas reached the approval queue
-    carrying "Implement '<title>' (P0)" as their plan and "'<title>' is implemented
-    and usable as described" as their acceptance test — nothing a builder could act
-    on, nothing a reviewer could check, and courier's recipient management got built
-    four separate times because no one could tell it was already done.
-
-    An unspecified improvement is now skipped rather than dressed up. Silence is a
-    better signal than filler: it shows up as a project producing no ideas, which is
-    visible, instead of a queue of work nobody can start.
-    """
-    approach = str(improvement.get("approach", "")).strip()
-    criteria = str(improvement.get("success_criteria", "")).strip()
-    if not approach or not criteria:
-        return False
-    # Mirror the governance-side guard: a section must say something its title
-    # does not. Cheap local check so we skip before shelling out to file-idea.py.
-    title_words = set(re.sub(r"[^0-9a-zA-Z]+", " ", str(improvement.get("title", ""))).lower().split())
-    for section in (approach, criteria):
-        words = set(re.sub(r"[^0-9a-zA-Z]+", " ", section).lower().split())
-        if len(words - title_words - _FILLER_WORDS) < 2:
-            return False
-    return True
-
-
-# Words common to every memo, so they cannot be what makes one specific.
-_FILLER_WORDS = frozenset("""
-implement implemented implementing implementation add added adding usable used
-as per this that describe described description work works working correct
-correctly proper properly success successful successfully expected regression
-regressions existing current flow flows feature features functionality
-change changes update updates ensure ensures make makes should must will can
-no not any all and or but with without for from into the a an of to in on at
-by is are be been being was were do does done p0 p1 p2 p3
-enhance enhanced enhancing enhancement improve improved improving improvement
-better optimize optimized optimizing optimization support new
-""".split())
 
 
 def _stem(word: str) -> str:
@@ -867,6 +832,8 @@ def file_ideas_for_plan(
     dry_run: bool = False,
     allowed_priorities: set[str] | None = None,
 ) -> int:
+    if not plan.get("improvements"):
+        return 0
     script_path = _resolve_file_idea_script()
     if script_path is None:
         return 0
@@ -1093,14 +1060,18 @@ def _functional_task(cap: int = FUNCTIONAL_IDEA_CAP, avoid_context: str = "", wi
     task = (
         "Propose FUNCTIONAL improvements that advance this project's VISION — concrete, buildable "
         "user-facing capabilities that move it toward its stated purpose and goals (and toward "
-        "parity with any listed similar products). Every active experiment has meaningful next "
-        "capabilities to build: ALWAYS return at least 2 concrete feature ideas, even for a mature "
-        "or healthy project — do NOT return an empty plan. This is NOT a technical-quality review: "
+        "parity with any listed similar products). Propose only evidence-backed gaps, with no "
+        "minimum idea count. If no P0-P2 gap is justified, submit outcome='no_gap' with "
+        "improvements=[], explain why in summary, and provide no_gap_evidence entries with "
+        "path and observation for files successfully read this run. Missing evidence is not a "
+        "no-gap result; do not invent filler. This is NOT a technical-quality review: "
         "ignore tests, CI, linting, and dependencies. Explore the repo (read project.yaml, README, "
         "and key source files) to ground each idea in what already exists. For each idea set "
         "category to one of feature/functionality/ux/feature-parity/onboarding, give a specific "
         "title, a 1-2 sentence description, a realistic priority (P0-P2 — most will be P1 or P2) "
-        f"and effort (S/M/L). Submit your best {cap + 3} ideas via the submit_plan tool, strongest first."
+        "and effort (S/M/L), plus a specific approach naming files/functions and independently "
+        "checkable success_criteria. "
+        f"Submit at most {cap + 3} ideas via submit_plan, strongest first."
     )
     if wiki_context:
         task += (
@@ -1133,10 +1104,16 @@ def plan_functional(
     from azure.ai.agents import AgentsClient
     from azure.identity import DefaultAzureCredential
 
-    from agent.foundry_agent import create_agent, run_agent
+    from agent.foundry_agent import cleanup_agent, create_agent, run_agent
 
     client = AgentsClient(endpoint=endpoint, credential=DefaultAzureCredential())
-    agent_id = create_agent(client, mode="plan", model=model)
+    client._autorefine_cancel_client = AgentsClient(
+        endpoint=endpoint, credential=DefaultAzureCredential(),
+    )
+    agent_id = create_agent(
+        client, mode="plan", model=model,
+        orphan_client=AgentsClient(endpoint=endpoint, credential=DefaultAzureCredential()),
+    )
     wiki_context = _extract_relevant_wiki_insights(config.name)
     if wiki_context:
         log.info(
@@ -1153,7 +1130,9 @@ def plan_functional(
             # this is the daily sweep, and its cost rows are the ones worth telling
             # apart from an on-demand plan.
             plan = run_agent(client, agent_id, project_dir, config, task, mode="file-ideas")
-            if plan:
+            if plan is not None:
+                if plan.get("outcome") == "no_gap":
+                    log.info("Functional ideation for %s: evidence-backed no_gap.", config.name)
                 return plan
             if attempt < FUNCTIONAL_PLAN_ATTEMPTS:
                 log.warning(
@@ -1165,8 +1144,7 @@ def plan_functional(
                 time.sleep(FUNCTIONAL_RETRY_DELAY_S)
         return None
     finally:
-        client.delete_agent(agent_id)
-        log.info("Functional agent cleaned up.")
+        cleanup_agent(client, agent_id)
 
 
 def _normalize_priority(raw: object) -> str:
@@ -1744,6 +1722,7 @@ def refine_project(
         FoundryRunIncompleteError,
         _handle_run_tests,
         build_refine_task,
+        cleanup_agent,
         create_agent,
         run_agent,
     )
@@ -1756,6 +1735,9 @@ def refine_project(
     client = AgentsClient(
         endpoint=endpoint,
         credential=DefaultAzureCredential(),
+    )
+    client._autorefine_cancel_client = AgentsClient(
+        endpoint=endpoint, credential=DefaultAzureCredential(),
     )
 
     # Create branch
@@ -1772,7 +1754,10 @@ def refine_project(
             log.error("Cannot create branch — skipping refine")
             return False
 
-    agent_id = create_agent(client, mode="refine", model=model)
+    agent_id = create_agent(
+        client, mode="refine", model=model,
+        orphan_client=AgentsClient(endpoint=endpoint, credential=DefaultAzureCredential()),
+    )
     preserve_changes = False
 
     try:
@@ -1892,8 +1877,7 @@ def refine_project(
                 except (OSError, subprocess.SubprocessError) as exc:
                     log.error("Could not roll back unvalidated refine changes: %s", exc)
         finally:
-            client.delete_agent(agent_id)
-            log.info("Agent cleaned up.")
+            cleanup_agent(client, agent_id)
 
 
 def run_health_scan_mode(

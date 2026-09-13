@@ -23,6 +23,7 @@ from agent.foundry_agent import (
     _call_foundry_with_retry,
     create_agent,
 )
+from tests.plan_fixtures import valid_plan
 
 
 class FakeFunctionTool:
@@ -182,10 +183,10 @@ class FakeSweepClient:
         self._undeletable = undeletable or set()
         self.deleted: list[str] = []
 
-    def list_agents(self) -> list[SimpleNamespace]:
+    def list_agents(self, **_kwargs: object) -> list[SimpleNamespace]:
         return self._agents
 
-    def delete_agent(self, agent_id: str) -> None:
+    def delete_agent(self, agent_id: str, **_kwargs: object) -> None:
         if agent_id in self._undeletable:
             raise HttpResponseError("boom")
         self.deleted.append(agent_id)
@@ -250,7 +251,9 @@ def test_create_agent_sweeps_orphans_before_creating(
     monkeypatch.setattr(foundry_agent, "FunctionTool", FakeFunctionTool)
     client = FakeSweepClient([_agent("autorefine", "stale", timedelta(days=3))])
 
-    assert foundry_agent.create_agent(client, mode="plan") == "agent-new"
+    assert foundry_agent.create_agent(
+        FakeSweepClient([]), mode="plan", orphan_client=client,
+    ) == "agent-new"
     assert client.deleted == ["stale"]
 
 
@@ -271,6 +274,10 @@ class TestSweepFailsOpen:
     a sweep that caught only ``HttpResponseError`` let a transient network blip
     during housekeeping abort agent creation and take the whole run with it.
     """
+
+    @pytest.fixture(autouse=True)
+    def no_retry_wait(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(foundry_agent._call_foundry_with_retry.retry, "sleep", lambda _: None)
 
     @pytest.mark.parametrize(
         "error",
@@ -299,7 +306,9 @@ class TestSweepFailsOpen:
 
         client = FakeSweepClient([])
         with patch.object(client, "list_agents", side_effect=error):
-            assert foundry_agent.create_agent(client, mode="plan") == "agent-new"
+            assert foundry_agent.create_agent(
+                FakeSweepClient([]), mode="plan", orphan_client=client,
+            ) == "agent-new"
 
     def test_delete_failure_is_swallowed_and_the_sweep_continues(self) -> None:
         client = FakeSweepClient(
@@ -310,7 +319,7 @@ class TestSweepFailsOpen:
         )
         real_delete = client.delete_agent
 
-        def flaky(agent_id: str) -> None:
+        def flaky(agent_id: str, **_kwargs: object) -> None:
             if agent_id == "unreachable":
                 raise ServiceRequestError("connection reset")
             real_delete(agent_id)
@@ -327,7 +336,9 @@ class TestSweepFailsOpen:
 
         client = FakeSweepClient([])
         with patch.object(client, "list_agents", side_effect=RuntimeError("bad payload")):
-            assert foundry_agent.create_agent(client, mode="plan") == "agent-new"
+            assert foundry_agent.create_agent(
+                FakeSweepClient([]), mode="plan", orphan_client=client,
+            ) == "agent-new"
 
 
 class TestSweepTimestampHandling:
@@ -438,10 +449,10 @@ def test_handle_list_directory_blocks_traversal(tmp_path: Path) -> None:
 
 def test_handle_submit_plan_returns_ack(tmp_path: Path) -> None:
     parsed = json.loads(
-        foundry_agent._handle_submit_plan(tmp_path, {"improvements": [{"title": "one"}, {"title": "two"}]})
+        foundry_agent._handle_submit_plan(tmp_path, valid_plan())
     )
     assert parsed["status"] == "plan_received"
-    assert parsed["improvements_count"] == 2
+    assert parsed["improvements_count"] == 1
 
 
 def test_parse_plan_from_text_parses_score_and_improvements() -> None:
@@ -551,8 +562,8 @@ def test_run_agent_handles_failed_status() -> None:
     config = ProjectConfig(name="demo", purpose="", users="", stage="active")
 
     thread_api = SimpleNamespace(
-        create=lambda: SimpleNamespace(id="thread-1"),
-        delete=lambda _thread_id: None,
+        create=lambda **_kwargs: SimpleNamespace(id="thread-1"),
+        delete=lambda _thread_id, **_kwargs: None,
     )
     messages_api = SimpleNamespace(create=lambda **_kwargs: None, list=lambda **_kwargs: [])
     def create_run(
@@ -561,6 +572,7 @@ def test_run_agent_handles_failed_status() -> None:
         agent_id: str,
         max_prompt_tokens: int | None = None,
         truncation_strategy: object = None,
+        **_kwargs: object,
     ) -> SimpleNamespace:
         return SimpleNamespace(
             id="run-1", status="failed", last_error=SimpleNamespace(code="server_error")
@@ -600,8 +612,8 @@ def test_run_agent_processes_tool_calls_and_returns_plan(monkeypatch: pytest.Mon
     monkeypatch.setattr(foundry_agent, "ToolOutput", DummyToolOutput)
 
     thread_api = SimpleNamespace(
-        create=lambda: SimpleNamespace(id="thread-1"),
-        delete=lambda _thread_id: None,
+        create=lambda **_kwargs: SimpleNamespace(id="thread-1"),
+        delete=lambda _thread_id, **_kwargs: None,
     )
 
     agent_message = SimpleNamespace(
@@ -617,7 +629,7 @@ def test_run_agent_processes_tool_calls_and_returns_plan(monkeypatch: pytest.Mon
         id="run-1",
         status="requires_action",
         required_action=DummySubmitToolOutputsAction(
-            [DummyToolCall("call-1", "submit_plan", '{"score": 72, "summary": "ok", "improvements": []}')]
+            [DummyToolCall("call-1", "submit_plan", json.dumps(valid_plan()))]
         ),
     )
     completed_run = SimpleNamespace(id="run-1", status="completed")
@@ -630,6 +642,7 @@ def test_run_agent_processes_tool_calls_and_returns_plan(monkeypatch: pytest.Mon
             agent_id: str,
             max_prompt_tokens: int | None = None,
             truncation_strategy: object = None,
+            **_kwargs: object,
         ) -> SimpleNamespace:
             return requires_action_run
 
@@ -642,7 +655,7 @@ def test_run_agent_processes_tool_calls_and_returns_plan(monkeypatch: pytest.Mon
     client = SimpleNamespace(threads=thread_api, messages=messages_api, runs=RunsApi())
 
     result = foundry_agent.run_agent(client, "agent-1", Path("."), config, "task")
-    assert result == {"score": 72, "summary": "ok", "improvements": [], "research_insights": []}
+    assert result == {**valid_plan(), "research_insights": []}
 
 
 # ── PR #23 additions: retry behaviour ────────────────────────────────────────
@@ -830,6 +843,7 @@ def test_real_sdk_puts_the_prompt_budget_on_the_wire() -> None:
     class CapturingTransport(HttpTransport):
         def send(self, request, **_kwargs):  # type: ignore[no-untyped-def]
             captured["body"] = request.body
+            captured["timeouts"] = (_kwargs["connection_timeout"], _kwargs["read_timeout"])
             return CapturingResponse()
 
         def open(self) -> None: ...
@@ -846,13 +860,16 @@ def test_real_sdk_puts_the_prompt_budget_on_the_wire() -> None:
         credential=StubCredential(),
         transport=CapturingTransport(),
     )
-    client.runs.create(
+    foundry_agent._call_foundry_with_retry(
+        "client.runs.create", client.runs.create,
+        deadline=foundry_agent.time.monotonic() + 10,
         thread_id="t1",
         agent_id="a1",
         **foundry_agent._prompt_budget_kwargs(client.runs.create),
     )
 
     body = json.loads(captured["body"])  # type: ignore[arg-type]
+    assert all(0 < timeout <= 5 for timeout in captured["timeouts"])
     assert body["max_prompt_tokens"] == foundry_agent.DEFAULT_MAX_PROMPT_TOKENS
     assert body["truncation_strategy"] == {
         "type": "last_messages",
@@ -932,6 +949,7 @@ def _budget_run_client(run_status: str, incomplete_reason: str | None = None):
             agent_id: str,
             max_prompt_tokens: int | None = None,
             truncation_strategy: object = None,
+            **_kwargs: object,
         ) -> SimpleNamespace:
             recorded.update(
                 thread_id=thread_id,
@@ -943,8 +961,8 @@ def _budget_run_client(run_status: str, incomplete_reason: str | None = None):
 
     deleted: list[str] = []
     thread_api = SimpleNamespace(
-        create=lambda: SimpleNamespace(id="thread-1"),
-        delete=lambda thread_id: deleted.append(thread_id),
+        create=lambda **_kwargs: SimpleNamespace(id="thread-1"),
+        delete=lambda thread_id, **_kwargs: deleted.append(thread_id),
     )
     messages_api = SimpleNamespace(create=lambda **_kwargs: None, list=lambda **_kwargs: [])
     client = SimpleNamespace(threads=thread_api, messages=messages_api, runs=RunsApi())
