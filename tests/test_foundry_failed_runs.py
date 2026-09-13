@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, create_autospec
+from unittest.mock import ANY, Mock, create_autospec
 
 import pytest
 from azure.core.exceptions import AzureError
@@ -13,6 +13,7 @@ from azure.core.exceptions import AzureError
 from agent import foundry_agent
 from agent import main as agent_main
 from agent.config import ProjectConfig
+from tests.plan_fixtures import valid_plan
 
 
 class _Function:
@@ -49,6 +50,7 @@ def _client(error: object, *, status: str = "failed") -> SimpleNamespace:
     def create(
         *, thread_id: str, agent_id: str, max_prompt_tokens: int | None = None,
         truncation_strategy: object = None,
+        **_kwargs: object,
     ) -> SimpleNamespace:
         return SimpleNamespace(id="run-1", status=status, last_error=error)
 
@@ -75,7 +77,9 @@ def test_permanent_or_unknown_failure_is_not_a_retryable_none(error: object) -> 
     with pytest.raises(foundry_agent.FoundryRunIncompleteError):
         foundry_agent.run_agent(client, "agent", Path("."), config, "task", mode="file-ideas")
 
-    client.threads.delete.assert_called_once_with("thread-1")
+    client.threads.delete.assert_called_once_with(
+        "thread-1", connection_timeout=ANY, read_timeout=ANY, retry_total=0,
+    )
 
 
 @pytest.mark.parametrize("code", ["server_error", "rate_limit_exceeded"])
@@ -86,7 +90,9 @@ def test_transient_plan_failure_can_retry_after_thread_cleanup(code: str) -> Non
     assert foundry_agent.run_agent(
         client, "agent", Path("."), config, "task", mode="file-ideas"
     ) is None
-    client.threads.delete.assert_called_once_with("thread-1")
+    client.threads.delete.assert_called_once_with(
+        "thread-1", connection_timeout=ANY, read_timeout=ANY, retry_total=0,
+    )
 
 
 def test_refine_failure_always_reaches_the_partial_edit_rollback_handler() -> None:
@@ -129,7 +135,7 @@ def test_terminal_run_discards_captured_plan(
     status: str,
     tool_dummies: None,
 ) -> None:
-    plan = {"score": 81, "summary": "partial", "improvements": []}
+    plan = valid_plan(81)
     client = _client(None)
     client.runs.create.side_effect = None
     client.runs.create.return_value = SimpleNamespace(
@@ -148,7 +154,9 @@ def test_terminal_run_discards_captured_plan(
     assert error.value.reason == status
     assert "Raise AUTOREFINE" not in str(error.value)
     client.messages.list.assert_not_called()
-    client.threads.delete.assert_called_once_with("thread-1")
+    client.threads.delete.assert_called_once_with(
+        "thread-1", connection_timeout=ANY, read_timeout=ANY, retry_total=0,
+    )
 
 
 def test_cancelling_is_polled_until_terminal() -> None:
@@ -161,7 +169,10 @@ def test_cancelling_is_polled_until_terminal() -> None:
 
     assert error.value.reason == "cancelled"
     assert "Raise AUTOREFINE" not in str(error.value)
-    client.runs.get.assert_called_once_with(thread_id="thread-1", run_id="run-1")
+    client.runs.get.assert_called_once_with(
+        thread_id="thread-1", run_id="run-1",
+        connection_timeout=ANY, read_timeout=ANY, retry_total=0,
+    )
     client.messages.list.assert_not_called()
 
 
@@ -215,7 +226,9 @@ def test_thread_is_cleaned_when_run_lifecycle_raises(
         foundry_agent.run_agent(client, "agent", Path("."), config, "task")
 
     assert error.value is primary
-    client.threads.delete.assert_called_once_with("thread-1")
+    client.threads.delete.assert_called_once_with(
+        "thread-1", connection_timeout=ANY, read_timeout=ANY, retry_total=0,
+    )
 
 
 def test_expected_cleanup_error_does_not_mask_incomplete_state() -> None:

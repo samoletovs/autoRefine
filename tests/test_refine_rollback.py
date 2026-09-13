@@ -136,6 +136,7 @@ def test_terminal_refine_run_rolls_back_and_never_publishes(
         agent_id: str,
         max_prompt_tokens: int | None = None,
         truncation_strategy: object = None,
+        **_kwargs: object,
     ) -> SimpleNamespace:
         return SimpleNamespace(id="run-1", status="requires_action", required_action=Action())
 
@@ -182,4 +183,6 @@ def test_terminal_refine_run_rolls_back_and_never_publishes(
     assert committed == []
     assert published == []
     client.messages.list.assert_not_called()
-    client.threads.delete.assert_called_once_with("thread-1")
+    client.threads.delete.assert_called_once()
+    assert client.threads.delete.call_args.args == ("thread-1",)
+    assert client.threads.delete.call_args.kwargs["retry_total"] == 0

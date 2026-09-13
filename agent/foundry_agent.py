@@ -36,7 +36,12 @@ from azure.ai.agents.models import (
     TruncationObject,
     TruncationStrategy,
 )
-from azure.core.exceptions import AzureError, HttpResponseError
+from azure.core.exceptions import (
+    AzureError,
+    HttpResponseError,
+    ServiceRequestError,
+    ServiceResponseError,
+)
 from tenacity import (
     RetryCallState,
     retry,
@@ -46,6 +51,7 @@ from tenacity import (
 )
 
 from agent.config import ProjectConfig
+from agent.plan_validation import plan_errors
 from agent.tools.quality_tools import plannable_findings
 
 log = logging.getLogger(__name__)
@@ -134,6 +140,9 @@ MIN_MAX_TOOL_ROUNDS = 100
 # Two identical rounds running is the smallest thing that is even a repeat;
 # 1 would abort on the very first tool call.
 MIN_STUCK_REPEATS = 2
+DEFAULT_RUN_TIMEOUT_SECONDS = 1800
+CLEANUP_TIMEOUT_SECONDS = 10
+MAX_PLAN_REJECTIONS = 3
 
 T = TypeVar("T")
 
@@ -168,7 +177,7 @@ class FoundryRunAbortedError(FoundryRunIncompleteError):
     exception type would slip past that handler and let a partial result reach
     a PR.
 
-    ``reason`` is ``"max_tool_rounds"`` or ``"stuck_tool_loop"``.
+    ``reason`` names the round, stuck, elapsed-time or plan-validation guard.
     """
 
     def __init__(self, run_id: str, reason: str, detail: str) -> None:
@@ -241,6 +250,13 @@ def resolve_stuck_repeats() -> int:
         "AUTOREFINE_STUCK_REPEATS",
         DEFAULT_STUCK_REPEATS,
         MIN_STUCK_REPEATS,
+    )
+
+
+def resolve_run_timeout_seconds() -> int:
+    """Elapsed run budget, including status polls and transient retry waits."""
+    return _positive_int_from_env(
+        "AUTOREFINE_RUN_TIMEOUT_SECONDS", DEFAULT_RUN_TIMEOUT_SECONDS, 1
     )
 
 
@@ -318,7 +334,10 @@ def _is_retryable_foundry_exception(exception: BaseException) -> bool:
 
     return isinstance(
         exception,
-        (httpx.RemoteProtocolError, httpx.ConnectError, httpx.TimeoutException),
+        (
+            ServiceRequestError, ServiceResponseError,
+            httpx.RemoteProtocolError, httpx.ConnectError, httpx.TimeoutException,
+        ),
     )
 
 
@@ -340,15 +359,52 @@ def _log_retry_attempt(retry_state: RetryCallState) -> None:
     )
 
 
+class _RunDeadlineExceeded(TimeoutError):
+    """Internal deadline signal, translated to the normal incomplete-run contract."""
+
+
+def _remaining_seconds(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _RunDeadlineExceeded("Foundry run elapsed-time budget exhausted")
+    return remaining
+
+
+_foundry_retry_wait = wait_random_exponential(multiplier=1, max=60)
+
+
+def _deadline_retry_wait(retry_state: RetryCallState) -> float:
+    delay = _foundry_retry_wait(retry_state)
+    deadline = retry_state.kwargs.get("deadline")
+    if deadline is not None:
+        delay = min(delay, max(0.0, deadline - time.monotonic()))
+    return delay
+
+
 @retry(
     retry=retry_if_exception(_is_retryable_foundry_exception),
-    wait=wait_random_exponential(multiplier=1, max=60),
+    wait=_deadline_retry_wait,
     stop=stop_after_attempt(MAX_FOUNDRY_RETRY_ATTEMPTS),
     reraise=True,
     before_sleep=_log_retry_attempt,
 )
-def _call_foundry_with_retry(operation: str, fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
-    """Call a Foundry SDK operation with transient-failure retries."""
+def _call_foundry_with_retry(
+    operation: str, fn: Callable[..., T], *args: Any,
+    deadline: float | None = None, **kwargs: Any,
+) -> T:
+    """Retry transient failures only within the remaining elapsed budget.
+
+    Disable hidden SDK retries; each application retry recomputes transport timeouts.
+    Callers check the deadline again after receiving the result so a late-created
+    run/thread ID remains available for cancellation/cleanup.
+    """
+    if deadline is not None:
+        remaining = _remaining_seconds(deadline)
+        kwargs.update(
+            connection_timeout=remaining / 2,
+            read_timeout=remaining / 2,
+            retry_total=0,
+        )
     return fn(*args, **kwargs)
 
 
@@ -381,6 +437,8 @@ def submit_plan(
     summary: str,
     improvements: list,
     research_insights: list | None = None,
+    outcome: str = "improvements",
+    no_gap_evidence: list | None = None,
 ) -> str:
     """Submit a structured improvement plan after analyzing the project.
 
@@ -392,6 +450,9 @@ def submit_plan(
         of the title. `success_criteria` must be checkable by someone who did not do
         the work, e.g. "pytest exits 0 with >=60 passing tests", not "it is implemented".
     :param research_insights: Insights from researching similar products
+    :param outcome: 'improvements', or 'no_gap' if no evidence-backed P0-P2 gap exists.
+    :param no_gap_evidence: For no_gap, list objects with path and observation for files
+        successfully read this run. Explain the no-gap conclusion in summary and use [] improvements.
     """
     return ""
 
@@ -636,7 +697,9 @@ def _terminal_tool_error(reason: str) -> str:
     })
 
 
-def _handle_run_tests(project_dir: Path, _args: dict) -> str:
+def _handle_run_tests(
+    project_dir: Path, _args: dict, *, timeout_seconds: float = 300,
+) -> str:
     """Run the project's test suite.
 
     A tool the model calls must never be able to abort the run. Whichever runner is
@@ -679,14 +742,16 @@ def _handle_run_tests(project_dir: Path, _args: dict) -> str:
             encoding="utf-8",
             errors="replace",
             env=_test_subprocess_env(),
-            timeout=300,
+            timeout=timeout_seconds,
         )
     except FileNotFoundError:
         return _terminal_tool_error(
             f"Test runner '{cmd[0]}' is not installed in this environment."
         )
     except subprocess.TimeoutExpired:
-        return json.dumps({"error": "Test run timed out after 300s", "passed": False})
+        return json.dumps({
+            "error": f"Test run timed out after {timeout_seconds:g}s", "passed": False,
+        })
     except OSError as exc:
         return json.dumps({"error": f"Could not run tests: {exc}", "passed": False})
 
@@ -789,12 +854,24 @@ def _normalize_plan_args(args: dict) -> dict:
     normalized["score"] = _coerce_int(args.get("score"), default=0)
     normalized["summary"] = str(args.get("summary", "") or "")
     raw_improvements = args.get("improvements")
-    improvements = [item for item in _coerce_list(raw_improvements) if isinstance(item, dict)]
+    improvements = _coerce_list(raw_improvements)
+    decoded_array = isinstance(raw_improvements, list)
     # gpt-4o-mini sometimes passes improvements as a numbered free-text string that
     # isn't valid JSON; recover the structured items so ideas aren't dropped.
-    if not improvements and isinstance(raw_improvements, str) and raw_improvements.strip():
-        improvements = _parse_improvements_list(raw_improvements)
-    normalized["improvements"] = improvements
+    if isinstance(raw_improvements, str) and raw_improvements.strip():
+        try:
+            decoded_array = isinstance(json.loads(raw_improvements), list)
+        except (json.JSONDecodeError, ValueError):
+            improvements = _parse_improvements_list(raw_improvements)
+    # Missing/malformed output must not turn into a valid empty no-gap result.
+    if raw_improvements is None or (
+        not isinstance(raw_improvements, list)
+        and not improvements
+        and not decoded_array
+    ):
+        normalized["improvements"] = None
+    else:
+        normalized["improvements"] = improvements
     research_insights = args.get("research_insights")
     if isinstance(research_insights, str):
         normalized["research_insights"] = research_insights
@@ -805,10 +882,27 @@ def _normalize_plan_args(args: dict) -> dict:
     return normalized
 
 
-def _handle_submit_plan(_project_dir: Path, args: dict) -> str:
-    """Receive the structured plan from the agent. Just acknowledge — main.py processes it."""
-    improvements = _coerce_list(args.get("improvements"))
-    return json.dumps({"status": "plan_received", "improvements_count": len(improvements)})
+def _handle_submit_plan(
+    _project_dir: Path, args: dict, *, read_paths: set[str] | None = None,
+) -> str:
+    """Validate before acknowledgement, while the model can still repair its memo."""
+    if not isinstance(args, dict):
+        return json.dumps({
+            "status": "plan_rejected",
+            "errors": [{"item": None, "field": "arguments", "error": "Supply a JSON object."}],
+        })
+    plan = _normalize_plan_args(args)
+    errors = plan_errors(plan, read_paths=read_paths or set())
+    if errors:
+        return json.dumps({
+            "status": "plan_rejected",
+            "errors": errors,
+            "instruction": "Repair the named fields and resubmit the complete plan. "
+            "Use evidence-backed no_gap only when justified; never replace errors with filler.",
+        })
+    return json.dumps({
+        "status": "plan_received", "improvements_count": len(plan["improvements"]),
+    })
 
 
 def _handle_write_project_file(project_dir: Path, args: dict) -> str:
@@ -1131,10 +1225,14 @@ def _abort_run(
     log.error("Aborting Foundry run %s (%s): %s", run_id, reason, detail)
 
     cancel = getattr(getattr(client, "runs", None), "cancel", None)
-    if callable(cancel):
+    if run is not None and callable(cancel):
         try:
-            cancel(thread_id=thread_id, run_id=run_id)
-        except (AzureError, OSError) as exc:
+            _call_foundry_with_retry(
+                "client.runs.cancel", cancel,
+                deadline=time.monotonic() + CLEANUP_TIMEOUT_SECONDS,
+                thread_id=thread_id, run_id=run_id,
+            )
+        except (AzureError, OSError, httpx.HTTPError) as exc:
             log.warning("Could not cancel aborted run %s: %s", run_id, exc)
 
     raise FoundryRunAbortedError(run_id, reason, detail)
@@ -1143,14 +1241,34 @@ def _abort_run(
 def _cleanup_thread(client: AgentsClient, thread_id: str) -> None:
     """Delete one run thread without hiding expected service/OS cleanup failures."""
     try:
-        _call_foundry_with_retry("client.threads.delete", client.threads.delete, thread_id)
-    except (AzureError, OSError) as exc:
+        _call_foundry_with_retry(
+            "client.threads.delete", client.threads.delete, thread_id,
+            deadline=time.monotonic() + CLEANUP_TIMEOUT_SECONDS,
+        )
+    except (AzureError, OSError, httpx.HTTPError) as exc:
         log.warning("Could not delete thread %s: %s", thread_id, exc)
 
 
 def _run_status(run: Any) -> str:
     status = getattr(run, "status", None)
     return str(getattr(status, "value", status) or "unknown").lower()
+
+
+def _get_final_message(
+    client: AgentsClient, *, thread_id: str, run_id: str, **kwargs: Any,
+) -> Any:
+    """Fetch only the latest message, inside the retry/deadline boundary.
+
+    SDK list() is lazy and limit is a page size, not an iteration limit.
+    Recreate the pager on retry; never pay to walk the rest of the thread.
+    """
+    messages = client.messages.list(
+        thread_id=thread_id, run_id=run_id, order=ListSortOrder.DESCENDING,
+        limit=1, **kwargs,
+    )
+    pages = getattr(messages, "by_page", None)
+    first_page = next(pages(), []) if callable(pages) else messages
+    return next(iter(first_page), None)
 
 
 def run_agent(
@@ -1164,9 +1282,9 @@ def run_agent(
 ) -> dict | None:
     """Run the agent with a task message. Returns the parsed plan or None.
 
-    Two local cost guards bound the tool-calling loop, which is otherwise
-    unbounded: a hard round ceiling (``AUTOREFINE_MAX_TOOL_ROUNDS``) and a
-    stuck detector (``AUTOREFINE_STUCK_REPEATS``). Either firing raises
+    Local guards bound tool rounds, repeated calls, rejected submissions and
+    elapsed time (``AUTOREFINE_RUN_TIMEOUT_SECONDS``), including status polling.
+    Any guard firing raises
     :class:`FoundryRunAbortedError` rather than returning ``None`` — callers
     read ``None`` as "the model declined to plan" and retry it, which would
     pay for a spinning run two more times.
@@ -1180,10 +1298,10 @@ def run_agent(
     """
     max_tool_rounds = resolve_max_tool_rounds()
     stuck_repeats = resolve_stuck_repeats()
+    timeout_seconds = resolve_run_timeout_seconds()
     started = time.monotonic()
-
-    thread = client.threads.create()
-    log.info("Thread: %s", thread.id)
+    deadline = started + timeout_seconds
+    thread: Any = None
 
     run: Any = None
     plan_result: dict | None = None
@@ -1192,8 +1310,14 @@ def run_agent(
     guard_fired: str | None = None
     last_signature: str | None = None
     repeat_streak = 0
+    plan_rejections = 0
+    read_paths: set[str] = set()
 
     try:
+        thread = _call_foundry_with_retry(
+            "client.threads.create", client.threads.create, deadline=deadline,
+        )
+        log.info("Thread: %s", thread.id)
         context = config.to_context()
         message_text = f"""## Project context
 {context}
@@ -1201,7 +1325,8 @@ def run_agent(
 ## Task
 {task}"""
 
-        client.messages.create(
+        _call_foundry_with_retry(
+            "client.messages.create", client.messages.create, deadline=deadline,
             thread_id=thread.id,
             role=MessageRole.USER,
             content=message_text,
@@ -1211,6 +1336,7 @@ def run_agent(
         run = _call_foundry_with_retry(
             "client.runs.create",
             client.runs.create,
+            deadline=deadline,
             thread_id=thread.id,
             agent_id=agent_id,
             **_prompt_budget_kwargs(client.runs.create),
@@ -1218,6 +1344,7 @@ def run_agent(
         log.info("Run started: %s", run.id)
 
         while _run_status(run) in ("queued", "in_progress", "requires_action", "cancelling"):
+            _remaining_seconds(deadline)
             if _run_status(run) == "requires_action":
                 # Counted before the isinstance check below on purpose. A
                 # required action we cannot service falls through to
@@ -1243,7 +1370,12 @@ def run_agent(
                     signature = _tool_call_signature(batch)
                     repeat_streak = repeat_streak + 1 if signature == last_signature else 1
                     last_signature = signature
-                    if repeat_streak >= stuck_repeats:
+                    plan_batch = all(
+                        getattr(getattr(call, "function", None), "name", "") == "submit_plan"
+                        for call in batch
+                    )
+                    repairing_plan = plan_batch and plan_rejections > 0 and plan_result is None
+                    if repeat_streak >= stuck_repeats and not repairing_plan:
                         guard_fired = "stuck_tool_loop"
                         _abort_run(
                             client,
@@ -1257,19 +1389,53 @@ def run_agent(
 
                     tool_outputs = []
                     for tool_call in batch:
+                        _remaining_seconds(deadline)
                         if isinstance(tool_call, RequiredFunctionToolCall):
                             tool_calls += 1
                             fn_name = tool_call.function.name
-                            fn_args = json.loads(tool_call.function.arguments)
+                            try:
+                                fn_args = json.loads(tool_call.function.arguments)
+                            except (json.JSONDecodeError, TypeError):
+                                if fn_name != "submit_plan":
+                                    raise
+                                fn_args = None
                             log.info("Tool call: %s(%s)", fn_name, fn_args)
 
                             handler = TOOL_HANDLERS.get(fn_name)
                             if handler:
-                                output = handler(project_dir, fn_args)
-
-                                # Capture plan if this is submit_plan
                                 if fn_name == "submit_plan":
-                                    plan_result = _normalize_plan_args(fn_args)
+                                    plan_result = None
+                                    output = _handle_submit_plan(
+                                        project_dir, fn_args, read_paths=read_paths,
+                                    )
+                                    feedback = json.loads(output)
+                                    if feedback["status"] == "plan_received":
+                                        plan_result = _normalize_plan_args(fn_args)
+                                    else:
+                                        plan_rejections += 1
+                                        if plan_rejections >= MAX_PLAN_REJECTIONS:
+                                            guard_fired = "invalid_plan"
+                                            _abort_run(
+                                                client, thread.id, run, guard_fired,
+                                                f"plan rejected {plan_rejections} times: "
+                                                f"{feedback['errors']}",
+                                            )
+                                        feedback["repairs_remaining"] = (
+                                            MAX_PLAN_REJECTIONS - plan_rejections
+                                        )
+                                        output = json.dumps(feedback)
+                                elif fn_name == "run_project_tests":
+                                    output = handler(
+                                        project_dir, fn_args,
+                                        timeout_seconds=min(300, _remaining_seconds(deadline)),
+                                    )
+                                else:
+                                    output = handler(project_dir, fn_args)
+                                _remaining_seconds(deadline)
+                                if fn_name == "read_project_file":
+                                    read = json.loads(output)
+                                    if "error" not in read and read.get("content"):
+                                        read_paths.add(read["path"])
                             else:
                                 output = json.dumps({"error": f"Unknown tool: {fn_name}"})
 
@@ -1281,6 +1447,7 @@ def run_agent(
                     run = _call_foundry_with_retry(
                         "client.runs.submit_tool_outputs",
                         client.runs.submit_tool_outputs,
+                        deadline=deadline,
                         thread_id=thread.id,
                         run_id=run.id,
                         tool_outputs=tool_outputs,
@@ -1288,14 +1455,16 @@ def run_agent(
                 continue
 
             # Poll
-            time.sleep(1)
+            time.sleep(min(1, _remaining_seconds(deadline)))
             run = _call_foundry_with_retry(
                 "client.runs.get",
                 client.runs.get,
+                deadline=deadline,
                 thread_id=thread.id,
                 run_id=run.id,
             )
 
+        _remaining_seconds(deadline)
         status = _run_status(run)
         if status == "failed":
             log.error("Run failed: %s", run.last_error)
@@ -1317,24 +1486,41 @@ def run_agent(
             raise FoundryRunFailedError(run.id, status)
 
         # Get the final message
-        messages = client.messages.list(
+        msg = _call_foundry_with_retry(
+            "client.messages.list", _get_final_message, client, deadline=deadline,
             thread_id=thread.id,
-            order=ListSortOrder.DESCENDING,
-            limit=1,
+            run_id=run.id,
         )
-        for msg in messages:
-            if msg.role == MessageRole.AGENT:
-                for block in msg.text_messages:
-                    agent_text = block.text.value
-                    log.info("Agent response:\n%s", agent_text)
+        _remaining_seconds(deadline)
+        if msg is not None and msg.role == MessageRole.AGENT:
+            for block in msg.text_messages:
+                agent_text = block.text.value
+                log.info("Agent response:\n%s", agent_text)
 
-                    # Fallback: if agent didn't call submit_plan, parse from text
-                    if plan_result is None and "Score:" in agent_text:
-                        plan_result = _parse_plan_from_text(agent_text)
-                        if plan_result:
-                            log.info("Parsed plan from text response (submit_plan not called)")
+                # Fallback: if agent didn't call submit_plan, parse from text
+                if plan_result is None and "Score:" in agent_text:
+                    candidate = _parse_plan_from_text(agent_text)
+                    if candidate and not plan_errors(candidate, read_paths=read_paths):
+                        plan_result = candidate
+                        log.info("Parsed plan from text response (submit_plan not called)")
 
+        _remaining_seconds(deadline)
+        if plan_result is None and plan_rejections:
+            guard_fired = "invalid_plan"
+            _abort_run(
+                client, thread.id, run, guard_fired,
+                "run completed without repairing the rejected plan",
+            )
         return plan_result
+    except (AzureError, OSError, httpx.HTTPError) as exc:
+        if not isinstance(exc, _RunDeadlineExceeded) and time.monotonic() < deadline:
+            raise
+        guard_fired = "run_deadline"
+        plan_result = None
+        _abort_run(
+            client, thread.id if thread else "unknown", run, guard_fired,
+            f"exhausted its {timeout_seconds}s elapsed budget (status={_run_status(run)})",
+        )
     finally:
         if run is not None:
             _log_run_cost(
@@ -1354,7 +1540,8 @@ def run_agent(
                 plan_captured=plan_result is not None,
                 duration_s=time.monotonic() - started,
             )
-        _cleanup_thread(client, thread.id)
+        if thread is not None:
+            _cleanup_thread(client, thread.id)
 
 
 def _parse_plan_from_text(text: str) -> dict | None:

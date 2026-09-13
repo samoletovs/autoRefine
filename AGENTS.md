@@ -92,6 +92,28 @@ Note the endpoint reads `…/api/projects/{proj}/assistants`. That is **Foundry 
 agents**, *not* the retired Azure OpenAI Assistants API — see
 [PLATFORM.md §15.2](../.github/PLATFORM.md).
 
+`AUTOREFINE_RUN_TIMEOUT_SECONDS` bounds one run's elapsed monotonic time (default
+1800 seconds; a positive integer). It covers setup, every status including
+queued/in_progress/cancelling, tool dispatch, retry waits and final result retrieval.
+SDK requests and the test subprocess receive the remaining budget; SDK-internal
+retries are disabled in favor of the bounded application retries. A synchronous
+operation that ignores its timeout cannot be preempted locally, but an overdue
+result is never accepted. Expiry raises `FoundryRunAbortedError` with
+`reason="run_deadline"` so functional planning cannot replay it and refine rolls back.
+Cancellation and thread deletion each have a separate 10-second best-effort grace;
+cleanup failures are logged without hiding the primary failure. Cost rows retain
+the guard, status and elapsed duration.
+
+Functional ideation has no idea quota. `submit_plan(outcome="no_gap", improvements=[],
+summary=..., no_gap_evidence=[{"path": ..., "observation": ...}])` is a successful
+empty result only with an explanation and files successfully read in that run.
+Missing output and transient service failures still have the existing bounded retry.
+`agent/plan_validation.py` supplies the shared specificity check for tool feedback
+and filing. Rejected submissions get one-based item/field errors and at most two
+repair opportunities (three rejected submissions total). Only a wholly acceptable
+plan from a completed run is returned; the final filer still independently rejects
+unspecified memos. Text fallback cannot bypass validation.
+
 ## What the score actually measures
 
 The 0-100 score is **not a quality measure — it is a coverage-weighted one**, and
