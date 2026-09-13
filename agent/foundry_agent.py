@@ -181,9 +181,13 @@ class FoundryRunAbortedError(FoundryRunIncompleteError):
     ``reason`` names the round, stuck, elapsed-time or plan-validation guard.
     """
 
-    def __init__(self, run_id: str, reason: str, detail: str) -> None:
+    def __init__(
+        self, run_id: str, reason: str, detail: str, *,
+        cancellation_unconfirmed: bool = True,
+    ) -> None:
         self.run_id = run_id
         self.reason = reason
+        self.cancellation_unconfirmed = cancellation_unconfirmed
         # Bypasses the parent's message, which advises raising the
         # prompt-token budget — useless advice for a loop going nowhere.
         RuntimeError.__init__(self, f"Foundry run {run_id} aborted: {detail}")
@@ -1232,20 +1236,38 @@ def _log_run_cost(
         log.warning("Could not emit the run cost line.", exc_info=True)
 
 
-def _cancel_run(client: AgentsClient, thread_id: str, run: Any) -> None:
+def _cancel_run(client: AgentsClient, thread_id: str, run: Any) -> bool:
     """Best-effort cancellation, including cleanup-only handling of late-created IDs."""
     run_id = getattr(run, "id", "unknown")
-    cancel = getattr(getattr(client, "runs", None), "cancel", None)
+    cancel_client = vars(client).get("_autorefine_cancel_client", client)
+    channel = "serialized" if cancel_client is client else "independent"
+    cancel = getattr(getattr(cancel_client, "runs", None), "cancel", None)
     if run is not None and callable(cancel):
         try:
-            _call_foundry_with_retry(
+            response = _call_foundry_with_retry(
                 "client.runs.cancel", cancel,
                 deadline=time.monotonic() + CLEANUP_TIMEOUT_SECONDS,
-                boundary=client_boundary(client), cleanup=True,
+                boundary=client_boundary(cancel_client), cleanup=True,
                 thread_id=thread_id, run_id=run_id,
             )
+            if _run_status(response) == "cancelled":
+                log.info("cancellation_confirmed run_id=%s channel=%s", run_id, channel)
+                return True
+            log.warning(
+                "cancellation_unconfirmed run_id=%s channel=%s status=%s",
+                run_id, channel, _run_status(response),
+            )
         except (AzureError, OSError, httpx.HTTPError) as exc:
-            log.warning("Could not cancel aborted run %s: %s", run_id, exc)
+            log.warning(
+                "Could not cancel aborted run %s: %s; cancellation_unconfirmed channel=%s",
+                run_id, exc, channel,
+            )
+    else:
+        log.warning(
+            "cancellation_unconfirmed run_id=%s channel=%s reason=no_cancellable_run",
+            run_id, channel,
+        )
+    return False
 
 
 def _abort_run(
@@ -1257,16 +1279,18 @@ def _abort_run(
 ) -> NoReturn:
     """Cancel a run a cost guard has given up on, then raise.
 
-    Cancelling first stops the service holding a run open waiting for tool
-    outputs that are never coming. Thread deletion belongs to ``run_agent``'s
+    Attempt cancellation before cleanup, without equating an accepted request
+    with a terminal service acknowledgement. Thread deletion belongs to ``run_agent``'s
     single lifecycle cleanup path. ``cancel`` is probed because the fakes in
     the test suite — and older SDKs — do not expose it.
     """
     run_id = getattr(run, "id", "unknown")
     log.error("Aborting Foundry run %s (%s): %s", run_id, reason, detail)
 
-    _cancel_run(client, thread_id, run)
-    raise FoundryRunAbortedError(run_id, reason, detail)
+    confirmed = _cancel_run(client, thread_id, run)
+    raise FoundryRunAbortedError(
+        run_id, reason, detail, cancellation_unconfirmed=not confirmed,
+    )
 
 
 def _cleanup_thread(client: AgentsClient, thread_id: str) -> None:

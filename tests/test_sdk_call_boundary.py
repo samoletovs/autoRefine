@@ -369,3 +369,105 @@ def test_stalled_isolated_orphan_sweep_does_not_retire_the_work_client(
     finally:
         release.set()
         assert finished.wait(2)
+
+
+@pytest.mark.parametrize("cancel_status", ["cancelled", "cancelling"])
+def test_known_run_cancels_through_independent_channel_while_poll_still_owns_client(
+    cancel_status: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    release, poll_finished, deleted = threading.Event(), threading.Event(), threading.Event()
+    run = SimpleNamespace(id="known-run", status="in_progress")
+    client = _ToolLoopClient(lambda n: None)
+    client.next_run = lambda: run
+    monkeypatch.setattr(f, "resolve_run_timeout_seconds", lambda: 1)
+    monkeypatch.setattr(f, "CLEANUP_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(f.time, "sleep", lambda _: None)
+
+    def poll(**kwargs: object) -> SimpleNamespace:
+        try:
+            assert release.wait(4)
+            return SimpleNamespace(id="known-run", status="completed")
+        finally:
+            poll_finished.set()
+
+    def cancel(**kwargs: object) -> SimpleNamespace:
+        assert not release.is_set(), "cancellation must not wait for the abandoned poll"
+        assert kwargs["run_id"] == "known-run"
+        return SimpleNamespace(status=cancel_status)
+
+    client.runs.get = poll
+    client.threads.delete = lambda *a, **kw: deleted.set()
+    cancellation = Mock(side_effect=cancel)
+    client._autorefine_cancel_client = SimpleNamespace(runs=SimpleNamespace(cancel=cancellation))
+    started = time.monotonic()
+    try:
+        with pytest.raises(f.FoundryRunAbortedError) as error:
+            f.run_agent(client, "agent", tmp_path, ProjectConfig(
+                name="fixture", purpose="", users="", stage="active",
+            ), "task")
+        assert time.monotonic() - started < 1.7
+        assert error.value.cancellation_unconfirmed is (cancel_status != "cancelled")
+        cancellation.assert_called_once()
+        assert not poll_finished.is_set()
+        assert not deleted.is_set(), "owning-client teardown must remain serialized"
+        if cancel_status == "cancelling":
+            assert "cancellation_unconfirmed" in caplog.text
+    finally:
+        release.set()
+        assert poll_finished.wait(2)
+        assert deleted.wait(2)
+
+
+def test_failed_cancellation_is_explicitly_unconfirmed(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = SimpleNamespace(runs=SimpleNamespace(cancel=Mock(
+        side_effect=ServiceResponseError("synthetic cancellation failure"),
+    )))
+    monkeypatch.setattr(f._call_foundry_with_retry.retry, "sleep", lambda _: None)
+    with pytest.raises(f.FoundryRunAbortedError) as error:
+        f._abort_run(
+            client, "thread", SimpleNamespace(id="run"), "run_deadline", "synthetic deadline",
+        )
+    assert error.value.cancellation_unconfirmed is True
+    assert "cancellation_unconfirmed" in caplog.text
+
+
+@pytest.mark.parametrize("entrypoint", ["plan", "functional", "refine"])
+def test_entrypoints_provision_only_isolated_sdk_channels_at_the_existing_endpoint(
+    entrypoint: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clients: list[SimpleNamespace] = []
+    no_gap = {"outcome": "no_gap", "score": 100, "improvements": [], "summary": "Reviewed"}
+
+    def new_client(**kwargs: object) -> SimpleNamespace:
+        assert kwargs["endpoint"] == "https://example.test"
+        client = SimpleNamespace(delete_agent=Mock())
+        clients.append(client)
+        return client
+
+    def create(client: SimpleNamespace, **kwargs: object) -> str:
+        assert client._autorefine_cancel_client is not client
+        assert kwargs["orphan_client"] is not client
+        assert kwargs["orphan_client"] is not client._autorefine_cancel_client
+        return "agent"
+
+    monkeypatch.setenv("FOUNDRY_PROJECT_ENDPOINT", "https://example.test")
+    monkeypatch.setattr("azure.ai.agents.AgentsClient", new_client)
+    monkeypatch.setattr("azure.identity.DefaultAzureCredential", lambda: None)
+    monkeypatch.setattr(f, "create_agent", create)
+    monkeypatch.setattr(f, "run_agent", Mock(return_value=no_gap))
+    monkeypatch.setattr(m, "_extract_relevant_wiki_insights", lambda name: "")
+    monkeypatch.setattr(m, "_worktree_snapshot", lambda path: set())
+    monkeypatch.setattr(m, "_worktree_status", lambda path: {})
+    monkeypatch.setattr("agent.tools.github_tools.create_branch", lambda *a: True)
+    config = ProjectConfig(name="fixture", purpose="", users="", stage="active")
+
+    if entrypoint == "plan":
+        assert m.plan_project(tmp_path, config, []) == no_gap
+    elif entrypoint == "functional":
+        assert m.plan_functional(tmp_path, config) == no_gap
+    else:
+        assert m.refine_project(tmp_path, config, no_gap, "owner/fixture") is False
+    assert len(clients) == 3

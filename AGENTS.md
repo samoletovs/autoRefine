@@ -118,6 +118,15 @@ Cleanup queues behind the active call rather than racing a closed/deleted client
 If it never returns, cleanup remains best-effort/unconfirmed (the existing orphan
 sweep is still necessary). This is a bounded caller contract, not a claim that a
 remote request has been cancelled merely because the local deadline expired.
+For known run IDs, the production entrypoints provide an independent cancellation
+SDK client at the same endpoint using the same existing credential configuration.
+It has its own transport/lease, so cancellation need not wait for a stuck poll;
+no Azure resource or auth configuration is created or changed. Other teardown still
+queues behind the owning call. Only a service response with `status="cancelled"`
+confirms cancellation. Missing/failed responses and `cancelling` acknowledgements
+emit `cancellation_unconfirmed`, also exposed on `FoundryRunAbortedError`. A direct
+caller without an independent channel gets bounded serialized best-effort cleanup,
+not a claim that billing stopped.
 The three production entrypoints give `create_agent` a separate `orphan_client`
 for best-effort sweeping. A stalled sweep retires only that housekeeping client's
 lease, so healthy work still starts. Direct `create_agent` callers may omit that

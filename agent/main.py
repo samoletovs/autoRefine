@@ -526,6 +526,9 @@ def plan_project(
         endpoint=endpoint,
         credential=DefaultAzureCredential(),
     )
+    client._autorefine_cancel_client = AgentsClient(
+        endpoint=endpoint, credential=DefaultAzureCredential(),
+    )
 
     agent_id = create_agent(
         client, mode="plan", model=model,
@@ -1104,6 +1107,9 @@ def plan_functional(
     from agent.foundry_agent import cleanup_agent, create_agent, run_agent
 
     client = AgentsClient(endpoint=endpoint, credential=DefaultAzureCredential())
+    client._autorefine_cancel_client = AgentsClient(
+        endpoint=endpoint, credential=DefaultAzureCredential(),
+    )
     agent_id = create_agent(
         client, mode="plan", model=model,
         orphan_client=AgentsClient(endpoint=endpoint, credential=DefaultAzureCredential()),
@@ -1729,6 +1735,9 @@ def refine_project(
     client = AgentsClient(
         endpoint=endpoint,
         credential=DefaultAzureCredential(),
+    )
+    client._autorefine_cancel_client = AgentsClient(
+        endpoint=endpoint, credential=DefaultAzureCredential(),
     )
 
     # Create branch
