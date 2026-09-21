@@ -80,6 +80,8 @@ def _billing_period(
         "?api-version=2018-03-01-preview"
     )
     matches: set[tuple[dt.date, dt.date]] = set()
+    completed: set[tuple[dt.date, dt.date]] = set()
+    count = 0
     for page in _pages(client, url):
         periods = page["value"]
         if not isinstance(periods, list):
@@ -90,10 +92,30 @@ def _billing_period(
             end = _date(props["billingPeriodEndDate"])
             if end < start:
                 raise ValueError("Invalid billing period range")
+            count += 1
             if start <= today <= end:
                 matches.add((start, end))
-    if len(matches) != 1:
-        raise ValueError("No unique current billing period available from Azure")
+            elif end < today:
+                completed.add((start, end))
+    if len(matches) > 1:
+        raise ValueError(
+            f"Azure returned {len(matches)} overlapping current billing periods for {today}; "
+            "costs cannot be attributed to a unique period"
+        )
+    if not matches:
+        detail = "Azure returned no billing periods"
+        if completed:
+            start, end = max(completed, key=lambda period: (period[1], period[0]))
+            detail = f"Latest available completed period: {start} through {end} (inclusive)"
+            if end + dt.timedelta(days=1) == today:
+                detail = f"Billing cycle reset today. {detail}"
+        elif count:
+            detail = "Azure returned no completed billing period"
+        raise ValueError(
+            f"Azure has not returned a current billing period for {today}. {detail}. "
+            "Current costs and credit estimates are unavailable; "
+            "retry after Azure publishes a period covering this date"
+        )
     return matches.pop()
 
 

@@ -198,6 +198,14 @@ known currency is valid. Cost failures mark health-scan results incomplete
 scans, report/notification attempts or dry-run output. Billing Periods is a
 subscription-type-dependent preview API; unsupported subscriptions fail visibly.
 
+On a cycle reset, Azure can still return only the period that ended yesterday.
+The scanner names the missing query date and last completed period in the report,
+dashboard and Telegram warning, rather than conflating this with overlapping
+periods. It still marks the cost stage incomplete: it never reuses last cycle's
+spend, assumes zero cost, or invents the new cycle's dates or credit balance.
+Retry once Azure returns a period covering the query date. A later missing-period
+read remains unavailable and is not described as a reset happening today.
+
 Reports carry `currency`, `budget_name`, `budget_currency`, `budget_time_grain`,
 inclusive `period_start`/`period_end`, `next_reset` (the following day), `query_end`,
 `remaining_budget` and `latest_usage_date`. The legacy `remaining` key aliases
