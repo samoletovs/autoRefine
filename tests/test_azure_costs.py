@@ -246,6 +246,56 @@ def test_new_cycle_does_not_reuse_previous_period(
     result = health_scan.scan_azure_costs()
     assert result["total"] == -1
     assert "current billing period" in result["error"]
+    assert "2026-09-21" in result["error"]
+    assert "2026-08-21 through 2026-09-20" in result["error"]
+    assert "Billing cycle reset today" in result["error"]
+    assert "retry after Azure publishes" in result["error"]
+    assert "remaining_budget" not in result
+    assert "estimated_credit_remaining_usd" not in result
+    assert "period_start" not in result
+    assert not [r for r in azure["requests"] if r.method == "POST"]
+    for rendered in (
+        _render_cost_section(result),
+        health_scan.generate_report({}, result, {}),
+        health_scan.build_telegram_summary({}, None, [], result),
+    ):
+        assert "Billing cycle reset today" in rendered
+        assert "2026-09-20" in rendered
+        assert "✅ No alerts" not in rendered
+        assert "cost-green" not in rendered
+
+
+def test_old_period_gap_is_not_misreported_as_todays_reset(
+    azure: dict[str, Any], clock: Any,
+) -> None:
+    clock.today = dt.datetime(2026, 9, 22, tzinfo=dt.UTC)
+    result = health_scan.scan_azure_costs()
+    assert result["total"] == -1
+    assert "current billing period for 2026-09-22" in result["error"]
+    assert "2026-08-21 through 2026-09-20" in result["error"]
+    assert "reset today" not in result["error"]
+    assert not [r for r in azure["requests"] if r.method == "POST"]
+
+
+@pytest.mark.parametrize(
+    ("periods", "expected"),
+    [
+        ([], "Azure returned no billing periods"),
+        ([_period("2026-09-21", "2026-10-20")], "no completed billing period"),
+        (
+            [_period("2026-08-21", "2026-09-20"), _period("2026-09-01", "2026-09-30")],
+            "2 overlapping current billing periods",
+        ),
+    ],
+)
+def test_unavailable_period_diagnostic_distinguishes_missing_from_ambiguous(
+    azure: dict[str, Any], periods: list[dict[str, Any]], expected: str,
+) -> None:
+    azure["responses"][_PERIODS_URL] = {"value": periods}
+    result = health_scan.scan_azure_costs()
+    assert result["total"] == -1
+    assert expected in result["error"]
+    assert "2026-09-08" in result["error"]
     assert not [r for r in azure["requests"] if r.method == "POST"]
 
 
