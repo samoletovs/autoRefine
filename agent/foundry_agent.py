@@ -50,14 +50,14 @@ from tenacity import (
     wait_random_exponential,
 )
 
-from agent.config import ProjectConfig
+from agent.config import DEFAULT_CLASSIC_DEPLOYMENT, ProjectConfig, require_classic_deployment
 from agent.plan_validation import plan_errors
 from agent.sdk_boundary import SdkBoundary, SdkDeadlineExceeded, client_boundary
 from agent.tools.quality_tools import plannable_findings
 
 log = logging.getLogger(__name__)
 
-DEFAULT_DEPLOYMENT = os.environ.get("FOUNDRY_DEFAULT_DEPLOYMENT", "gpt-6-luna")
+DEFAULT_DEPLOYMENT = os.environ.get("FOUNDRY_DEFAULT_DEPLOYMENT", DEFAULT_CLASSIC_DEPLOYMENT)
 ENDPOINT = os.environ.get("FOUNDRY_PROJECT_ENDPOINT", "")
 MODEL_PRICES: dict[str, tuple[float, float, float]] = {
     # Global short-context USD/M: uncached input, output, cached input.
@@ -261,7 +261,7 @@ def resolve_max_completion_tokens() -> int:
 
 
 def _deployment(model: str | None, mode: str) -> str:
-    deployment = model or DEFAULT_DEPLOYMENT
+    deployment = require_classic_deployment(model or DEFAULT_DEPLOYMENT)
     if deployment not in MODEL_PRICES:
         raise ValueError("Foundry deployment must name a supported actual model")
     if deployment == "gpt-6-sol" and (model is None or mode != "plan"):
@@ -1088,9 +1088,9 @@ def create_agent(
     """Create the autoRefine Foundry agent. In refine mode, includes write tools.
 
     :param model: Foundry deployment name to use. Falls back to
-        ``FOUNDRY_DEFAULT_DEPLOYMENT`` env var, then to ``gpt-6-luna``.
-        ``gpt-6-sol`` is restricted to an explicit on-demand plan — ``--model`` threads
-        through to here so callers can pick per-run.
+        ``FOUNDRY_DEFAULT_DEPLOYMENT`` env var, then to ``gpt-4o-mini``.
+        Luna/Sol are blocked until their separate classic-service gate passes,
+        including explicit manual overrides.
     :param orphan_client: Separate SDK client for fail-open housekeeping. Omit to
         skip sweeping; an abandoned housekeeping call must not retire the work client.
     """

@@ -35,9 +35,9 @@ param notifyVaultName string = 'kv-mindme-ymcpt'
 // the latter, which reads like a missing model rather than a wrong URL.
 param foundryEndpoint string = 'https://foundrylab-aiservices.services.ai.azure.com/api/projects/foundrylab'
 
-@description('Routine actual-model deployment; GPT-6 requires a separate classic Agent Service promotion gate.')
-@allowed(['gpt-6-luna', 'gpt-4.1', 'gpt-4o-mini'])
-param foundryDeployment string = 'gpt-6-luna'
+@description('Verified classic deployment only. GPT-6 is blocked until its separate classic-service gate passes.')
+@allowed(['gpt-4.1', 'gpt-4o-mini'])
+param foundryDeployment string = 'gpt-4o-mini'
 
 @description('Telegram chat id for notifications. Not a secret, but environment-specific.')
 param nauroChatId string

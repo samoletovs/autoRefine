@@ -14,7 +14,12 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from agent.config import AutoRefineConfig, ProjectConfig
+from agent.config import (
+    DEFAULT_CLASSIC_DEPLOYMENT,
+    AutoRefineConfig,
+    ProjectConfig,
+    require_classic_deployment,
+)
 from agent.plan_validation import FILLER_WORDS as _FILLER_WORDS
 from agent.plan_validation import is_specified
 from agent.tools.github_tools import clone_repo, read_project_yaml
@@ -1992,8 +1997,8 @@ def main() -> None:
         default=None,
         help=(
             "Foundry deployment name to use for plan/file-ideas/refine modes. "
-            "Defaults to FOUNDRY_DEFAULT_DEPLOYMENT env var, then gpt-6-luna. "
-            "gpt-6-sol is only for an explicit --repo --mode plan --model gpt-6-sol."
+            "Defaults to FOUNDRY_DEFAULT_DEPLOYMENT env var, then gpt-4o-mini. "
+            "Luna/Sol are blocked pending the classic-service compatibility gate."
         ),
     )
     parser.add_argument("--dry-run", action="store_true")
@@ -2020,7 +2025,12 @@ def main() -> None:
     )
     args = parser.parse_args()
     requested_model = args.model
-    args.model = args.model or os.environ.get("FOUNDRY_DEFAULT_DEPLOYMENT", "gpt-6-luna")
+    args.model = args.model or os.environ.get("FOUNDRY_DEFAULT_DEPLOYMENT", DEFAULT_CLASSIC_DEPLOYMENT)
+    if args.mode in {"plan", "file-ideas", "refine"}:
+        try:
+            require_classic_deployment(args.model)
+        except ValueError as exc:
+            parser.error(str(exc))
     if args.model == "gpt-6-sol" and (
         requested_model != "gpt-6-sol" or args.mode != "plan" or not args.repo or args.manifest
     ):
