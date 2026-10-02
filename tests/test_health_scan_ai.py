@@ -312,14 +312,16 @@ def test_missing_finish_reason_is_not_treated_as_truncation() -> None:
 
 
 # ── request shape: cost discipline and payload wiring ──────────────────────
-def test_defaults_to_gpt_4o_mini() -> None:
+def test_defaults_to_luna_without_legacy_token_parameters() -> None:
     """AGENTS.md pins the daily scan to a cheap deployment; keep it pinned."""
     with mock_openai(CLEAN_JSON) as ctor:
         health_scan.analyze_with_ai({}, {})
 
     kwargs = ctor.client.chat.completions.create.call_args.kwargs
-    assert kwargs["model"] == "gpt-4o-mini"
-    assert kwargs["temperature"] == 0.1
+    assert kwargs["model"] == "gpt-6-luna"
+    assert kwargs["reasoning_effort"] == "none"
+    assert "temperature" not in kwargs
+    assert "max_tokens" not in kwargs
 
 
 def test_output_ceiling_fits_a_full_fleet_answer() -> None:
@@ -333,7 +335,7 @@ def test_output_ceiling_fits_a_full_fleet_answer() -> None:
     with mock_openai(CLEAN_JSON) as ctor:
         health_scan.analyze_with_ai({}, {})
 
-    assert ctor.client.chat.completions.create.call_args.kwargs["max_tokens"] == 4000
+    assert ctor.client.chat.completions.create.call_args.kwargs["max_completion_tokens"] == 4000
 
 
 def test_max_tokens_env_overrides_the_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -343,7 +345,7 @@ def test_max_tokens_env_overrides_the_ceiling(monkeypatch: pytest.MonkeyPatch) -
     with mock_openai(CLEAN_JSON) as ctor:
         health_scan.analyze_with_ai({}, {})
 
-    assert ctor.client.chat.completions.create.call_args.kwargs["max_tokens"] == 1500
+    assert ctor.client.chat.completions.create.call_args.kwargs["max_completion_tokens"] == 1500
 
 
 @pytest.mark.parametrize("bad", ["", "abc", "2000tokens", "0", "-1", "3.5"])
@@ -362,18 +364,44 @@ def test_unusable_max_tokens_env_falls_back_to_the_default(
         result = health_scan.analyze_with_ai({}, {})
 
     assert result == PAYLOAD
-    assert ctor.client.chat.completions.create.call_args.kwargs["max_tokens"] == 4000
+    assert ctor.client.chat.completions.create.call_args.kwargs["max_completion_tokens"] == 4000
 
 
-def test_health_scan_model_env_overrides_deployment(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("model", ["gpt-4.1", "gpt-4o-mini"])
+def test_health_scan_model_env_preserves_callable_rollback(
+    monkeypatch: pytest.MonkeyPatch, model: str,
 ) -> None:
-    monkeypatch.setenv("HEALTH_SCAN_MODEL", "gpt-5")
+    monkeypatch.setenv("HEALTH_SCAN_MODEL", model)
 
     with mock_openai(CLEAN_JSON) as ctor:
         health_scan.analyze_with_ai({}, {})
 
-    assert ctor.client.chat.completions.create.call_args.kwargs["model"] == "gpt-5"
+    options = ctor.client.chat.completions.create.call_args.kwargs
+    assert options["model"] == model
+    assert options["max_tokens"] == 4000
+    assert options["temperature"] == 0.1
+    assert "reasoning_effort" not in options
+    assert "max_completion_tokens" not in options
+
+
+@pytest.mark.parametrize("model", ["gpt-6-sol", "unknown-alias"])
+def test_health_scan_cannot_become_a_scheduled_premium_call(
+    monkeypatch: pytest.MonkeyPatch, model: str,
+) -> None:
+    monkeypatch.setenv("HEALTH_SCAN_MODEL", model)
+    with mock_openai(CLEAN_JSON) as ctor:
+        result = health_scan.analyze_with_ai({}, {})
+    assert "error" in result
+    assert "issues_to_create" not in result
+    ctor.client.chat.completions.create.assert_not_called()
+
+
+def test_health_scan_cannot_raise_the_pilot_completion_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HEALTH_SCAN_MAX_TOKENS", "4001")
+    with mock_openai(CLEAN_JSON) as ctor:
+        result = health_scan.analyze_with_ai({}, {})
+    assert "error" in result
+    ctor.client.chat.completions.create.assert_not_called()
 
 
 def test_scan_data_reaches_the_user_message() -> None:

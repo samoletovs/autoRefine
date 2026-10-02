@@ -256,8 +256,8 @@ def test_main_plan_passes_model_to_plan_project(
     ("deployment", "model_args", "expected"),
     [
         (None, [], "gpt-4o-mini"),
-        ("configured-deployment", [], "configured-deployment"),
-        ("configured-deployment", ["--model", "requested-deployment"], "requested-deployment"),
+        ("gpt-4.1", [], "gpt-4.1"),
+        ("gpt-4.1", ["--model", "gpt-4o-mini"], "gpt-4o-mini"),
     ],
 )
 def test_file_ideas_uses_same_model_for_both_planning_passes(

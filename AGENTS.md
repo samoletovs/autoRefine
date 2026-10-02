@@ -14,8 +14,8 @@ with tests + PRs, and can file idea memos.
 3. **Never modify secrets or auth config.** Report findings, don't fix.
 4. **Always run tests** after making changes. Revert if tests fail.
 5. **Ask the user** when confidence is below 70% on any change.
-6. **Cost discipline.** Default to `gpt-4o-mini` for the daily evaluate/health-scan
-   passes (these run across 11 repos twice a day). Budget cap: €5/month on
+6. **Cost discipline.** Health Chat uses `gpt-6-luna`; classic planning stays on
+   `gpt-4o-mini` until its separate service gate passes. Budget target: €5/month on
    autoRefine's own consumption. See "Model strategy" below before bumping.
 7. **Every measured number in this file and in code comments has expired.** They are
    observations with a date, not properties of the system. Quote one only with its date
@@ -42,16 +42,33 @@ strong models only where the cost is bounded.
 
 | Tier | Used by | Default deployment | Override env |
 |------|---------|--------------------|--------------|
-| Cheap (daily) | `evaluate` mode (deterministic, no LLM) + `health-scan` AI analyst | `gpt-4o-mini` | `HEALTH_SCAN_MODEL` |
-| Cheap (on-demand) | `plan` / `refine` Foundry agent | `gpt-4o-mini` | `FOUNDRY_DEFAULT_DEPLOYMENT`, or CLI `--model` |
+| Routine | `evaluate` (deterministic, no LLM) + `health-scan` AI analyst | `gpt-6-luna` candidate | `HEALTH_SCAN_MODEL` |
+| Routine planning | `plan` / `refine` / `file-ideas` classic Foundry agent | `gpt-4o-mini` | `FOUNDRY_DEFAULT_DEPLOYMENT`, or CLI `--model`; only mini / GPT-4.1 enabled |
+| Deep (blocked) | Prepared single-repo planning path | `gpt-6-sol` candidate, not enabled | Manual overrides cannot bypass the classic-service gate |
 | Deep (rare) | Closed-loop PR reviewer (lives in `samoletovs/nauroLabs-github/scripts/claude-deep-review.py`, **not** in this repo) | `claude-opus-4` with `claude-sonnet-4` fallback, via GitHub Models | configured in the governance repo |
 
 Bump rules:
 
-- For a one-off deep analysis pass: `python -m agent.main --model gpt-5 --mode plan --repo owner/name`
-- For a sustained bump: set `FOUNDRY_DEFAULT_DEPLOYMENT` in `.env`. Coordinate
-  with the €5/month cap — Foundry's `gpt-5` is ~10× more expensive than
-  `gpt-4o-mini`, so a sustained bump means cutting daily-scan frequency.
+- Candidate models are version `2026-09-22` on `foundrylab-aiservices`.
+  Preparation is not promotion. See [README.md](README.md#model-pilot).
+- Both Luna and Sol are blocked before classic agent creation, housekeeping or
+  run creation, including explicit manual overrides. The shared allowlist is
+  in `agent/config.py`; CLI permission is not service-compatibility proof.
+  Do not add an environment switch that bypasses the gate.
+- Parent reported on 2026-10-02 that both bounded synthetic classic runs
+  accepted creation but failed with `server_error`. Baseline control is pending:
+  this is a failed gate, not proof the models are unsupported.
+- Run-wide prompt/completion caps are 200,000/16,000 for routine planning and
+  prepared at 40,000/4,000 for Sol if later admitted. Existing deadlines, tool-round,
+  activity, repeated-call and publication gates remain in force.
+- Classic `azure-ai-agents` 1.1 has no declared `reasoning_effort`. Never pass
+  a made-up kwarg, or claim low reasoning is enforced on this surface. The
+  parent must separately verify model support, tool calling and run caps.
+- Rollback uses `gpt-4o-mini` or `gpt-4.1`. No cadence, secret or auth changes
+  accompany the pilot; existing deployment settings shadow code defaults.
+- The existing Container Apps Job has no model override and clones Python at
+  startup. Code, CLI, example environment and IaC defaults must stay mini;
+  a code-default change would reach that job without an IaC deployment.
 - The **PR reviewer** path (Claude Opus 4 via GitHub Models) is configured
   outside this repo because the merge gate lives in the governance
   workflows. See `samoletovs/nauroLabs-github` → `.github/workflows/auto-review.yml`.

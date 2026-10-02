@@ -571,6 +571,7 @@ def test_run_agent_handles_failed_status() -> None:
         thread_id: str,
         agent_id: str,
         max_prompt_tokens: int | None = None,
+        max_completion_tokens: int | None = None,
         truncation_strategy: object = None,
         **_kwargs: object,
     ) -> SimpleNamespace:
@@ -641,6 +642,7 @@ def test_run_agent_processes_tool_calls_and_returns_plan(monkeypatch: pytest.Mon
             thread_id: str,
             agent_id: str,
             max_prompt_tokens: int | None = None,
+            max_completion_tokens: int | None = None,
             truncation_strategy: object = None,
             **_kwargs: object,
         ) -> SimpleNamespace:
@@ -871,6 +873,7 @@ def test_real_sdk_puts_the_prompt_budget_on_the_wire() -> None:
     body = json.loads(captured["body"])  # type: ignore[arg-type]
     assert all(0 < timeout <= 5 for timeout in captured["timeouts"])
     assert body["max_prompt_tokens"] == foundry_agent.DEFAULT_MAX_PROMPT_TOKENS
+    assert body["max_completion_tokens"] == foundry_agent.DEFAULT_MAX_COMPLETION_TOKENS
     assert body["truncation_strategy"] == {
         "type": "last_messages",
         "last_messages": foundry_agent.DEFAULT_TRUNCATION_LAST_MESSAGES,
@@ -948,6 +951,7 @@ def _budget_run_client(run_status: str, incomplete_reason: str | None = None):
             thread_id: str,
             agent_id: str,
             max_prompt_tokens: int | None = None,
+            max_completion_tokens: int | None = None,
             truncation_strategy: object = None,
             **_kwargs: object,
         ) -> SimpleNamespace:
@@ -955,6 +959,7 @@ def _budget_run_client(run_status: str, incomplete_reason: str | None = None):
                 thread_id=thread_id,
                 agent_id=agent_id,
                 max_prompt_tokens=max_prompt_tokens,
+                max_completion_tokens=max_completion_tokens,
                 truncation_strategy=truncation_strategy,
             )
             return run
@@ -982,6 +987,7 @@ def test_run_agent_passes_bounded_prompt_to_runs_create(
     assert recorded["thread_id"] == "thread-1"
     assert recorded["agent_id"] == "agent-1"
     assert recorded["max_prompt_tokens"] == foundry_agent.DEFAULT_MAX_PROMPT_TOKENS
+    assert recorded["max_completion_tokens"] == foundry_agent.DEFAULT_MAX_COMPLETION_TOKENS
     assert recorded["truncation_strategy"].as_dict() == {
         "type": "last_messages",
         "last_messages": 4,
@@ -990,6 +996,7 @@ def test_run_agent_passes_bounded_prompt_to_runs_create(
         "thread_id",
         "agent_id",
         "max_prompt_tokens",
+        "max_completion_tokens",
         "truncation_strategy",
     }
 

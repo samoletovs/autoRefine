@@ -69,6 +69,7 @@ class _Runs:
         thread_id: str,
         agent_id: str,
         max_prompt_tokens: int | None = None,
+        max_completion_tokens: int | None = None,
         truncation_strategy: object = None,
         **_kwargs: object,
     ) -> SimpleNamespace:
@@ -303,6 +304,7 @@ def test_round_budget_counts_unservable_required_actions(
             thread_id: str,
             agent_id: str,
             max_prompt_tokens: int | None = None,
+            max_completion_tokens: int | None = None,
             truncation_strategy: object = None,
             **_kwargs: object,
         ) -> SimpleNamespace:

@@ -8,6 +8,19 @@ import yaml
 
 log = logging.getLogger(__name__)
 
+DEFAULT_CLASSIC_DEPLOYMENT = "gpt-4o-mini"
+VERIFIED_CLASSIC_DEPLOYMENTS = frozenset({"gpt-4o-mini", "gpt-4.1"})
+
+
+def require_classic_deployment(deployment: str) -> str:
+    """A manual override is not evidence that a classic-service gate passed."""
+    if deployment not in VERIFIED_CLASSIC_DEPLOYMENTS:
+        raise ValueError(
+            "Classic Foundry compatibility gate has not passed for this deployment; "
+            "only gpt-4o-mini and gpt-4.1 are enabled."
+        )
+    return deployment
+
 
 @dataclass
 class ProjectConfig:
@@ -89,7 +102,7 @@ class AutoRefineConfig:
     # Default model: cheap Foundry tier for daily scans of 11 repos.
     # Override via CLI --model or FOUNDRY_DEFAULT_DEPLOYMENT env var.
     # See AGENTS.md "Model strategy" for the tiered plan.
-    model: str = "gpt-4o-mini"
+    model: str = DEFAULT_CLASSIC_DEPLOYMENT
     dry_run: bool = False
     workdir: Path = field(default_factory=lambda: Path("/tmp/autorefine"))
     # True only for a manifest-driven sweep of every project. Such a sweep re-plans
