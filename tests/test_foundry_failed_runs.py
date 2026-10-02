@@ -49,6 +49,7 @@ def tool_dummies(monkeypatch: pytest.MonkeyPatch) -> None:
 def _client(error: object, *, status: str = "failed") -> SimpleNamespace:
     def create(
         *, thread_id: str, agent_id: str, max_prompt_tokens: int | None = None,
+        max_completion_tokens: int | None = None,
         truncation_strategy: object = None,
         **_kwargs: object,
     ) -> SimpleNamespace:

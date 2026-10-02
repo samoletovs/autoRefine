@@ -641,12 +641,8 @@ def analyze_with_ai(
             azure_ad_token_provider=token_provider,
         )
 
-    # Resolve model. Default still ``gpt-4o-mini`` for cost-discipline on the
-    # daily 06:00/18:00 health scan, but the deployment is configurable via
-    # ``HEALTH_SCAN_MODEL``. The deep-analysis variant of this scan can be
-    # bumped to ``gpt-5`` or another high-tier deployment per AGENTS.md
-    # "Model strategy".
-    model = os.environ.get("HEALTH_SCAN_MODEL", "gpt-4o-mini")
+    # Sol belongs to the explicit on-demand Foundry plan, not a scheduled scan.
+    model = os.environ.get("HEALTH_SCAN_MODEL", "gpt-6-luna")
 
     # Output ceiling. The old value of 2000 was not enough for a full-fleet
     # answer: tokenised with o200k_base, the schema above for 24 repos with the
@@ -719,14 +715,22 @@ Do NOT create issues for: subjective improvements, architecture decisions, or is
     )
 
     try:
+        if model not in {"gpt-6-luna", "gpt-4.1", "gpt-4o-mini"}:
+            raise ValueError("HEALTH_SCAN_MODEL must be gpt-6-luna or a supported rollback model")
+        if max_tokens > 4000:
+            raise ValueError("HEALTH_SCAN_MAX_TOKENS must be <= 4000 during the pilot")
+        options = (
+            {"max_completion_tokens": max_tokens, "reasoning_effort": "none"}
+            if model == "gpt-6-luna"
+            else {"max_tokens": max_tokens, "temperature": 0.1}
+        )
         response = client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_msg},
             ],
-            max_tokens=max_tokens,
-            temperature=0.1,
+            **options,
         )
         choice = response.choices[0]
         raw = (choice.message.content or "").strip()
@@ -744,6 +748,11 @@ Do NOT create issues for: subjective improvements, architecture decisions, or is
             raise ValueError(
                 f"model reply truncated at max_tokens={max_tokens}"
             )
+        if getattr(choice, "finish_reason", None) not in {None, "stop"}:
+            raise ValueError("model reply did not complete normally")
+        refusal = getattr(choice.message, "refusal", None)
+        if isinstance(refusal, str) and refusal.strip():
+            raise ValueError("model refused health analysis")
 
         return _parse_analysis_reply(raw)
     except Exception as e:

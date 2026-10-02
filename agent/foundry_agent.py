@@ -57,8 +57,15 @@ from agent.tools.quality_tools import plannable_findings
 
 log = logging.getLogger(__name__)
 
-DEFAULT_DEPLOYMENT = os.environ.get("FOUNDRY_DEFAULT_DEPLOYMENT", "gpt-4o-mini")
+DEFAULT_DEPLOYMENT = os.environ.get("FOUNDRY_DEFAULT_DEPLOYMENT", "gpt-6-luna")
 ENDPOINT = os.environ.get("FOUNDRY_PROJECT_ENDPOINT", "")
+MODEL_PRICES: dict[str, tuple[float, float, float]] = {
+    # Global short-context USD/M: uncached input, output, cached input.
+    "gpt-6-luna": (0.10, 0.50, 0.01),
+    "gpt-6-sol": (2.00, 10.00, 0.20),
+    "gpt-4.1": (2.00, 8.00, 0.50),
+    "gpt-4o-mini": (0.15, 0.60, 0.075),
+}
 MAX_FOUNDRY_RETRY_ATTEMPTS = 5
 RETRYABLE_FOUNDRY_STATUS_CODES = {429, 502, 503, 504}
 
@@ -103,6 +110,9 @@ SYSTEM_PROMPT = (Path(__file__).parent / "prompts" / "system.md").read_text(enco
 #                        on each round, which is what turns a run's input cost
 #                        from O(rounds^2) into roughly O(rounds).
 DEFAULT_MAX_PROMPT_TOKENS = 200_000
+DEFAULT_MAX_COMPLETION_TOKENS = 16_000
+DEEP_MAX_PROMPT_TOKENS = 40_000
+DEEP_MAX_COMPLETION_TOKENS = 4_000
 DEFAULT_TRUNCATION_LAST_MESSAGES = 12
 # A run-wide ceiling below ~20k cannot survive more than a couple of turns and
 # would kill plans before submit_plan, so reject it rather than accept a value
@@ -240,6 +250,25 @@ def resolve_truncation_last_messages() -> int:
     )
 
 
+def resolve_max_completion_tokens() -> int:
+    """A run-wide ceiling, including any reasoning the service performs."""
+    value = _positive_int_from_env(
+        "AUTOREFINE_MAX_COMPLETION_TOKENS", DEFAULT_MAX_COMPLETION_TOKENS, 1,
+    )
+    if value > DEFAULT_MAX_COMPLETION_TOKENS:
+        raise ValueError("AUTOREFINE_MAX_COMPLETION_TOKENS must be <= 16000")
+    return value
+
+
+def _deployment(model: str | None, mode: str) -> str:
+    deployment = model or DEFAULT_DEPLOYMENT
+    if deployment not in MODEL_PRICES:
+        raise ValueError("Foundry deployment must name a supported actual model")
+    if deployment == "gpt-6-sol" and (model is None or mode != "plan"):
+        raise ValueError("Sol is restricted to an explicit on-demand plan model override")
+    return deployment
+
+
 def resolve_max_tool_rounds() -> int:
     """Tool-round ceiling for a run. Override: ``AUTOREFINE_MAX_TOOL_ROUNDS``."""
     return _positive_int_from_env(
@@ -278,7 +307,7 @@ def resolve_cost_log_path() -> Path | None:
 
 
 class FoundryPromptBudgetUnsupportedError(RuntimeError):
-    """The installed SDK cannot express the prompt budget on ``runs.create``.
+    """The installed SDK cannot express the token budgets on ``runs.create``.
 
     Fails closed. A ``**kwargs``-only signature is *not* evidence of support:
     the generated clients accept arbitrary kwargs and silently drop unknown
@@ -286,15 +315,21 @@ class FoundryPromptBudgetUnsupportedError(RuntimeError):
     """
 
 
-def _prompt_budget_kwargs(create: Callable[..., Any]) -> dict[str, Any]:
-    """Build the prompt-bounding kwargs, requiring explicit SDK support.
+def _prompt_budget_kwargs(
+    create: Callable[..., Any], model: str | None = None,
+) -> dict[str, Any]:
+    """Build run-wide input/output bounds, requiring explicit SDK support.
 
-    ``max_prompt_tokens`` and ``truncation_strategy`` must appear as named
+    ``max_prompt_tokens``, ``max_completion_tokens`` and ``truncation_strategy`` must appear as named
     parameters of the pinned ``azure-ai-agents`` ``RunsOperations.create``. If
     they do not, we raise rather than fall back to an unbounded run, so a
     dependency bump can never silently restore the runaway-cost behaviour.
     """
     max_prompt_tokens = resolve_max_prompt_tokens()
+    max_completion_tokens = resolve_max_completion_tokens()
+    if model == "gpt-6-sol":
+        max_prompt_tokens = min(max_prompt_tokens, DEEP_MAX_PROMPT_TOKENS)
+        max_completion_tokens = min(max_completion_tokens, DEEP_MAX_COMPLETION_TOKENS)
     last_messages = resolve_truncation_last_messages()
 
     try:
@@ -306,7 +341,7 @@ def _prompt_budget_kwargs(create: Callable[..., Any]) -> dict[str, Any]:
 
     missing = [
         name
-        for name in ("max_prompt_tokens", "truncation_strategy")
+        for name in ("max_prompt_tokens", "max_completion_tokens", "truncation_strategy")
         if name not in parameters
         or parameters[name].kind is inspect.Parameter.VAR_KEYWORD
     ]
@@ -324,6 +359,7 @@ def _prompt_budget_kwargs(create: Callable[..., Any]) -> dict[str, Any]:
     )
     return {
         "max_prompt_tokens": max_prompt_tokens,
+        "max_completion_tokens": max_completion_tokens,
         "truncation_strategy": TruncationObject(
             type=TruncationStrategy.LAST_MESSAGES,
             last_messages=last_messages,
@@ -1052,13 +1088,13 @@ def create_agent(
     """Create the autoRefine Foundry agent. In refine mode, includes write tools.
 
     :param model: Foundry deployment name to use. Falls back to
-        ``FOUNDRY_DEFAULT_DEPLOYMENT`` env var, then to ``gpt-4o-mini``.
-        Pass a deployment name like ``gpt-5-mini`` (cheap tier) or
-        ``gpt-5`` (deep reasoning) — the CLI ``--model`` arg threads
+        ``FOUNDRY_DEFAULT_DEPLOYMENT`` env var, then to ``gpt-6-luna``.
+        ``gpt-6-sol`` is restricted to an explicit on-demand plan — ``--model`` threads
         through to here so callers can pick per-run.
     :param orphan_client: Separate SDK client for fail-open housekeeping. Omit to
         skip sweeping; an abandoned housekeeping call must not retire the work client.
     """
+    deployment = _deployment(model, mode)
     deadline = time.monotonic() + resolve_run_timeout_seconds()
     # Housekeeping only — never allowed to block agent creation. sweep_orphaned_agents
     # already swallows AzureError, so this catches what is left: a generated client can
@@ -1082,7 +1118,9 @@ def create_agent(
         tool_functions.add(apply_improvement)
 
     tools = FunctionTool(functions=tool_functions)
-    deployment = model or DEFAULT_DEPLOYMENT
+    # Classic AgentsClient does not declare reasoning_effort. Do not pass an
+    # ignored kwarg and claim it controls reasoning; bound the run instead.
+    sampling = {} if deployment.startswith("gpt-6-") else {"temperature": 0.3}
 
     try:
         agent = _call_foundry_with_retry(
@@ -1093,7 +1131,7 @@ def create_agent(
             name=AGENT_NAME,
             instructions=SYSTEM_PROMPT,
             tools=tools.definitions,
-            temperature=0.3,
+            **sampling,
         )
     except _RunDeadlineExceeded as exc:
         raise FoundryRunAbortedError(
@@ -1149,6 +1187,7 @@ def _append_cost_row(
             "plan_captured": plan_captured,
             "duration_s": round(duration_s, 1),
             **_run_token_usage(run),
+            **_run_cost_estimate(run),
         }
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
@@ -1200,6 +1239,27 @@ def _run_token_usage(run: Any) -> dict[str, Any]:
         return getattr(usage, key, None)
 
     return {key: field(key) for key in ("prompt_tokens", "completion_tokens", "total_tokens")}
+
+
+def _run_cost_estimate(run: Any) -> dict[str, Any]:
+    reported = getattr(run, "model", None)
+    model = next((
+        known for known in MODEL_PRICES
+        if isinstance(reported, str) and (reported == known or reported.startswith(known + "-"))
+    ), None)
+    usage = _run_token_usage(run)
+    prompt, completion = usage["prompt_tokens"], usage["completion_tokens"]
+    cost = None
+    if model is not None and type(prompt) is int and type(completion) is int and min(prompt, completion) >= 0:
+        input_rate, output_rate, _cached_rate = MODEL_PRICES[model]
+        cost = (prompt * input_rate + completion * output_rate) / 1_000_000
+    else:
+        log.warning("Run USD estimate unavailable: missing/unknown model or token usage")
+    return {
+        "model": reported if isinstance(reported, str) else None,
+        "estimated_usd_uncached": cost,
+        "cost_basis": "uncached_input_upper_bound" if cost is not None else "unavailable",
+    }
 
 
 def _log_run_cost(
@@ -1350,6 +1410,7 @@ def run_agent(
     task: str,
     *,
     mode: str = "unknown",
+    model: str | None = None,
 ) -> dict | None:
     """Run the agent with a task message. Returns the parsed plan or None.
 
@@ -1367,6 +1428,8 @@ def run_agent(
         the rows exist to show. Defaults to ``"unknown"`` rather than guessing,
         so a caller that says nothing is visible as such in the data.
     """
+    deployment = _deployment(model, mode)
+    budget_options = _prompt_budget_kwargs(client.runs.create, deployment)
     max_tool_rounds = resolve_max_tool_rounds()
     stuck_repeats = resolve_stuck_repeats()
     timeout_seconds = resolve_run_timeout_seconds()
@@ -1415,7 +1478,8 @@ def run_agent(
             late_result=lambda late_run: _cancel_run(client, thread.id, late_run),
             thread_id=thread.id,
             agent_id=agent_id,
-            **_prompt_budget_kwargs(client.runs.create),
+            model=deployment,
+            **budget_options,
         )
         log.info("Run started: %s", run.id)
 

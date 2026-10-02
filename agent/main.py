@@ -537,7 +537,7 @@ def plan_project(
 
     try:
         task = build_plan_task(findings, config)
-        plan = run_agent(client, agent_id, project_dir, config, task, mode="plan")
+        plan = run_agent(client, agent_id, project_dir, config, task, mode="plan", model=model)
 
         if plan:
             log.info(
@@ -1129,7 +1129,7 @@ def plan_functional(
             # "file-ideas", not "plan": the agent is built with the plan tool set, but
             # this is the daily sweep, and its cost rows are the ones worth telling
             # apart from an on-demand plan.
-            plan = run_agent(client, agent_id, project_dir, config, task, mode="file-ideas")
+            plan = run_agent(client, agent_id, project_dir, config, task, mode="file-ideas", model=model)
             if plan is not None:
                 if plan.get("outcome") == "no_gap":
                     log.info("Functional ideation for %s: evidence-backed no_gap.", config.name)
@@ -1765,7 +1765,7 @@ def refine_project(
         # Refine writes into the live worktree, so an aborted run must not leave
         # half-applied edits behind for a later run to commit.
         try:
-            run_agent(client, agent_id, project_dir, config, task, mode="refine")
+            run_agent(client, agent_id, project_dir, config, task, mode="refine", model=model)
         except FoundryRunIncompleteError as exc:
             log.error("Refine run ended incomplete (%s) — rolling back partial changes.", exc.reason)
             return False
@@ -1989,11 +1989,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--model",
-        default=os.environ.get("FOUNDRY_DEFAULT_DEPLOYMENT", "gpt-4o-mini"),
+        default=None,
         help=(
             "Foundry deployment name to use for plan/file-ideas/refine modes. "
-            "Defaults to FOUNDRY_DEFAULT_DEPLOYMENT env var, then gpt-4o-mini. "
-            "Set to a higher-tier deployment (e.g. gpt-5) for deep analysis."
+            "Defaults to FOUNDRY_DEFAULT_DEPLOYMENT env var, then gpt-6-luna. "
+            "gpt-6-sol is only for an explicit --repo --mode plan --model gpt-6-sol."
         ),
     )
     parser.add_argument("--dry-run", action="store_true")
@@ -2019,6 +2019,12 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    requested_model = args.model
+    args.model = args.model or os.environ.get("FOUNDRY_DEFAULT_DEPLOYMENT", "gpt-6-luna")
+    if args.model == "gpt-6-sol" and (
+        requested_model != "gpt-6-sol" or args.mode != "plan" or not args.repo or args.manifest
+    ):
+        parser.error("Sol requires an explicit --repo owner/name --mode plan --model gpt-6-sol")
     if args.repo is not None and not _is_valid_repo_slug(args.repo):
         parser.error("--repo must be in the format owner/name")
     # Resolve repo list

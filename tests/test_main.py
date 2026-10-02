@@ -255,7 +255,7 @@ def test_main_plan_passes_model_to_plan_project(
 @pytest.mark.parametrize(
     ("deployment", "model_args", "expected"),
     [
-        (None, [], "gpt-4o-mini"),
+        (None, [], "gpt-6-luna"),
         ("configured-deployment", [], "configured-deployment"),
         ("configured-deployment", ["--model", "requested-deployment"], "requested-deployment"),
     ],

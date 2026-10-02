@@ -70,8 +70,8 @@ python -m agent.main --repo owner/repo --mode dashboard --output dashboard.html
 ```
 
 `--model` selects the deployment for `plan`, `refine`, and both technical and functional
-planning in `file-ideas`. It overrides `FOUNDRY_DEFAULT_DEPLOYMENT`; the default remains
-`gpt-4o-mini`.
+planning in `file-ideas`. It overrides `FOUNDRY_DEFAULT_DEPLOYMENT`; the candidate
+routine default is `gpt-6-luna`, conditional on the [model pilot](#model-pilot).
 
 `file-ideas --dry-run` suppresses issue creation and Telegram notifications, but can
 still use Foundry to generate plans. The governance filer must support `--repo` and
@@ -152,8 +152,8 @@ autoRefine/
 
 autoRefine is a **Foundry hosted agent** with function-calling tools:
 
-- **Model**: `gpt-4o-mini` by default (cheap, runs across 11 repos). Bump to
-  `gpt-5` for one-off deep analysis via `python -m agent.main --model gpt-5`.
+- **Model**: candidate `gpt-6-luna` for routine work. Explicit single-repo
+  `--mode plan --model gpt-6-sol` is the only premium path.
   The closed-loop PR reviewer (deep-review) lives in `samoletovs/nauroLabs-github`
   and uses Claude Opus 4 (via GitHub Models) — see that repo's AGENT_ROLES.md.
 - **Tools**: GitHub API, file system, test runner, quality checkers
@@ -164,9 +164,72 @@ autoRefine is a **Foundry hosted agent** with function-calling tools:
 
 - Python 3.11+
 - Microsoft Foundry (Azure AI Projects SDK)
-- Azure OpenAI (`gpt-4o-mini` default, configurable via CLI / env)
+- Azure OpenAI (selective Luna/Sol candidate, with GPT-4.1 / GPT-4o mini rollback)
 - GitHub API (`gh` CLI + REST)
 - PyYAML for `project.yaml` parsing
+
+## Model pilot
+
+**Prepared, not promoted.** Parent approval of synthetic API/quality evaluation
+and the combined +$10/month pilot is required before activation. Tests here
+use synthetic SDK transports; they neither call Azure nor run a health scan.
+Even a real `--dry-run` calls services and spends money.
+
+| Surface | Resource, deployment and actual model | Configuration |
+|---|---|---|
+| Health analyst, Chat Completions | `foundrylab-aiservices`, `gpt-6-luna`, `gpt-6-luna` v2026-09-22 | `AZURE_OPENAI_ENDPOINT=https://foundrylab-aiservices.cognitiveservices.azure.com/`, `HEALTH_SCAN_MODEL=gpt-6-luna` |
+| Classic Foundry planning | same account, `gpt-6-luna` v2026-09-22 | `FOUNDRY_PROJECT_ENDPOINT=https://foundrylab-aiservices.services.ai.azure.com/api/projects/foundrylab`, `FOUNDRY_DEFAULT_DEPLOYMENT=gpt-6-luna` |
+| On-demand deep plan | same account, `gpt-6-sol` v2026-09-22 | `--repo owner/name --mode plan --model gpt-6-sol` |
+
+Deployment aliases are not inferred: use the same-named actual deployments.
+The health analyst uses `max_completion_tokens<=4000` and
+`reasoning_effort=none`; `HEALTH_SCAN_MAX_TOKENS` may lower but not raise the
+pilot ceiling. `AZURE_OPENAI_DEPLOYMENT` is not used by this health path.
+Sol is refused by scheduled health analysis and fleet/write modes.
+
+Classic agents have run-wide input/output ceilings, not Chat Completions
+parameters: routine **200,000 / 16,000**, Sol **40,000 / 4,000**.
+`AUTOREFINE_MAX_PROMPT_TOKENS` and `AUTOREFINE_MAX_COMPLETION_TOKENS` can lower
+these. Sol clamps larger configured values to its own limits. The existing
+1,800-second run deadline, 12-message window, round/repetition guards,
+cancellation/cleanup and fail-closed plan contracts are unchanged.
+
+**Classic support is a separate blocker.** The installed `azure-ai-agents`
+1.1 SDK and its documented create/run signatures do not declare
+`reasoning_effort`. This branch deliberately does not pass it through
+`**kwargs`, since a generated client may drop it. No claim of `low` reasoning
+is made for classic Sol. Parent must verify Luna/Sol support, tools and
+run-wide completion caps synthetically on this exact service before promotion.
+If explicit reasoning effort is required, classic promotion stays blocked;
+a service/API migration is separate work, not a hidden fallback.
+
+Run telemetry now includes the service-reported model and an
+`estimated_usd_uncached` upper-bound estimate. Global short-context USD/M:
+Luna **0.10 input / 0.50 output / 0.01 cached input**; Sol **2 / 10 / 0.20**.
+Classic usage has no reliable cached-input count, so **all input is priced
+uncached**, not at the cached rate. Unknown model or missing usage yields
+`cost_basis=unavailable` and no price estimate, with a warning.
+
+### Parent activation and rollback
+
+- [autorefine-health-scan.yml](.github/workflows/autorefine-health-scan.yml),
+  job `health-scan`, uses repository variable `HEALTH_SCAN_MODEL` ahead of its
+  default. The existing `AZURE_OPENAI_ENDPOINT` secret may select another
+  account; verify it without exposing it. Secrets/auth are unchanged here.
+- Planning production is the existing Container Apps Job declared in
+  [main.bicep](infrastructure/main.bicep), not a deployment workflow.
+  Its entrypoint clones default-branch Python on startup, but the job's
+  `FOUNDRY_DEFAULT_DEPLOYMENT` and `AUTOREFINE_MAX_COMPLETION_TOKENS=16000`
+  environment changes require parent IaC deployment. Code merge alone does
+  not prove that configuration is live.
+- Agents named `autorefine` are ephemeral, created and cleaned up per run;
+  there is no persistent agent to update. Existing unrelated shared-project
+  agents must not be edited.
+- Roll back **both** `HEALTH_SCAN_MODEL` and `FOUNDRY_DEFAULT_DEPLOYMENT` to
+  `gpt-4o-mini` or `gpt-4.1` on the approved resource. Health requests regain
+  legacy `max_tokens`/temperature; classic requests retain their finite
+  run caps. Do not raise budgets or change cadence to hide a failed gate.
+- There is no repository-owned `copilot-triage` workflow in this repo.
 
 ## Cost
 

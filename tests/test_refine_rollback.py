@@ -138,6 +138,7 @@ def test_terminal_refine_run_rolls_back_and_never_publishes(
         thread_id: str,
         agent_id: str,
         max_prompt_tokens: int | None = None,
+        max_completion_tokens: int | None = None,
         truncation_strategy: object = None,
         **_kwargs: object,
     ) -> SimpleNamespace:

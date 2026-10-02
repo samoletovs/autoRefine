@@ -89,7 +89,7 @@ class AutoRefineConfig:
     # Default model: cheap Foundry tier for daily scans of 11 repos.
     # Override via CLI --model or FOUNDRY_DEFAULT_DEPLOYMENT env var.
     # See AGENTS.md "Model strategy" for the tiered plan.
-    model: str = "gpt-4o-mini"
+    model: str = "gpt-6-luna"
     dry_run: bool = False
     workdir: Path = field(default_factory=lambda: Path("/tmp/autorefine"))
     # True only for a manifest-driven sweep of every project. Such a sweep re-plans
