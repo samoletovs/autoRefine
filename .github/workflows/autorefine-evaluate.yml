@@ -47,10 +47,12 @@ permissions:
 # and re-reads every project in the manifest, so two dispatches at once buy two
 # full bills for one answer.
 #
-# cancel-in-progress is deliberately false. agent/main.py deletes its ephemeral
-# Foundry agent in a `finally` block, and a cancelled job is a hard kill that
-# never reaches it — cancelling would save an Actions minute and leak an agent
-# that then survives until the next run's sweep_orphaned_agents clears it.
+# cancel-in-progress is deliberately false. A cancelled job is a hard kill that
+# never reaches run_agent's `finally`, so the run's cost row is never written and
+# its stored Foundry responses are left to the service's own expiry — cancelling
+# would save an Actions minute and lose the measurement of what the run cost.
+# (The agent itself is a persistent version since the Responses migration, so a
+# kill can no longer orphan one.)
 concurrency:
   group: autorefine-evaluate
   cancel-in-progress: false
@@ -149,8 +151,10 @@ jobs:
       # suffix and passes `--resource` — so this writes the cache entry it will later
       # look for, rather than one that merely ought to normalise to the same key.
       #
-      # https://ai.azure.com is the AgentsClient default scope; ARM is what `az login`
-      # already holds, re-taken here so the whole set shares one expiry.
+      # https://ai.azure.com is the scope of the OpenAI client that
+      # AIProjectClient.get_openai_client builds (and of the project client itself);
+      # ARM is what `az login` already holds, re-taken here so the whole set shares
+      # one expiry.
       #
       # Fail-open and quiet. `--output none` keeps tokens out of the log, and the
       # fallback keeps a diagnostic from killing the ~43 minutes of work it exists to

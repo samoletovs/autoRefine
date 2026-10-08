@@ -5,16 +5,16 @@ from __future__ import annotations
 import inspect
 import json
 import logging
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import httpx
+import openai
 import pytest
 from azure.core.exceptions import (
     HttpResponseError,
-    ServiceRequestError,
-    ServiceResponseError,
+    ResourceNotFoundError,
 )
 
 from agent import foundry_agent
@@ -24,40 +24,134 @@ from agent.foundry_agent import (
     create_agent,
 )
 from tests.plan_fixtures import valid_plan
+from tests.test_foundry_loop_guards import AGENT, _DummyToolCall, _ToolLoopClient
 
 
-class FakeFunctionTool:
-    def __init__(self, functions: set) -> None:
-        self.functions = functions
-        self.definitions = [{"name": fn.__name__} for fn in functions]
+class FakeAgents:
+    """``project.agents`` double: versions newest first, as ``order="desc"`` returns."""
+
+    def __init__(self, versions: list[SimpleNamespace] | None = None, *, missing: bool = False) -> None:
+        self.versions = list(versions or [])
+        self.missing = missing
+        self.created: list[dict] = []
+        self.list_kwargs: list[dict] = []
+
+    def list_versions(self, agent_name: str, **kwargs: object) -> list[SimpleNamespace]:
+        self.list_kwargs.append({"agent_name": agent_name, **kwargs})
+        if self.missing:
+            raise ResourceNotFoundError("agent not found")
+        return [v for v in self.versions if v.name == agent_name]
+
+    def create_version(self, agent_name: str, **kwargs: object) -> SimpleNamespace:
+        self.created.append({"agent_name": agent_name, **kwargs})
+        same_name = [int(v.version) for v in self.versions if v.name == agent_name]
+        version = SimpleNamespace(
+            name=agent_name, version=str(max(same_name, default=0) + 1),
+            metadata=kwargs["metadata"],
+        )
+        self.versions.insert(0, version)
+        self.missing = False
+        return version
 
 
-class FakeClient:
-    def __init__(self) -> None:
-        self.kwargs = {}
-
-    def create_agent(self, **kwargs: object) -> SimpleNamespace:
-        self.kwargs = kwargs
-        return SimpleNamespace(id="agent-1")
+def _project(agents: FakeAgents | None = None) -> SimpleNamespace:
+    return SimpleNamespace(agents=agents or FakeAgents())
 
 
-def test_create_agent_works_without_search_web_tool(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(foundry_agent, "FunctionTool", FakeFunctionTool)
-    client = FakeClient()
+def _tool_names(definition: object) -> set[str]:
+    return {tool["name"] for tool in definition.as_dict()["tools"]}
 
-    agent_id = foundry_agent.create_agent(client, mode="plan")
 
-    assert agent_id == "agent-1"
-    tool_names = {tool["name"] for tool in client.kwargs["tools"]}
-    assert "search_web" not in tool_names
-    assert tool_names == {
+def test_create_agent_publishes_a_plan_version_without_search_web_tool() -> None:
+    project = _project()
+
+    agent = foundry_agent.create_agent(project, mode="plan")
+
+    assert agent == foundry_agent.AgentVersion("autorefine-plan", "1", "gpt-4o-mini")
+    (created,) = project.agents.created
+    assert created["agent_name"] == "autorefine-plan"
+    assert _tool_names(created["definition"]) == {
         "read_project_file",
         "list_directory",
         "run_project_tests",
         "submit_plan",
     }
+    assert created["definition"].instructions == foundry_agent.SYSTEM_PROMPT
+    assert created["metadata"] == {
+        foundry_agent.AGENT_DEFINITION_METADATA_KEY:
+            foundry_agent.definition_fingerprint(created["definition"]),
+    }
+
+
+def test_refine_agent_is_a_separate_name_with_the_write_tools() -> None:
+    project = _project()
+
+    agent = foundry_agent.create_agent(project, mode="refine")
+
+    assert agent.name == "autorefine-refine"
+    assert _tool_names(project.agents.created[0]["definition"]) == {
+        "read_project_file", "list_directory", "run_project_tests", "submit_plan",
+        "write_project_file", "apply_improvement",
+    }
+
+
+def test_unchanged_definition_reuses_the_existing_version() -> None:
+    """Nothing is created per run, so a crashed run can leave nothing behind."""
+    project = _project()
+    first = foundry_agent.create_agent(project, mode="plan")
+    second = foundry_agent.create_agent(project, mode="plan")
+
+    assert first == second
+    assert len(project.agents.created) == 1
+    assert project.agents.list_kwargs[-1]["order"] == "desc"
+
+
+def test_changed_definition_gets_a_new_version_and_older_matches_are_reused() -> None:
+    """A --model override must not flip-flop the agent into a new version each run."""
+    project = _project()
+    mini = foundry_agent.create_agent(project, mode="plan")
+    gpt41 = foundry_agent.create_agent(project, mode="plan", model="gpt-4.1")
+    mini_again = foundry_agent.create_agent(project, mode="plan")
+
+    assert (mini.version, gpt41.version) == ("1", "2")
+    assert gpt41.model == "gpt-4.1"
+    assert mini_again == mini, "the older matching version is pinned, not republished"
+    assert len(project.agents.created) == 2
+
+
+def test_a_forged_or_foreign_version_without_our_fingerprint_is_never_reused() -> None:
+    foreign = SimpleNamespace(name="autorefine-plan", version="9", metadata={"other": "x"})
+    project = _project(FakeAgents([foreign]))
+
+    agent = foundry_agent.create_agent(project, mode="plan")
+
+    assert agent.version == "10"
+
+
+def test_missing_agent_is_created_on_first_use() -> None:
+    project = _project(FakeAgents(missing=True))
+
+    assert foundry_agent.create_agent(project, mode="plan").version == "1"
+
+
+def test_definition_fingerprint_tracks_model_prompt_tools_and_sampling() -> None:
+    fingerprint = foundry_agent.definition_fingerprint
+    build = foundry_agent.build_agent_definition
+    base = fingerprint(build("plan", "gpt-4o-mini"))
+
+    assert base == fingerprint(build("plan", "gpt-4o-mini"))
+    assert base != fingerprint(build("plan", "gpt-4.1"))
+    assert base != fingerprint(build("refine", "gpt-4o-mini"))
+    assert build("plan", "gpt-4o-mini").temperature == 0.3
+
+
+def test_tool_schemas_match_the_dispatch_table() -> None:
+    names = {tool.name for tool in foundry_agent.tool_definitions("refine")}
+    assert names == set(foundry_agent.TOOL_HANDLERS)
+    plan = {tool.as_dict()["name"]: tool.as_dict() for tool in foundry_agent.tool_definitions()}
+    assert plan["submit_plan"]["parameters"]["properties"]["improvements"]["type"] == "array"
+    assert plan["submit_plan"]["parameters"]["properties"]["score"]["type"] == "integer"
+    assert all(tool["type"] == "function" for tool in plan.values())
 
 
 def test_tool_handlers_do_not_include_search_web() -> None:
@@ -162,236 +256,25 @@ def test_handle_run_tests_no_runner_detected(tmp_path: Path) -> None:
 
 
 def test_create_agent_uses_passed_model() -> None:
-    fake_created = SimpleNamespace(id="agent-123")
-    fake_client = SimpleNamespace()
+    project = _project()
 
-    with patch("agent.foundry_agent.FunctionTool") as mock_tool, patch.object(
-        fake_client, "create_agent", return_value=fake_created, create=True
-    ) as mock_create_agent:
-        mock_tool.return_value.definitions = ["tool-a"]
-        agent_id = foundry_agent.create_agent(fake_client, mode="plan", model="gpt-4.1")
+    agent = foundry_agent.create_agent(project, mode="plan", model="gpt-4.1")
 
-    assert agent_id == "agent-123"
-    assert mock_create_agent.call_args.kwargs["model"] == "gpt-4.1"
+    assert agent.model == "gpt-4.1"
+    assert project.agents.created[0]["definition"].model == "gpt-4.1"
 
 
-class FakeSweepClient:
-    """Client double exposing just the listing/deleting surface the sweep uses."""
-
-    def __init__(self, agents: list[SimpleNamespace], undeletable: set[str] | None = None) -> None:
-        self._agents = agents
-        self._undeletable = undeletable or set()
-        self.deleted: list[str] = []
-
-    def list_agents(self, **_kwargs: object) -> list[SimpleNamespace]:
-        return self._agents
-
-    def delete_agent(self, agent_id: str, **_kwargs: object) -> None:
-        if agent_id in self._undeletable:
-            raise HttpResponseError("boom")
-        self.deleted.append(agent_id)
-
-    def create_agent(self, **kwargs: object) -> SimpleNamespace:
-        return SimpleNamespace(id="agent-new")
-
-
-def _agent(name: str, agent_id: str, age: timedelta) -> SimpleNamespace:
-    return SimpleNamespace(
-        name=name, id=agent_id, created_at=datetime.now(timezone.utc) - age
-    )
-
-
-def test_sweep_deletes_only_stale_autorefine_agents() -> None:
-    client = FakeSweepClient(
-        [
-            _agent("autorefine", "stale-1", timedelta(days=5)),
-            _agent("autorefine", "stale-2", timedelta(hours=7)),
-            _agent("autorefine", "live", timedelta(minutes=20)),
-            _agent("atlas-teacher", "other-project", timedelta(days=90)),
-        ]
-    )
-
-    swept = foundry_agent.sweep_orphaned_agents(client)
-
-    assert swept == 2
-    assert client.deleted == ["stale-1", "stale-2"]
-
-
-def test_sweep_ignores_agents_without_creation_time() -> None:
-    client = FakeSweepClient([SimpleNamespace(name="autorefine", id="x", created_at=None)])
-
-    assert foundry_agent.sweep_orphaned_agents(client) == 0
-    assert client.deleted == []
-
-
-def test_sweep_returns_zero_when_listing_fails() -> None:
-    client = SimpleNamespace()
-    with patch.object(
-        client, "list_agents", side_effect=HttpResponseError("nope"), create=True
-    ):
-        assert foundry_agent.sweep_orphaned_agents(client) == 0
-
-
-def test_sweep_continues_after_a_failed_delete() -> None:
-    client = FakeSweepClient(
-        [
-            _agent("autorefine", "undeletable", timedelta(days=2)),
-            _agent("autorefine", "deletable", timedelta(days=2)),
-        ],
-        undeletable={"undeletable"},
-    )
-
-    assert foundry_agent.sweep_orphaned_agents(client) == 1
-    assert client.deleted == ["deletable"]
-
-
-def test_create_agent_sweeps_orphans_before_creating(
+def test_create_agent_deadline_is_a_run_deadline_abort(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(foundry_agent, "FunctionTool", FakeFunctionTool)
-    client = FakeSweepClient([_agent("autorefine", "stale", timedelta(days=3))])
+    monkeypatch.setenv("AUTOREFINE_RUN_TIMEOUT_SECONDS", "1")
+    agents = FakeAgents()
+    agents.list_versions = Mock(side_effect=foundry_agent._RunDeadlineExceeded("late"))
 
-    assert foundry_agent.create_agent(
-        FakeSweepClient([]), mode="plan", orphan_client=client,
-    ) == "agent-new"
-    assert client.deleted == ["stale"]
+    with pytest.raises(foundry_agent.FoundryRunAbortedError) as error:
+        foundry_agent.create_agent(_project(agents))
 
-
-def test_create_agent_still_works_when_client_cannot_list(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(foundry_agent, "FunctionTool", FakeFunctionTool)
-
-    assert foundry_agent.create_agent(FakeClient(), mode="plan") == "agent-1"
-
-
-class TestSweepFailsOpen:
-    """Cleanup must never destroy the work the run came to do.
-
-    ``ServiceRequestError`` and ``ServiceResponseError`` are what azure-core
-    raises for a connection reset, a DNS failure or a read timeout. They are
-    *siblings* of ``HttpResponseError`` under ``AzureError``, not subclasses, so
-    a sweep that caught only ``HttpResponseError`` let a transient network blip
-    during housekeeping abort agent creation and take the whole run with it.
-    """
-
-    @pytest.fixture(autouse=True)
-    def no_retry_wait(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(foundry_agent._call_foundry_with_retry.retry, "sleep", lambda _: None)
-
-    @pytest.mark.parametrize(
-        "error",
-        [
-            ServiceRequestError("connection reset by peer"),
-            ServiceResponseError("read timed out"),
-            HttpResponseError("500 from the service"),
-        ],
-        ids=["connection-reset", "read-timeout", "http-error"],
-    )
-    def test_listing_failure_is_swallowed(self, error: Exception) -> None:
-        client = SimpleNamespace()
-        with patch.object(client, "list_agents", side_effect=error, create=True):
-            assert foundry_agent.sweep_orphaned_agents(client) == 0
-
-    @pytest.mark.parametrize(
-        "error",
-        [ServiceRequestError("connection reset"), ServiceResponseError("timeout")],
-        ids=["connection-reset", "read-timeout"],
-    )
-    def test_transient_network_error_does_not_block_agent_creation(
-        self, error: Exception, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The regression: the run must still get its agent."""
-        monkeypatch.setattr(foundry_agent, "FunctionTool", FakeFunctionTool)
-
-        client = FakeSweepClient([])
-        with patch.object(client, "list_agents", side_effect=error):
-            assert foundry_agent.create_agent(
-                FakeSweepClient([]), mode="plan", orphan_client=client,
-            ) == "agent-new"
-
-    def test_delete_failure_is_swallowed_and_the_sweep_continues(self) -> None:
-        client = FakeSweepClient(
-            [
-                _agent("autorefine", "unreachable", timedelta(days=2)),
-                _agent("autorefine", "deletable", timedelta(days=2)),
-            ]
-        )
-        real_delete = client.delete_agent
-
-        def flaky(agent_id: str, **_kwargs: object) -> None:
-            if agent_id == "unreachable":
-                raise ServiceRequestError("connection reset")
-            real_delete(agent_id)
-
-        with patch.object(client, "delete_agent", side_effect=flaky):
-            assert foundry_agent.sweep_orphaned_agents(client) == 1
-        assert client.deleted == ["deletable"]
-
-    def test_unexpected_error_still_does_not_block_agent_creation(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The client is generated; a malformed response can raise anything."""
-        monkeypatch.setattr(foundry_agent, "FunctionTool", FakeFunctionTool)
-
-        client = FakeSweepClient([])
-        with patch.object(client, "list_agents", side_effect=RuntimeError("bad payload")):
-            assert foundry_agent.create_agent(
-                FakeSweepClient([]), mode="plan", orphan_client=client,
-            ) == "agent-new"
-
-
-class TestSweepTimestampHandling:
-    """A single odd record must not abort the sweep or the run."""
-
-    @staticmethod
-    def _naive(name: str, agent_id: str, age: timedelta) -> SimpleNamespace:
-        """An agent whose ``created_at`` lost its tzinfo, as a generated client can."""
-        record = _agent(name, agent_id, age)
-        record.created_at = record.created_at.replace(tzinfo=None)
-        return record
-
-    def test_naive_created_at_is_read_as_utc_not_a_crash(self) -> None:
-        """Comparing naive against the aware cutoff used to raise TypeError."""
-        client = FakeSweepClient([self._naive("autorefine", "naive-stale", timedelta(days=2))])
-
-        assert foundry_agent.sweep_orphaned_agents(client) == 1
-        assert client.deleted == ["naive-stale"]
-
-    def test_naive_but_recent_agent_is_still_protected_by_the_age_gate(self) -> None:
-        """Normalising must not turn a live agent into a sweepable one."""
-        client = FakeSweepClient([self._naive("autorefine", "naive-live", timedelta(minutes=5))])
-
-        assert foundry_agent.sweep_orphaned_agents(client) == 0
-        assert client.deleted == []
-
-    def test_record_without_a_name_attribute_is_skipped(self) -> None:
-        client = FakeSweepClient([SimpleNamespace(id="nameless", created_at=None)])
-
-        assert foundry_agent.sweep_orphaned_agents(client) == 0
-        assert client.deleted == []
-
-    def test_age_gate_still_spares_other_projects_agents(self) -> None:
-        """AGENTS.md: atlas-* and lab-memory share the project and are persistent."""
-        client = FakeSweepClient(
-            [
-                _agent("atlas-teacher", "other", timedelta(days=90)),
-                _agent("lab-memory", "memory", timedelta(days=90)),
-                _agent("autorefine", "ours", timedelta(days=2)),
-            ]
-        )
-
-        assert foundry_agent.sweep_orphaned_agents(client) == 1
-        assert client.deleted == ["ours"]
-
-
-def test_tool_definition_stubs_return_empty_string() -> None:
-    assert foundry_agent.read_project_file("README.md") == ""
-    assert foundry_agent.list_directory(".") == ""
-    assert foundry_agent.run_project_tests() == ""
-    assert foundry_agent.submit_plan(80, "summary", []) == ""
-    assert foundry_agent.write_project_file("x.txt", "body") == ""
-    assert foundry_agent.apply_improvement("t", "d", []) == ""
+    assert error.value.reason == "run_deadline"
 
 
 def test_handle_read_project_file_success_and_truncation(tmp_path: Path) -> None:
@@ -560,104 +443,48 @@ def test_build_refine_task_lists_improvements() -> None:
 
 def test_run_agent_handles_failed_status() -> None:
     config = ProjectConfig(name="demo", purpose="", users="", stage="active")
+    client = _ToolLoopClient(lambda n: None)
+    original = client.next_response
 
-    thread_api = SimpleNamespace(
-        create=lambda **_kwargs: SimpleNamespace(id="thread-1"),
-        delete=lambda _thread_id, **_kwargs: None,
-    )
-    messages_api = SimpleNamespace(create=lambda **_kwargs: None, list=lambda **_kwargs: [])
-    def create_run(
-        *,
-        thread_id: str,
-        agent_id: str,
-        max_prompt_tokens: int | None = None,
-        max_completion_tokens: int | None = None,
-        truncation_strategy: object = None,
-        **_kwargs: object,
-    ) -> SimpleNamespace:
-        return SimpleNamespace(
-            id="run-1", status="failed", last_error=SimpleNamespace(code="server_error")
-        )
+    def failed() -> SimpleNamespace:
+        response = original()
+        response.status = "failed"
+        response.error = SimpleNamespace(code="server_error", message="boom")
+        return response
 
-    runs_api = SimpleNamespace(create=create_run)
-    client = SimpleNamespace(threads=thread_api, messages=messages_api, runs=runs_api)
+    client.next_response = failed
 
-    result = foundry_agent.run_agent(client, "agent-1", Path("."), config, "task")
+    result = foundry_agent.run_agent(client, AGENT, Path("."), config, "task")
     assert result is None
 
 
-def test_run_agent_processes_tool_calls_and_returns_plan(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_run_agent_processes_tool_calls_and_returns_plan() -> None:
     config = ProjectConfig(name="demo", purpose="", users="", stage="active")
+    client = _ToolLoopClient(lambda n: [
+        _DummyToolCall("call-1", "submit_plan", json.dumps(valid_plan())),
+    ] if n == 1 else None)
+    client.final_text = "Score: 72/100\n1. **Fix tests** — add tests"
 
-    class DummyFunction:
-        def __init__(self, name: str, arguments: str) -> None:
-            self.name = name
-            self.arguments = arguments
-
-    class DummyToolCall:
-        def __init__(self, tool_call_id: str, name: str, arguments: str) -> None:
-            self.id = tool_call_id
-            self.function = DummyFunction(name, arguments)
-
-    class DummySubmitToolOutputsAction:
-        def __init__(self, tool_calls: list[DummyToolCall]) -> None:
-            self.submit_tool_outputs = SimpleNamespace(tool_calls=tool_calls)
-
-    class DummyToolOutput:
-        def __init__(self, tool_call_id: str, output: str) -> None:
-            self.tool_call_id = tool_call_id
-            self.output = output
-
-    monkeypatch.setattr(foundry_agent, "RequiredFunctionToolCall", DummyToolCall)
-    monkeypatch.setattr(foundry_agent, "SubmitToolOutputsAction", DummySubmitToolOutputsAction)
-    monkeypatch.setattr(foundry_agent, "ToolOutput", DummyToolOutput)
-
-    thread_api = SimpleNamespace(
-        create=lambda **_kwargs: SimpleNamespace(id="thread-1"),
-        delete=lambda _thread_id, **_kwargs: None,
-    )
-
-    agent_message = SimpleNamespace(
-        role=foundry_agent.MessageRole.AGENT,
-        text_messages=[SimpleNamespace(text=SimpleNamespace(value="Score: 72/100\n1. **Fix tests** — add tests"))],
-    )
-    messages_api = SimpleNamespace(
-        create=lambda **_kwargs: None,
-        list=lambda **_kwargs: [agent_message],
-    )
-
-    requires_action_run = SimpleNamespace(
-        id="run-1",
-        status="requires_action",
-        required_action=DummySubmitToolOutputsAction(
-            [DummyToolCall("call-1", "submit_plan", json.dumps(valid_plan()))]
-        ),
-    )
-    completed_run = SimpleNamespace(id="run-1", status="completed")
-
-    class RunsApi:
-        def create(
-            self,
-            *,
-            thread_id: str,
-            agent_id: str,
-            max_prompt_tokens: int | None = None,
-            max_completion_tokens: int | None = None,
-            truncation_strategy: object = None,
-            **_kwargs: object,
-        ) -> SimpleNamespace:
-            return requires_action_run
-
-        def submit_tool_outputs(self, **_kwargs: object) -> SimpleNamespace:
-            return completed_run
-
-        def get(self, **_kwargs: object) -> SimpleNamespace:
-            return completed_run
-
-    client = SimpleNamespace(threads=thread_api, messages=messages_api, runs=RunsApi())
-
-    result = foundry_agent.run_agent(client, "agent-1", Path("."), config, "task")
+    result = foundry_agent.run_agent(client, AGENT, Path("."), config, "task")
     assert result == {**valid_plan(), "research_insights": []}
+
+
+def test_run_agent_falls_back_to_the_final_text_only_when_it_validates(tmp_path: Path) -> None:
+    config = ProjectConfig(name="demo", purpose="", users="", stage="active")
+    client = _ToolLoopClient(lambda n: None)
+    client.final_text = "Score: 72/100\n1. **Fix tests** — add tests"
+
+    assert foundry_agent.run_agent(client, AGENT, tmp_path, config, "task") is None
+    assert len(client.requests) == 1, "the final text is read off the response, not refetched"
+
+
+def test_run_agent_refuses_an_agent_pinned_to_another_model(tmp_path: Path) -> None:
+    config = ProjectConfig(name="demo", purpose="", users="", stage="active")
+    client = _ToolLoopClient(lambda n: None)
+
+    with pytest.raises(ValueError, match="pinned to gpt-4o-mini"):
+        foundry_agent.run_agent(client, AGENT, tmp_path, config, "task", model="gpt-4.1")
+    assert client.requests == []
 
 
 # ── PR #23 additions: retry behaviour ────────────────────────────────────────
@@ -718,24 +545,40 @@ def test_foundry_retry_does_not_retry_http_400() -> None:
     assert calls == 1
 
 
+def test_openai_transient_errors_are_retried_and_permanent_ones_are_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_call_foundry_with_retry.retry, "sleep", lambda _seconds: None)
+    request = httpx.Request("POST", "https://example.test/openai/v1/responses")
+
+    def status(code: int) -> openai.APIStatusError:
+        return openai.APIStatusError("x", response=httpx.Response(code, request=request), body=None)
+
+    for error, retried in [
+        (status(429), True), (status(503), True), (status(500), False), (status(400), False),
+        (openai.APIConnectionError(request=request), True),
+        (openai.APITimeoutError(request=request), True),
+    ]:
+        operation = Mock(side_effect=[error, "ok"])
+        if retried:
+            assert _call_foundry_with_retry("client.responses.create", operation) == "ok"
+        else:
+            with pytest.raises(type(error)):
+                _call_foundry_with_retry("client.responses.create", operation)
+        assert operation.call_count == (2 if retried else 1)
+
+
 # ── Prompt-token budget (cost cap) ───────────────────────────────────────────
 
 
 def test_max_prompt_tokens_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("AUTOREFINE_MAX_PROMPT_TOKENS", raising=False)
-    monkeypatch.delenv("AUTOREFINE_TRUNCATION_LAST_MESSAGES", raising=False)
     assert foundry_agent.resolve_max_prompt_tokens() == foundry_agent.DEFAULT_MAX_PROMPT_TOKENS
-    assert (
-        foundry_agent.resolve_truncation_last_messages()
-        == foundry_agent.DEFAULT_TRUNCATION_LAST_MESSAGES
-    )
 
 
 def test_max_prompt_tokens_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AUTOREFINE_MAX_PROMPT_TOKENS", " 90000 ")
-    monkeypatch.setenv("AUTOREFINE_TRUNCATION_LAST_MESSAGES", "5")
     assert foundry_agent.resolve_max_prompt_tokens() == 90000
-    assert foundry_agent.resolve_truncation_last_messages() == 5
 
 
 @pytest.mark.parametrize("value", ["not-a-number", "0", "-1", "100", "19999"])
@@ -745,39 +588,44 @@ def test_max_prompt_tokens_rejects_invalid(value: str, monkeypatch: pytest.Monke
         foundry_agent.resolve_max_prompt_tokens()
 
 
-def test_truncation_last_messages_rejects_below_floor(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("AUTOREFINE_TRUNCATION_LAST_MESSAGES", "1")
-    with pytest.raises(ValueError):
-        foundry_agent.resolve_truncation_last_messages()
+def test_legacy_truncation_window_is_reported_not_silently_obeyed(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    from openai.resources.responses import Responses
+
+    monkeypatch.setenv("AUTOREFINE_TRUNCATION_LAST_MESSAGES", "4")
+    budget = foundry_agent._run_budget(Responses.create)
+    assert budget.truncation == "auto"
+    assert "AUTOREFINE_TRUNCATION_LAST_MESSAGES is ignored" in caplog.text
 
 
-def test_installed_sdk_supports_prompt_budget_kwargs() -> None:
-    """The pinned azure-ai-agents SDK must accept the cap; guards silent no-ops."""
-    from azure.ai.agents.operations import RunsOperations
+def test_installed_sdk_supports_the_response_bounds() -> None:
+    """The pinned openai SDK must declare the bounds; guards silent no-ops."""
+    from openai.resources.responses import Responses
 
-    params = inspect.signature(RunsOperations.create).parameters
-    assert "max_prompt_tokens" in params
-    assert "truncation_strategy" in params
+    params = inspect.signature(Responses.create).parameters
+    for name in ("truncation", "max_output_tokens", "previous_response_id", "extra_body"):
+        assert name in params
 
 
 def test_prompt_budget_fails_closed_when_sdk_lacks_params() -> None:
     """A future SDK dropping the params must error, never run unbounded."""
 
-    def legacy_create(thread_id: str, agent_id: str) -> None: ...
+    def legacy_create(input: object, model: str) -> None: ...  # noqa: A002
 
     with pytest.raises(foundry_agent.FoundryPromptBudgetUnsupportedError):
-        foundry_agent._prompt_budget_kwargs(legacy_create)
+        foundry_agent._run_budget(legacy_create)
 
 
 def test_prompt_budget_rejects_kwargs_only_signature() -> None:
-    """**kwargs is not evidence of support: generated clients drop unknown kwargs."""
+    """**kwargs is not evidence of support: a client may drop unknown kwargs."""
 
-    def kwargs_only_create(thread_id: str, **kwargs: object) -> None: ...
+    def kwargs_only_create(input: object, **kwargs: object) -> None: ...  # noqa: A002
 
     with pytest.raises(foundry_agent.FoundryPromptBudgetUnsupportedError) as excinfo:
-        foundry_agent._prompt_budget_kwargs(kwargs_only_create)
-    assert "max_prompt_tokens" in str(excinfo.value)
-    assert "truncation_strategy" in str(excinfo.value)
+        foundry_agent._run_budget(kwargs_only_create)
+    assert "truncation" in str(excinfo.value)
+    assert "max_output_tokens" in str(excinfo.value)
 
 
 def test_default_max_prompt_tokens_is_a_runaway_guard_not_a_per_call_cap() -> None:
@@ -786,238 +634,86 @@ def test_default_max_prompt_tokens_is_a_runaway_guard_not_a_per_call_cap() -> No
     assert foundry_agent.DEFAULT_MAX_PROMPT_TOKENS >= 100_000
 
 
-def test_real_sdk_puts_the_prompt_budget_on_the_wire() -> None:
-    """The budget must reach Foundry, not merely reach ``runs.create``.
+def test_real_sdk_puts_the_loop_on_the_wire(tmp_path: Path) -> None:
+    """The bounds and the chain must reach Foundry, not merely reach ``responses.create``.
 
-    Every other prompt-budget test here drives a hand-written fake whose ``create``
-    is *defined* to accept these parameters, so all of them would still pass if the
-    real generated client accepted the kwargs and dropped them before serialising —
-    the exact silent-no-op this whole change exists to prevent. This one runs the
-    real ``AgentsClient`` against a transport that captures the outgoing request and
-    asserts on the actual JSON body.
+    Every other loop test drives a hand-written fake whose ``create`` is *defined*
+    to accept these parameters, so all of them would still pass if the real OpenAI
+    client dropped them before serialising. This one runs the real ``openai.OpenAI``
+    client against a transport that captures the outgoing requests and asserts on
+    the actual JSON bodies: the pinned ``agent_reference``, ``truncation``, the
+    output budget, and a ``function_call_output`` chained by ``previous_response_id``.
     """
-    from azure.ai.agents import AgentsClient
-    from azure.core.credentials import AccessToken
-    from azure.core.pipeline.transport import HttpTransport
+    bodies: list[dict] = []
+    deleted: list[str] = []
+    (tmp_path / "README.md").write_text("# demo\n", encoding="utf-8")
 
-    captured: dict[str, object] = {}
-    run_payload = {
-        "id": "run_1",
-        "object": "thread.run",
-        "status": "queued",
-        "thread_id": "t1",
-        "assistant_id": "a1",
-        "created_at": 0,
-        "model": "gpt-4o-mini",
-        "instructions": "",
-        "tools": [],
-    }
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.method == "DELETE":
+            deleted.append(request.url.path.rsplit("/", 1)[-1])
+            return httpx.Response(200, json={"id": "x", "object": "response", "deleted": True})
+        body = json.loads(request.content)
+        bodies.append(body)
+        n = len(bodies)
+        usage = {
+            "input_tokens": 100, "output_tokens": 10, "total_tokens": 110,
+            "input_tokens_details": {"cached_tokens": 40},
+            "output_tokens_details": {"reasoning_tokens": 0},
+        }
+        if n == 1:
+            output = [{
+                "type": "function_call", "id": "fc_1", "call_id": "call_1",
+                "name": "read_project_file", "arguments": '{"path": "README.md"}',
+                "status": "completed",
+            }]
+        else:
+            output = [{
+                "type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
+                "content": [{"type": "output_text", "text": "Done.", "annotations": []}],
+            }]
+        return httpx.Response(200, json={
+            "id": f"resp_{n}", "object": "response", "created_at": 0, "status": "completed",
+            "model": "gpt-4o-mini", "output": output, "usage": usage,
+            "parallel_tool_calls": True, "tool_choice": "auto", "tools": [],
+        })
+
+    client = openai.OpenAI(
+        base_url="https://stub.services.ai.azure.com/api/projects/p/openai/v1",
+        api_key="synthetic",
+        max_retries=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(respond)),
+    )
+    config = ProjectConfig(name="demo", purpose="", users="", stage="active")
+
+    assert foundry_agent.run_agent(client, AGENT, tmp_path, config, "task") is None
+
+    reference = {"name": "autorefine-plan", "version": "7", "type": "agent_reference"}
+    assert [body["agent_reference"] for body in bodies] == [reference, reference]
+    assert all(body["truncation"] == "auto" and body["store"] is True for body in bodies)
+    assert bodies[0]["max_output_tokens"] == foundry_agent.DEFAULT_MAX_COMPLETION_TOKENS
+    assert bodies[1]["max_output_tokens"] == foundry_agent.DEFAULT_MAX_COMPLETION_TOKENS - 10
+    assert "previous_response_id" not in bodies[0]
+    assert bodies[1]["previous_response_id"] == "resp_1"
+    (item,) = bodies[1]["input"]
+    assert item["type"] == "function_call_output" and item["call_id"] == "call_1"
+    assert json.loads(item["output"])["content"] == "# demo"
+    assert "model" not in bodies[0], "the pinned agent version owns the model"
+    assert deleted == ["resp_1", "resp_2"]
+
+
+def test_open_foundry_clients_disables_hidden_sdk_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The application retry is the only one inside the elapsed deadline."""
+    from azure.core.credentials import AccessToken
 
     class StubCredential:
         def get_token(self, *_scopes: str, **_kwargs: object) -> AccessToken:
             return AccessToken("stub", 9_999_999_999)
 
-        def close(self) -> None: ...
-
-    class CapturingResponse:
-        status_code = 200
-        headers = {"content-type": "application/json"}
-        reason = "OK"
-        content_type = "application/json"
-        request = None
-
-        @property
-        def content(self) -> bytes:
-            return json.dumps(run_payload).encode()
-
-        def text(self, encoding: str | None = None) -> str:
-            return json.dumps(run_payload)
-
-        def body(self) -> bytes:
-            return self.content
-
-        def read(self) -> bytes:
-            return self.content
-
-        def json(self) -> dict:
-            return run_payload
-
-    class CapturingTransport(HttpTransport):
-        def send(self, request, **_kwargs):  # type: ignore[no-untyped-def]
-            captured["body"] = request.body
-            captured["timeouts"] = (_kwargs["connection_timeout"], _kwargs["read_timeout"])
-            return CapturingResponse()
-
-        def open(self) -> None: ...
-
-        def close(self) -> None: ...
-
-        def __enter__(self) -> CapturingTransport:
-            return self
-
-        def __exit__(self, *_args: object) -> None: ...
-
-    client = AgentsClient(
-        endpoint="https://stub.services.ai.azure.com/api/projects/p",
-        credential=StubCredential(),
-        transport=CapturingTransport(),
-    )
-    foundry_agent._call_foundry_with_retry(
-        "client.runs.create", client.runs.create,
-        deadline=foundry_agent.time.monotonic() + 10,
-        thread_id="t1",
-        agent_id="a1",
-        **foundry_agent._prompt_budget_kwargs(client.runs.create),
+    monkeypatch.setattr("azure.identity.DefaultAzureCredential", StubCredential)
+    project, client = foundry_agent.open_foundry_clients(
+        "https://stub.services.ai.azure.com/api/projects/p",
     )
 
-    body = json.loads(captured["body"])  # type: ignore[arg-type]
-    assert all(0 < timeout <= 5 for timeout in captured["timeouts"])
-    assert body["max_prompt_tokens"] == foundry_agent.DEFAULT_MAX_PROMPT_TOKENS
-    assert body["max_completion_tokens"] == foundry_agent.DEFAULT_MAX_COMPLETION_TOKENS
-    assert body["truncation_strategy"] == {
-        "type": "last_messages",
-        "last_messages": foundry_agent.DEFAULT_TRUNCATION_LAST_MESSAGES,
-    }
-
-
-def _billed_input_tokens(rounds: int, window: int | None) -> int:
-    """Input tokens Foundry bills for one run, in uncached-equivalent units.
-
-    Models what the service does with ``truncation_strategy`` so the saving can be
-    measured rather than asserted. On turn *k* the prompt is the system prompt plus
-    the thread so far, capped to the last ``window`` messages. Azure prompt caching
-    bills a prefix shared with the previous turn at half rate, so a turn whose
-    prefix still grows monotonically is mostly cached, while a turn whose window has
-    started sliding shares only the system prompt.
-    """
-    system = 591  # measured size of agent/prompts/system.md
-    per_message = 262  # measured: 411M input tokens over the observed traffic
-    billed = 0.0
-    for turn in range(1, rounds + 1):
-        history = turn if window is None else min(turn, window)
-        prompt = system + history * per_message
-        sliding = window is not None and turn > window
-        cached = system if sliding else prompt - per_message
-        billed += 0.5 * cached + (prompt - cached)
-    return int(billed)
-
-
-def test_truncation_window_bounds_per_turn_prompt_growth() -> None:
-    """A bounded window must turn a run's input cost from quadratic into linear.
-
-    Without truncation the prompt on turn k contains every earlier turn, so a run's
-    input tokens grow as O(rounds^2) — the shape that produced 400M cached-input
-    tokens a month. The window is read back out of the kwargs actually built for the
-    real SDK signature rather than from a constant, so deleting ``truncation_strategy``
-    from the run fails this test instead of quietly leaving the constant behind.
-    """
-    from azure.ai.agents.operations import RunsOperations
-
-    budget = foundry_agent._prompt_budget_kwargs(RunsOperations.create)
-    assert budget["max_prompt_tokens"] > 0
-    strategy = budget["truncation_strategy"].as_dict()
-    assert strategy["type"] == "last_messages", "per-turn history is not being bounded"
-    window = strategy["last_messages"]
-
-    rounds = 78  # measured rounds per plan run
-    unbounded = _billed_input_tokens(rounds, None)
-    bounded = _billed_input_tokens(rounds, window)
-
-    assert bounded < unbounded * 0.7, (
-        f"windowed run bills {bounded} vs {unbounded} unbounded — "
-        "truncation is not bounding per-turn prompt growth"
-    )
-    # Doubling the rounds must not quadruple the bill: cost has to stay linear.
-    assert _billed_input_tokens(rounds * 2, window) < 2.2 * bounded
-    assert _billed_input_tokens(rounds * 2, None) > 3.0 * unbounded
-
-
-def _budget_run_client(run_status: str, incomplete_reason: str | None = None):
-    recorded: dict = {}
-    incomplete_details = (
-        SimpleNamespace(reason=incomplete_reason) if incomplete_reason is not None else None
-    )
-    run = SimpleNamespace(
-        id="run-1",
-        status=run_status,
-        last_error=None,
-        incomplete_details=incomplete_details,
-    )
-
-    class RunsApi:
-        def create(
-            self,
-            *,
-            thread_id: str,
-            agent_id: str,
-            max_prompt_tokens: int | None = None,
-            max_completion_tokens: int | None = None,
-            truncation_strategy: object = None,
-            **_kwargs: object,
-        ) -> SimpleNamespace:
-            recorded.update(
-                thread_id=thread_id,
-                agent_id=agent_id,
-                max_prompt_tokens=max_prompt_tokens,
-                max_completion_tokens=max_completion_tokens,
-                truncation_strategy=truncation_strategy,
-            )
-            return run
-
-    deleted: list[str] = []
-    thread_api = SimpleNamespace(
-        create=lambda **_kwargs: SimpleNamespace(id="thread-1"),
-        delete=lambda thread_id, **_kwargs: deleted.append(thread_id),
-    )
-    messages_api = SimpleNamespace(create=lambda **_kwargs: None, list=lambda **_kwargs: [])
-    client = SimpleNamespace(threads=thread_api, messages=messages_api, runs=RunsApi())
-    return client, recorded, deleted
-
-
-def test_run_agent_passes_bounded_prompt_to_runs_create(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("AUTOREFINE_MAX_PROMPT_TOKENS", raising=False)
-    monkeypatch.setenv("AUTOREFINE_TRUNCATION_LAST_MESSAGES", "4")
-    config = ProjectConfig(name="demo", purpose="", users="", stage="active")
-    client, recorded, _deleted = _budget_run_client("completed")
-
-    foundry_agent.run_agent(client, "agent-1", Path("."), config, "task")
-
-    assert recorded["thread_id"] == "thread-1"
-    assert recorded["agent_id"] == "agent-1"
-    assert recorded["max_prompt_tokens"] == foundry_agent.DEFAULT_MAX_PROMPT_TOKENS
-    assert recorded["max_completion_tokens"] == foundry_agent.DEFAULT_MAX_COMPLETION_TOKENS
-    assert recorded["truncation_strategy"].as_dict() == {
-        "type": "last_messages",
-        "last_messages": 4,
-    }
-    assert set(recorded) == {
-        "thread_id",
-        "agent_id",
-        "max_prompt_tokens",
-        "max_completion_tokens",
-        "truncation_strategy",
-    }
-
-
-def test_run_agent_raises_on_incomplete_max_prompt_tokens() -> None:
-    config = ProjectConfig(name="demo", purpose="", users="", stage="active")
-    client, _recorded, deleted = _budget_run_client("incomplete", "max_prompt_tokens")
-
-    with pytest.raises(foundry_agent.FoundryRunIncompleteError) as excinfo:
-        foundry_agent.run_agent(client, "agent-1", Path("."), config, "task")
-
-    assert excinfo.value.reason == "max_prompt_tokens"
-    assert excinfo.value.run_id == "run-1"
-    assert deleted == ["thread-1"]
-
-
-def test_run_agent_incomplete_without_details_still_raises() -> None:
-    config = ProjectConfig(name="demo", purpose="", users="", stage="active")
-    client, _recorded, _deleted = _budget_run_client("incomplete")
-
-    with pytest.raises(foundry_agent.FoundryRunIncompleteError) as excinfo:
-        foundry_agent.run_agent(client, "agent-1", Path("."), config, "task")
-
-    assert excinfo.value.reason is None
+    assert client.max_retries == 0
+    assert str(client.base_url).rstrip("/").endswith("/api/projects/p/openai/v1")
+    assert hasattr(project.agents, "create_version")

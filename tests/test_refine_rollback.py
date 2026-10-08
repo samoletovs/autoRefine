@@ -83,10 +83,9 @@ def test_refine_project_rolls_back_and_returns_false_on_incomplete(
         raise FoundryRunIncompleteError("run-1", "max_prompt_tokens")
 
     monkeypatch.setattr(
-        "azure.ai.agents.AgentsClient",
-        lambda **_kw: SimpleNamespace(delete_agent=lambda _id, **kw: None),
+        "agent.foundry_agent.open_foundry_clients",
+        lambda _endpoint: (SimpleNamespace(agents=Mock()), object()),
     )
-    monkeypatch.setattr("azure.identity.DefaultAzureCredential", lambda **_kw: object())
     monkeypatch.setattr("agent.foundry_agent.create_agent", lambda *_a, **_kw: "agent-1")
     monkeypatch.setattr("agent.foundry_agent.run_agent", fake_run_agent)
     monkeypatch.setattr("agent.foundry_agent.build_refine_task", lambda *_a, **_kw: "task")
@@ -115,57 +114,29 @@ def test_terminal_refine_run_rolls_back_and_never_publishes(
 ) -> None:
     from agent import foundry_agent
     from agent.config import ProjectConfig
-
-    class ToolCall:
-        def __init__(self) -> None:
-            self.id = "call-1"
-            self.function = SimpleNamespace(
-                name="write_project_file",
-                arguments=json.dumps({"path": "half_done.py", "content": "# partial\n"}),
-            )
-
-    class Action:
-        def __init__(self) -> None:
-            self.submit_tool_outputs = SimpleNamespace(tool_calls=[ToolCall()])
-
-    class ToolOutput:
-        def __init__(self, tool_call_id: str, output: str) -> None:
-            self.tool_call_id = tool_call_id
-            self.output = output
-
-    def create_run(
-        *,
-        thread_id: str,
-        agent_id: str,
-        max_prompt_tokens: int | None = None,
-        max_completion_tokens: int | None = None,
-        truncation_strategy: object = None,
-        **_kwargs: object,
-    ) -> SimpleNamespace:
-        return SimpleNamespace(id="run-1", status="requires_action", required_action=Action())
-
-    client = SimpleNamespace(
-        threads=SimpleNamespace(
-            create=Mock(return_value=SimpleNamespace(id="thread-1")),
-            delete=Mock(),
-        ),
-        messages=SimpleNamespace(create=Mock(), list=Mock(return_value=[])),
-        runs=SimpleNamespace(
-            create=create_run,
-            submit_tool_outputs=Mock(return_value=SimpleNamespace(id="run-1", status=status)),
-        ),
-        delete_agent=Mock(),
+    from tests.test_foundry_loop_guards import (
+        _DummyToolCall,
+        _response,
+        _ToolLoopClient,
+        agent_for,
     )
+
+    client = _ToolLoopClient(lambda n: None)
+    created = iter([
+        _response("resp-1", "completed", [_DummyToolCall(
+            "call-1", "write_project_file",
+            json.dumps({"path": "half_done.py", "content": "# partial\n"}),
+        )]),
+        _response("resp-2", status),
+    ])
+    client.next_response = lambda: next(created)
+    project = SimpleNamespace(agents=Mock())
     committed: list[str] = []
     published: list[str] = []
 
     monkeypatch.setenv("FOUNDRY_PROJECT_ENDPOINT", "https://example.test/foundry")
-    monkeypatch.setattr("azure.ai.agents.AgentsClient", lambda **_kw: client)
-    monkeypatch.setattr("azure.identity.DefaultAzureCredential", lambda **_kw: object())
-    monkeypatch.setattr(foundry_agent, "RequiredFunctionToolCall", ToolCall)
-    monkeypatch.setattr(foundry_agent, "SubmitToolOutputsAction", Action)
-    monkeypatch.setattr(foundry_agent, "ToolOutput", ToolOutput)
-    monkeypatch.setattr(foundry_agent, "create_agent", lambda *_a, **_kw: "agent-1")
+    monkeypatch.setattr(foundry_agent, "open_foundry_clients", lambda _endpoint: (project, client))
+    monkeypatch.setattr(foundry_agent, "create_agent", lambda *_a, **_kw: agent_for(mode="refine"))
     monkeypatch.setattr(foundry_agent, "build_refine_task", lambda *_a, **_kw: "task")
     monkeypatch.setattr("agent.tools.github_tools.create_branch", lambda *_a, **_kw: True)
     monkeypatch.setattr(
@@ -186,7 +157,5 @@ def test_terminal_refine_run_rolls_back_and_never_publishes(
     assert not (repo / "half_done.py").exists()
     assert committed == []
     assert published == []
-    client.messages.list.assert_not_called()
-    client.threads.delete.assert_called_once()
-    assert client.threads.delete.call_args.args == ("thread-1",)
-    assert client.threads.delete.call_args.kwargs["retry_total"] == 0
+    assert client.deleted == ["resp-1", "resp-2"]
+    assert project.agents.mock_calls == []

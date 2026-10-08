@@ -14,7 +14,7 @@ with tests + PRs, and can file idea memos.
 3. **Never modify secrets or auth config.** Report findings, don't fix.
 4. **Always run tests** after making changes. Revert if tests fail.
 5. **Ask the user** when confidence is below 70% on any change.
-6. **Cost discipline.** Health Chat uses `gpt-6-luna`; classic planning stays on
+6. **Cost discipline.** Health Chat uses `gpt-6-luna`; Foundry agent planning stays on
    `gpt-4o-mini` until its separate service gate passes. Budget target: €5/month on
    autoRefine's own consumption. See "Model strategy" below before bumping.
 7. **Every measured number in this file and in code comments has expired.** They are
@@ -43,27 +43,31 @@ strong models only where the cost is bounded.
 | Tier | Used by | Default deployment | Override env |
 |------|---------|--------------------|--------------|
 | Routine | `evaluate` (deterministic, no LLM) + `health-scan` AI analyst | `gpt-6-luna` candidate | `HEALTH_SCAN_MODEL` |
-| Routine planning | `plan` / `refine` / `file-ideas` classic Foundry agent | `gpt-4o-mini` | `FOUNDRY_DEFAULT_DEPLOYMENT`, or CLI `--model`; only mini / GPT-4.1 enabled |
-| Deep (blocked) | Prepared single-repo planning path | `gpt-6-sol` candidate, not enabled | Manual overrides cannot bypass the classic-service gate |
+| Routine planning | `plan` / `refine` / `file-ideas` Foundry prompt agent (`autorefine-plan` / `autorefine-refine`) | `gpt-4o-mini` | `FOUNDRY_DEFAULT_DEPLOYMENT`, or CLI `--model`; only mini / GPT-4.1 enabled |
+| Deep (blocked) | Prepared single-repo planning path | `gpt-6-sol` candidate, not enabled | Manual overrides cannot bypass the model gate |
 | Deep (rare) | Closed-loop PR reviewer (lives in `samoletovs/nauroLabs-github/scripts/claude-deep-review.py`, **not** in this repo) | `claude-opus-4` with `claude-sonnet-4` fallback, via GitHub Models | configured in the governance repo |
 
 Bump rules:
 
 - Candidate models are version `2026-09-22` on `foundrylab-aiservices`.
   Preparation is not promotion. See [README.md](README.md#model-pilot).
-- Both Luna and Sol are blocked before classic agent creation, housekeeping or
-  run creation, including explicit manual overrides. The shared allowlist is
-  in `agent/config.py`; CLI permission is not service-compatibility proof.
+- Both Luna and Sol are blocked before agent-version publication or any
+  response request, including explicit manual overrides. The shared allowlist is
+  in `agent/config.py` (its `classic` names predate the 2026-10-08 Responses
+  migration); CLI permission is not service-compatibility proof.
   Do not add an environment switch that bypasses the gate.
-- Parent reported on 2026-10-02 that both bounded synthetic classic runs
-  accepted creation but failed with `server_error`. Baseline control is pending:
-  this is a failed gate, not proof the models are unsupported.
+- Parent reported on 2026-10-02 that both bounded synthetic runs on the
+  *classic* Agents surface accepted creation but failed with `server_error`.
+  That surface is gone; the gate has not been re-run on the Responses surface.
+  Baseline control is pending: this is a failed gate, not proof the models are
+  unsupported.
 - Run-wide prompt/completion caps are 200,000/16,000 for routine planning and
-  prepared at 40,000/4,000 for Sol if later admitted. Existing deadlines, tool-round,
-  activity, repeated-call and publication gates remain in force.
-- Classic `azure-ai-agents` 1.1 has no declared `reasoning_effort`. Never pass
-  a made-up kwarg, or claim low reasoning is enforced on this surface. The
-  parent must separately verify model support, tool calling and run caps.
+  prepared at 40,000/4,000 for Sol if later admitted, now summed locally across
+  a run's responses. Existing deadlines, tool-round, activity, repeated-call and
+  publication gates remain in force.
+- `PromptAgentDefinition` does declare `reasoning`, but no version sets it: the
+  models that would use it stay gated. Never claim low reasoning is enforced
+  until the parent verifies model support, tool calling and run caps on this surface.
 - Rollback uses `gpt-4o-mini` or `gpt-4.1`. No cadence, secret or auth changes
   accompany the pilot; existing deployment settings shadow code defaults.
 - The existing Container Apps Job has no model override and clones Python at
@@ -94,60 +98,73 @@ Bump rules:
 
 ## Foundry agent lifecycle
 
-autoRefine's agent is **ephemeral**: `create_agent()` makes one per run, `main.py`
-deletes it in a `finally` block. A hard kill (CI timeout, OOM, container eviction)
-never reaches that block, so agents leaked into the Foundry project at roughly one a
-week until 2026-08-20.
+autoRefine runs on the **Foundry Agent Service** API (`azure-ai-projects` 2.x),
+migrated 2026-10-08 from the classic `azure-ai-agents` surface (threads/runs), which
+Azure retires on 2027-03-31 (advisory HYJP-QGZ). `tests/test_foundry_api_surface.py`
+fails if anything imports `azure.ai.agents` again or a manifest reinstalls it.
 
-`create_agent()` therefore also calls `sweep_orphaned_agents()`, which deletes agents
-named `autorefine` older than `ORPHAN_AGENT_MAX_AGE` (6h) — a crashed run self-heals on
-the next one. **The age gate is load-bearing:** a run takes ~43 min, so anything younger
-may be a live agent belonging to a run in progress. Don't drop the gate, and don't widen
-the name match — `atlas-*` and `lab-memory` share the project and are persistent.
+**Agents are persistent and versioned, not per-run.** There are two prompt agents,
+`autorefine-plan` (read tools + `submit_plan`) and `autorefine-refine` (plus the write
+tools). `create_agent()` hashes the definition — model, instructions, tools, sampling —
+into version metadata (`autorefine_definition_sha256`), reuses the newest of the last
+20 versions whose hash matches, and publishes a new version only when none does. Every
+request pins the exact version in `agent_reference`, so a concurrent `--model gpt-4.1`
+run publishing its own version cannot change the agent underneath a run in progress,
+and flipping back reuses the older version rather than minting another.
 
-Note the endpoint reads `…/api/projects/{proj}/assistants`. That is **Foundry classic
-agents**, *not* the retired Azure OpenAI Assistants API — see
-[PLATFORM.md §15.2](../.github/PLATFORM.md).
+This replaced the classic ephemeral agent and its orphan sweep. The classic agent was
+created per run and deleted in a `finally`; a hard kill (CI timeout, OOM, container
+eviction) leaked one roughly weekly until a 6-hour-age sweep cleaned them up. A
+version is a reusable definition, so a killed run strands nothing and there is no
+sweep. Never widen the name match beyond these two names — `atlas-*` and `lab-memory`
+share the project and belong to other repos. Measured 2026-10-08 at migration: zero
+classic `autorefine` agents remained in the project.
+
+**A run is a chain of responses.** `run_agent()` sends the task as the first
+`responses.create(..., extra_body={"agent_reference": ...}, store=True)`. Tool calls
+come back as `function_call` output items; their results go back as
+`function_call_output` items with `previous_response_id` set to the prior response
+and the same `agent_reference`. The loop ends on a response with no function calls,
+whose `output_text` feeds the existing text fallback. Stored responses are deleted in
+the run's `finally` (the analogue of the classic thread delete) — each delete has its
+own 10-second grace and cleanup stops at the first expected failure, leaving the rest
+to the service's own expiry. Status mapping: `failed` → `FoundryRunFailedError(code)`
+(`server_error`/`rate_limit_exceeded` stay a retryable `None` outside refine);
+`incomplete` → `FoundryRunIncompleteError(incomplete_details.reason)`; anything else
+non-`completed` → `FoundryRunFailedError(status)`. Synchronous responses report service
+failure as HTTP instead of a run status, so after the bounded application retries an
+HTTP 429/5xx maps onto the same transient codes and other 4xx onto
+`FoundryRunFailedError` with the service error code.
 
 `AUTOREFINE_RUN_TIMEOUT_SECONDS` bounds one run's elapsed monotonic time (default
-1800 seconds; a positive integer). It covers setup, every status including
-queued/in_progress/cancelling, tool dispatch, retry waits and final result retrieval.
-SDK requests and the test subprocess receive the remaining budget; SDK-internal
-retries are disabled in favor of the bounded application retries. Socket timeouts
-measure inactivity, not elapsed time: a continuously arriving body can evade them.
-`agent/sdk_boundary.py` therefore imposes an absolute **caller** deadline around
-the whole synchronous SDK operation, including authentication and body consumption.
-One serialized daemon-worker lease owns the client; after timeout it is retired
-against further work and only cleanup can use it. No model tool or publication
-runs on that worker. A late-created agent, thread or run ID is used only for cleanup,
+1800 seconds; a positive integer). It covers setup, any `queued`/`in_progress`
+polling, tool dispatch, retry waits and the final response. Requests and the test
+subprocess receive the remaining budget; OpenAI-internal retries are disabled
+(`open_foundry_clients` builds the client with `max_retries=0`) in favour of the
+bounded application retries. Socket timeouts measure inactivity, not elapsed time: a
+continuously arriving body can evade them. `agent/sdk_boundary.py` therefore imposes
+an absolute **caller** deadline around the whole synchronous SDK operation, including
+authentication and body consumption. One serialized daemon-worker lease owns each
+client (the project client for agent versions, the OpenAI client for responses); after
+timeout it is retired against further work and only cleanup can use it. No model tool
+or publication runs on that worker. A late-created response is used only for cleanup,
 never delivered into an ended run. Expiry raises `FoundryRunAbortedError` with
 `reason="run_deadline"` so functional planning cannot replay it and refine rolls back.
-Cancellation, thread deletion and agent deletion each have a separate 10-second
-caller grace. Expected Azure/OS cleanup failures are logged without hiding the
-primary result/error; unexpected programming errors still propagate. All three
-plan/functional/refine entrypoints use the same bounded agent-deletion helper.
-Cost rows retain the guard, status and elapsed duration.
+Expected Azure/OpenAI/OS cleanup failures are logged without hiding the primary
+result/error; unexpected programming errors still propagate. Cost rows retain the
+guard, status and elapsed duration.
 
 Python cannot safely kill an arbitrary synchronous SDK/auth thread. A stalled
 worker may therefore outlive its caller; it is daemonized and cannot hold process
 exit. Its client must **not** be closed or reused by another request while owned.
-Cleanup queues behind the active call rather than racing a closed/deleted client.
-If it never returns, cleanup remains best-effort/unconfirmed (the existing orphan
-sweep is still necessary). This is a bounded caller contract, not a claim that a
-remote request has been cancelled merely because the local deadline expired.
-For known run IDs, the production entrypoints provide an independent cancellation
-SDK client at the same endpoint using the same existing credential configuration.
-It has its own transport/lease, so cancellation need not wait for a stuck poll;
-no Azure resource or auth configuration is created or changed. Other teardown still
-queues behind the owning call. Only a service response with `status="cancelled"`
-confirms cancellation. Missing/failed responses and `cancelling` acknowledgements
-emit `cancellation_unconfirmed`, also exposed on `FoundryRunAbortedError`. A direct
-caller without an independent channel gets bounded serialized best-effort cleanup,
-not a claim that billing stopped.
-The three production entrypoints give `create_agent` a separate `orphan_client`
-for best-effort sweeping. A stalled sweep retires only that housekeeping client's
-lease, so healthy work still starts. Direct `create_agent` callers may omit that
-optional client to skip sweeping; never pass the work client itself.
+Cleanup queues behind the active call rather than racing a closed client. This is a
+bounded caller contract, not a claim that a remote request stopped merely because
+the local deadline expired. **There is nothing to cancel** for a synchronous response:
+once it has returned, no work continues server-side, and a guard simply stops sending
+tool outputs and raises. Only a guard that fires while a request is still in flight
+(an abandoned call at the deadline, or a response left `queued`/`in_progress`) emits
+`cancellation_unconfirmed` and sets it on `FoundryRunAbortedError`; otherwise the log
+says `no_server_side_work`.
 
 Functional ideation has no idea quota. `submit_plan(outcome="no_gap", improvements=[],
 summary=..., no_gap_evidence=[{"path": ..., "observation": ...}])` is a successful
@@ -904,17 +921,29 @@ Two things drive it, and they multiply:
 
 | Driver | Why it costs | Lever |
 |--------|--------------|-------|
-| Every tool round re-sends the whole thread | one plan run is ~74 rounds, so input is O(rounds²) | `truncation_strategy` on the run (`AUTOREFINE_TRUNCATION_LAST_MESSAGES`) |
+| Every tool round re-sends the whole conversation | one plan run is ~74 rounds, so input is O(rounds²) | prompt caching of the append-only chain; the run-wide `AUTOREFINE_MAX_PROMPT_TOKENS` cap as runaway guard |
 | Every project is planned every day | only 6.4 of 24 projects have a commit on a given day | the activity gate (`should_plan_repo`) |
 
-**The truncation window trades cache for volume, and that is fine but not free.**
-Azure bills a cached prefix at half rate, and the run was hitting cache 97.5% of the
-time precisely *because* it re-sent an ever-growing prefix. A sliding window forfeits
-that discount from the turn it starts sliding. Raw input tokens fall ~68%; the *bill*
-falls ~42%. Expect the uncached `…-Inp-glbl` meter to rise while the cached one
-collapses — that is the change working, not a regression. Don't tighten the window
-below 12 without evidence that runs still reach `submit_plan`; and never reorder or
-templatize `agent/prompts/system.md`, which is the one prefix still caching cleanly.
+**The classic truncation window is gone — a behavioural change, measure it.** The
+classic run took `truncation_strategy(last_messages=12)` (`AUTOREFINE_TRUNCATION_LAST_MESSAGES`),
+which bounded per-turn history. The Responses API has no last-N equivalent:
+`truncation="auto"` only drops items when the model's context window would overflow, and
+`previous_response_id` chaining re-sends the whole conversation every round. So per-run
+input grows O(rounds²) again. It does so as a byte-identical, append-only prefix — the
+shape Azure prompt caching rewards — and Responses report it: the 2026-10-08 live smoke
+run (n=1, 4 responses, gpt-4o-mini) read 9,564 input tokens of which 4,736 cached,
+and its later rounds cached 2,176/2,461 and 2,560/2,672. The variable is now ignored
+with a warning. `AUTOREFINE_MAX_PROMPT_TOKENS` (200,000 run-wide) and
+`AUTOREFINE_MAX_COMPLETION_TOKENS` (16,000) are now summed **locally** over every
+response; the loop stops before a request past either cap with the same
+`FoundryRunIncompleteError` reasons, overshooting by at most one response, and each
+request's `max_output_tokens` is the completion budget left. Before trusting the
+200,000 ceiling for long runs, read `prompt_tokens` and `cached_prompt_tokens` off the
+first post-migration `run_cost` lines: a run long enough to near it is now cheaper per
+token (cached) but larger in tokens than under the window. Never reorder or templatize
+`agent/prompts/system.md`; it is the head of every cached prefix.
+
+The paragraphs below were measured on the classic, windowed surface and describe it.
 
 **The activity gate is the lever with no quality cost.** A project whose default
 branch hasn't moved gets re-read and re-planned to produce the ideas it produced
@@ -1422,11 +1451,13 @@ After configuration, validate data access in dry-run before explicitly authorizi
 writes, issue creation/assignment and Telegram delivery. Normal health scans still have
 no critical-issue dedup/shared-cause grouping; `--no-copilot-assign` alone still files issues.
 
-Failed Foundry runs are replayed only for `server_error` and `rate_limit_exceeded`.
+Failed Foundry runs are replayed only for `server_error` and `rate_limit_exceeded`
+(a `failed` response status, or HTTP 429/5xx after the bounded retries).
 Permanent/unknown failures raise an incomplete-run subtype so functional planning does
 not buy three identical attempts, and failed refine runs reach the partial-edit rollback
-handler even when the service error is transient. Expected Azure/OS thread-cleanup
-failures do not replace the primary failure; unexpected programming errors propagate.
+handler even when the service error is transient. Expected Azure/OpenAI/OS
+response-cleanup failures do not replace the primary failure; unexpected programming
+errors propagate.
 
 ```bash
 pytest tests/ -x -q

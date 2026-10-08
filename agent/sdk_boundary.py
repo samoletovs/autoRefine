@@ -138,7 +138,7 @@ class SdkBoundary:
 
 
 def client_boundary(client: Any) -> SdkBoundary:
-    """One lease per client, including its run/thread/agent cleanup operations."""
+    """One lease per client, including its cleanup operations (e.g. response deletes)."""
     with _boundary_lock:
         boundary = vars(client).get("_autorefine_sdk_boundary")
         if not isinstance(boundary, SdkBoundary):

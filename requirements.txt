@@ -1,14 +1,18 @@
 # autoRefine dependencies
 
-# Foundry SDK + auth
-azure-ai-projects>=1.0.0
-# Upper bound: foundry_agent fails closed if runs.create stops declaring
-# max_prompt_tokens/max_completion_tokens/truncation_strategy, so a major bump needs re-verification.
-azure-ai-agents>=1.1.0,<2.0.0
+# Foundry SDK + auth. 2.x is the Foundry Agent Service API (versioned prompt agents
+# driven through the Responses API); the classic azure-ai-agents surface retires
+# 2027-03-31 and must not come back (tests/test_foundry_api_surface.py).
+# Upper bound: a major bump needs re-verification of create_version/list_versions.
+# azure-ai-projects 2.5+ requires openai>=3, which this code has not been verified on.
+# Lift both caps together in one tested bump.
+azure-ai-projects>=2.1.0,<2.5
 azure-identity>=1.19.0
 
-# OpenAI-compatible client (used by foundry agent + health scan)
-openai>=1.55.0
+# OpenAI-compatible client (Foundry responses + health scan). foundry_agent fails
+# closed if responses.create stops declaring truncation/max_output_tokens/
+# previous_response_id, so a major bump needs re-verification.
+openai>=2.8.0,<3
 
 # Azure cost + monitoring (health scan)
 azure-mgmt-costmanagement>=4.0.1

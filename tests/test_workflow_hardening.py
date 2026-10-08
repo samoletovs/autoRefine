@@ -145,17 +145,17 @@ def test_evaluate_workflow_serialises_its_runs() -> None:
 
 
 def test_evaluate_workflow_does_not_cancel_runs_in_progress() -> None:
-    """Cancelling here would trade an Actions minute for a leaked Foundry agent.
+    """Cancelling here would trade an Actions minute for a run nobody can account for.
 
-    ``agent/main.py`` deletes its ephemeral agent in a ``finally`` block. A
-    cancelled job is a hard kill, so that block never runs and the agent survives
-    until the next run's ``sweep_orphaned_agents`` clears it (AGENTS.md).
+    ``run_agent`` writes its cost row and deletes its stored Foundry responses in a
+    ``finally`` block. A cancelled job is a hard kill, so that block never runs
+    (AGENTS.md, "Foundry agent lifecycle").
     """
     concurrency = _load(EVALUATE_WORKFLOW).get("concurrency") or {}
 
     assert concurrency.get("cancel-in-progress") is not True, (
         "cancel-in-progress must not be true: a cancelled evaluate run never "
-        "reaches the 'finally' that deletes its Foundry agent."
+        "reaches the 'finally' that records its cost and cleans up its responses."
     )
 
 
@@ -358,8 +358,9 @@ def test_azure_login_is_followed_by_a_prewarm(path: Path) -> None:
 
     What this cannot check is whether the *list of resources* is complete. A
     client's scope is usually an SDK default rather than a string in our source
-    — ``AgentsClient``'s ``https://ai.azure.com`` is not written down anywhere in
-    this repository — so a guard that tried to derive the list would be guessing,
+    — the OpenAI client's ``https://ai.azure.com`` comes from ``get_openai_client``, not
+    from a string this repository passes — so a guard that tried to derive the list
+    would be guessing,
     and a guard that hard-coded it would just be the workflow again. Adding a new
     Azure service means adding its resource by hand.
     """

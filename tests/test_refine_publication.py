@@ -39,7 +39,7 @@ def _patch_refine(
     run_agent: object,
     test_result: object,
 ) -> SimpleNamespace:
-    client = SimpleNamespace(delete_agent=MagicMock())
+    project = SimpleNamespace(agents=MagicMock())
     create_branch = MagicMock(return_value=True)
     create_agent = MagicMock(return_value="agent-1")
     final_tests = MagicMock(
@@ -49,8 +49,9 @@ def _patch_refine(
     create_pr = MagicMock(return_value=True)
 
     monkeypatch.setenv("FOUNDRY_PROJECT_ENDPOINT", "https://example.test/foundry")
-    monkeypatch.setattr("azure.ai.agents.AgentsClient", lambda **_kw: client)
-    monkeypatch.setattr("azure.identity.DefaultAzureCredential", lambda **_kw: object())
+    monkeypatch.setattr(
+        "agent.foundry_agent.open_foundry_clients", lambda _endpoint: (project, object()),
+    )
     monkeypatch.setattr("agent.foundry_agent.create_agent", create_agent)
     monkeypatch.setattr("agent.foundry_agent.run_agent", run_agent)
     monkeypatch.setattr("agent.foundry_agent.build_refine_task", lambda *_a, **_kw: "task")
@@ -60,7 +61,7 @@ def _patch_refine(
     monkeypatch.setattr("agent.tools.github_tools.create_pr", create_pr)
 
     return SimpleNamespace(
-        client=client,
+        project=project,
         create_branch=create_branch,
         create_agent=create_agent,
         final_tests=final_tests,
@@ -244,7 +245,8 @@ def test_prepublication_exceptions_roll_back_then_propagate(
     assert (repo / "tracked.txt").read_text(encoding="utf-8") == "original\n"
     spies.commit_and_push.assert_not_called()
     spies.create_pr.assert_not_called()
-    spies.client.delete_agent.assert_called_once()
+    spies.create_agent.assert_called_once()
+    assert spies.project.agents.mock_calls == [], "the persistent agent is never deleted"
 
 
 def test_refine_refuses_unknown_worktree_status_before_paid_work(

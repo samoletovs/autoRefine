@@ -4,27 +4,27 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+import time as real_time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import ANY, Mock
+from unittest.mock import Mock
 
 import httpx
+import openai
 import pytest
 from azure.core.exceptions import AzureError, ServiceRequestError, ServiceResponseError
-from azure.core.paging import ItemPaged
 
 from agent import foundry_agent as f
 from agent import main as m
 from tests.plan_fixtures import valid_plan
 from tests.test_foundry_loop_guards import (
-    _DummyAction,
-    _DummyToolCall,
-    _ToolLoopClient,
+    AGENT,
     _config,
-    loop_dummies,  # noqa: F401
+    _DummyToolCall,
+    _response,
+    _ToolLoopClient,
 )
-
-pytestmark = pytest.mark.usefixtures("loop_dummies")
 
 
 class Clock:
@@ -48,15 +48,26 @@ def clock(monkeypatch: pytest.MonkeyPatch) -> Clock:
 
 
 def _poll_client(status: str) -> _ToolLoopClient:
+    """A first response stuck in ``status`` for as long as anyone polls it."""
     client = _ToolLoopClient(lambda n: None)
-    run = SimpleNamespace(id="run-1", status=status)
-    client.next_run = lambda: run
-    client.runs.get = Mock(return_value=run)
+    response = _response("resp-1", status)
+    client.next_response = lambda: response
+    client.responses.retrieve = Mock(return_value=response)
     return client
 
 
-@pytest.mark.parametrize("status", ["queued", "in_progress", "cancelling"])
-def test_endless_status_cancels_cleans_up_and_records_deadline_evidence(
+def _wait_for(predicate, seconds: float = 2.0) -> bool:  # type: ignore[no-untyped-def]
+    """Late cleanup runs on a daemon thread; give it real time to land."""
+    end = real_time.perf_counter() + seconds
+    while real_time.perf_counter() < end:
+        if predicate():
+            return True
+        threading.Event().wait(0.01)  # time.sleep is the fake clock here
+    return predicate()
+
+
+@pytest.mark.parametrize("status", ["queued", "in_progress"])
+def test_endless_status_stops_cleans_up_and_records_deadline_evidence(
     status: str, clock: Clock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -66,83 +77,87 @@ def test_endless_status_cancels_cleans_up_and_records_deadline_evidence(
     caplog.set_level(logging.INFO)
 
     with pytest.raises(f.FoundryRunIncompleteError) as error:
-        f.run_agent(client, "agent", tmp_path, _config(), "task", mode="file-ideas")
+        f.run_agent(client, AGENT, tmp_path, _config(), "task", mode="file-ideas")
 
     assert error.value.reason == "run_deadline"
+    # A response still queued/in progress may be billing; that is not hidden.
+    assert error.value.cancellation_unconfirmed is True
+    assert "cancellation_unconfirmed" in caplog.text
     assert clock.now == 3
-    assert client.runs.get.call_count == 2
-    assert client.cancelled == ["run-1"]
-    assert client.deleted_threads == ["thread-1"]
+    assert client.responses.retrieve.call_count == 2
+    assert client.deleted == ["resp-1"]
     row = json.loads(log_path.read_text(encoding="utf-8"))
     assert row["guard"] == "run_deadline"
     assert row["status"] == status
     assert row["duration_s"] == 3
     assert row["plan_captured"] is False
     assert "guard=run_deadline" in caplog.text
-    for call in client.runs.get.call_args_list:
-        assert 0 < call.kwargs["connection_timeout"] <= 1
-        assert 0 < call.kwargs["read_timeout"] <= 1
-        assert call.kwargs["retry_total"] == 0
+    for call in client.responses.retrieve.call_args_list:
+        assert 0 < call.kwargs["timeout"].read <= 1
+        assert 0 < call.kwargs["timeout"].connect <= 1
 
 
 def test_transient_retry_backoff_never_outlives_the_remaining_budget(
     clock: Clock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = _poll_client("in_progress")
-    client.runs.get.side_effect = httpx.ConnectError("synthetic unavailable service")
+    client.responses.retrieve.side_effect = httpx.ConnectError("synthetic unavailable service")
     monkeypatch.setattr(f, "_foundry_retry_wait", lambda state: 60)
 
     with pytest.raises(f.FoundryRunAbortedError) as error:
-        f.run_agent(client, "agent", tmp_path, _config(), "task")
+        f.run_agent(client, AGENT, tmp_path, _config(), "task")
 
     assert error.value.reason == "run_deadline"
     assert clock.waits == [1, 2]
-    assert client.runs.get.call_count == 1
-    assert client.cancelled == ["run-1"]
-    assert client.deleted_threads == ["thread-1"]
+    assert client.responses.retrieve.call_count == 1
+    assert client.deleted == ["resp-1"]
 
 
 def test_normal_queued_progress_tool_completed_flow_is_preserved(
     clock: Clock, tmp_path: Path,
 ) -> None:
     client = _poll_client("queued")
-    client.runs.get.side_effect = [
-        SimpleNamespace(id="run-1", status="in_progress"),
-        SimpleNamespace(id="run-1", status="requires_action", required_action=_DummyAction([
+    created = iter([
+        _response("resp-1", "queued"),
+        _response("resp-2", "completed"),
+    ])
+    client.next_response = lambda: next(created)
+    client.responses.retrieve.side_effect = [
+        _response("resp-1", "in_progress"),
+        _response("resp-1", "completed", [
             _DummyToolCall("submit", "submit_plan", json.dumps(valid_plan())),
-        ])),
+        ]),
     ]
-    client.runs.submit_tool_outputs = Mock(
-        return_value=SimpleNamespace(id="run-1", status="completed"),
-    )
 
-    result = f.run_agent(client, "agent", tmp_path, _config(), "task")
+    result = f.run_agent(client, AGENT, tmp_path, _config(), "task")
 
     assert result["improvements"] == valid_plan()["improvements"]
     assert clock.now == 2
-    assert client.cancelled == []
-    assert client.deleted_threads == ["thread-1"]
-    assert client.runs.submit_tool_outputs.call_args.kwargs["read_timeout"] == 0.5
+    assert client.requests[1]["previous_response_id"] == "resp-1"
+    assert client.requests[1]["timeout"].read == 0.5
+    assert client.deleted == ["resp-1", "resp-2"]
 
 
 def test_expiry_after_plan_capture_still_discards_the_result(
     clock: Clock, tmp_path: Path, caplog: pytest.LogCaptureFixture,
 ) -> None:
-    client = _ToolLoopClient(lambda n: [
-        _DummyToolCall("submit", "submit_plan", json.dumps(valid_plan())),
+    client = _ToolLoopClient(lambda n: None)
+    created = iter([
+        _response("resp-1", "completed", [
+            _DummyToolCall("submit", "submit_plan", json.dumps(valid_plan())),
+        ]),
+        _response("resp-2", "in_progress"),
     ])
-    client.runs.submit_tool_outputs = Mock(
-        return_value=SimpleNamespace(id="run-1", status="in_progress"),
-    )
-    client.runs.get = Mock(return_value=SimpleNamespace(id="run-1", status="in_progress"))
+    client.next_response = lambda: next(created)
+    client.responses.retrieve = Mock(return_value=_response("resp-2", "in_progress"))
     caplog.set_level(logging.INFO)
 
     with pytest.raises(f.FoundryRunAbortedError) as error:
-        f.run_agent(client, "agent", tmp_path, _config(), "task")
+        f.run_agent(client, AGENT, tmp_path, _config(), "task")
 
     assert error.value.reason == "run_deadline"
     assert "plan_captured=False" in caplog.text
-    assert client.cancelled == ["run-1"]
+    assert client.deleted == ["resp-1", "resp-2"]
 
 
 def test_tool_receives_remaining_budget_and_cannot_return_an_overdue_result(
@@ -151,8 +166,6 @@ def test_tool_receives_remaining_budget_and_cannot_return_an_overdue_result(
     client = _ToolLoopClient(lambda n: [
         _DummyToolCall("tests", "run_project_tests", "{}"),
     ])
-    outputs = Mock()
-    client.runs.submit_tool_outputs = outputs
     budgets: list[float] = []
 
     def test_handler(project_dir: Path, args: dict, *, timeout_seconds: float) -> str:
@@ -162,33 +175,29 @@ def test_tool_receives_remaining_budget_and_cannot_return_an_overdue_result(
 
     monkeypatch.setitem(f.TOOL_HANDLERS, "run_project_tests", test_handler)
     with pytest.raises(f.FoundryRunAbortedError) as error:
-        f.run_agent(client, "agent", tmp_path, _config(), "task")
+        f.run_agent(client, AGENT, tmp_path, _config(), "task")
 
     assert error.value.reason == "run_deadline"
     assert budgets == [3]
-    outputs.assert_not_called()
-    assert client.cancelled == ["run-1"]
+    assert len(client.requests) == 1, "an overdue tool output must never be sent"
+    assert error.value.cancellation_unconfirmed is False
 
 
-@pytest.mark.parametrize("failure", ["cancel", "delete"])
 def test_cleanup_failure_preserves_deadline_with_bounded_cleanup_requests(
-    failure: str, clock: Clock, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    clock: Clock, tmp_path: Path, caplog: pytest.LogCaptureFixture,
 ) -> None:
     client = _poll_client("queued")
-    cancel = Mock(side_effect=AzureError("offline") if failure == "cancel" else None)
-    delete = Mock(side_effect=AzureError("offline") if failure == "delete" else None)
-    client.runs.cancel = cancel
-    client.threads.delete = delete
+    delete = Mock(side_effect=AzureError("offline"))
+    client.responses.delete = delete
 
     with pytest.raises(f.FoundryRunAbortedError) as error:
-        f.run_agent(client, "agent", tmp_path, _config(), "task")
+        f.run_agent(client, AGENT, tmp_path, _config(), "task")
 
     assert error.value.reason == "run_deadline"
-    assert "Could not" in caplog.text
-    for call in (cancel.call_args, delete.call_args):
-        assert call.kwargs["read_timeout"] == f.CLEANUP_TIMEOUT_SECONDS / 2
-        assert call.kwargs["connection_timeout"] == f.CLEANUP_TIMEOUT_SECONDS / 2
-        assert call.kwargs["retry_total"] == 0
+    assert "Could not delete response" in caplog.text
+    timeout = delete.call_args.kwargs["timeout"]
+    assert timeout.read == f.CLEANUP_TIMEOUT_SECONDS / 2
+    assert timeout.connect == f.CLEANUP_TIMEOUT_SECONDS / 2
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "1.5", "bogus"])
@@ -196,136 +205,89 @@ def test_deadline_is_validated_before_starting_paid_work(
     value: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = _poll_client("queued")
-    client.threads.create = Mock()
     monkeypatch.setenv("AUTOREFINE_RUN_TIMEOUT_SECONDS", value)
 
     with pytest.raises(ValueError, match="AUTOREFINE_RUN_TIMEOUT_SECONDS"):
-        f.run_agent(client, "agent", tmp_path, _config(), "task")
+        f.run_agent(client, AGENT, tmp_path, _config(), "task")
 
-    client.threads.create.assert_not_called()
+    assert client.requests == []
 
 
-def test_late_run_creation_retains_id_for_cancellation(
+def test_late_response_creation_is_only_used_for_cleanup(
     clock: Clock, tmp_path: Path,
 ) -> None:
     client = _poll_client("completed")
 
-    def late_run() -> SimpleNamespace:
+    def late_response() -> object:
         clock.sleep(4)
-        return SimpleNamespace(id="run-1", status="completed")
+        return _response("resp-late", "completed", [
+            _DummyToolCall("w", "write_project_file", '{"path":"late.py","content":"x"}'),
+        ])
 
-    client.next_run = late_run
+    client.next_response = late_response
     with pytest.raises(f.FoundryRunAbortedError) as error:
-        f.run_agent(client, "agent", tmp_path, _config(), "task")
+        f.run_agent(client, AGENT, tmp_path, _config(), "task", mode="refine")
 
     assert error.value.reason == "run_deadline"
-    assert client.cancelled == ["run-1"]
-    assert client.deleted_threads == ["thread-1"]
+    assert error.value.cancellation_unconfirmed is True
+    assert _wait_for(lambda: client.deleted == ["resp-late"])
+    assert not (tmp_path / "late.py").exists()
 
 
 def test_deadline_is_not_replayed_by_functional_planning(
     clock: Clock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = _poll_client("queued")
-    client.threads.create = Mock(side_effect=client.threads.create)
-    client.delete_agent = Mock()
+    project = SimpleNamespace(agents=Mock())
     monkeypatch.setenv("FOUNDRY_PROJECT_ENDPOINT", "https://example.test")
-    monkeypatch.setattr("azure.ai.agents.AgentsClient", lambda **kw: client)
-    monkeypatch.setattr("azure.identity.DefaultAzureCredential", lambda: None)
-    monkeypatch.setattr(f, "create_agent", lambda *a, **kw: "agent")
+    monkeypatch.setattr(f, "open_foundry_clients", lambda endpoint: (project, client))
+    monkeypatch.setattr(f, "create_agent", lambda *a, **kw: AGENT)
     monkeypatch.setattr(m, "_extract_relevant_wiki_insights", lambda name: "")
 
     with pytest.raises(f.FoundryRunAbortedError) as error:
         m.plan_functional(tmp_path, _config())
 
     assert error.value.reason == "run_deadline"
-    assert client.threads.create.call_count == 1
-    client.delete_agent.assert_called_once_with(
-        "agent", connection_timeout=ANY, read_timeout=ANY, retry_total=0,
-    )
+    assert len(client.requests) == 1
+    assert project.agents.mock_calls == [], "the persistent agent is never deleted"
 
 
+@pytest.mark.parametrize("failure", [
+    AzureError("synthetic transport timeout"),
+    openai.APIConnectionError(request=httpx.Request("GET", "https://example.test")),
+])
 def test_transport_failure_after_expiry_still_has_deadline_outcome(
-    clock: Clock, tmp_path: Path,
+    failure: Exception, clock: Clock, tmp_path: Path,
 ) -> None:
     client = _poll_client("queued")
 
-    def expired_poll(**kwargs: object) -> None:
+    def expired_poll(*args: object, **kwargs: object) -> None:
         clock.sleep(2)
-        raise AzureError("synthetic transport timeout")
+        raise failure
 
-    client.runs.get = expired_poll
+    client.responses.retrieve = expired_poll
     with pytest.raises(f.FoundryRunAbortedError) as error:
-        f.run_agent(client, "agent", tmp_path, _config(), "task")
+        f.run_agent(client, AGENT, tmp_path, _config(), "task")
 
     assert error.value.reason == "run_deadline"
-    assert client.cancelled == ["run-1"]
-    assert client.deleted_threads == ["thread-1"]
+    assert client.deleted == ["resp-1"]
 
 
-@pytest.mark.parametrize("exception_type", [ServiceRequestError, ServiceResponseError])
-def test_sdk_transient_transport_errors_recover_with_budget_remaining(
-    exception_type: type[Exception], clock: Clock, tmp_path: Path,
+@pytest.mark.parametrize("failure", [
+    ServiceRequestError("temporary transport failure"),
+    ServiceResponseError("temporary transport failure"),
+    openai.APIConnectionError(request=httpx.Request("GET", "https://example.test")),
+    openai.APITimeoutError(request=httpx.Request("GET", "https://example.test")),
+])
+def test_transient_transport_errors_recover_with_budget_remaining(
+    failure: Exception, clock: Clock, tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = _poll_client("queued")
-    client.runs.get.side_effect = [
-        exception_type("temporary transport failure"),
-        SimpleNamespace(id="run-1", status="completed"),
-    ]
+    client.responses.retrieve.side_effect = [failure, _response("resp-1", "completed")]
     monkeypatch.setattr(f, "_foundry_retry_wait", lambda state: 0.5)
 
-    assert f.run_agent(client, "agent", tmp_path, _config(), "task") is None
-    assert client.runs.get.call_count == 2
+    assert f.run_agent(client, AGENT, tmp_path, _config(), "task") is None
+    assert client.responses.retrieve.call_count == 2
     assert clock.now == 1.5
-    assert client.runs.get.call_args.kwargs["read_timeout"] == 0.75
-    assert client.cancelled == []
-
-
-def test_lazy_message_fetch_retries_in_budget_and_never_fetches_another_page(
-    clock: Clock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    client = _poll_client("completed")
-    attempts: list[float] = []
-    message = SimpleNamespace(role=f.MessageRole.AGENT, text_messages=[])
-    monkeypatch.setattr(f, "_foundry_retry_wait", lambda state: 0.5)
-
-    def messages(**kwargs: object) -> ItemPaged:
-        assert kwargs["run_id"] == "run-1"
-
-        def fetch(token: str | None) -> list:
-            assert token is None, "fetching the next page escapes the remaining budget"
-            attempts.append(kwargs["read_timeout"])
-            if len(attempts) == 1:
-                raise ServiceResponseError("synthetic temporary read timeout")
-            clock.sleep(2)
-            return [message]
-
-        return ItemPaged(fetch, lambda data: ("older-page", iter(data)))
-
-    client.messages.list = messages
-
-    assert f.run_agent(client, "agent", tmp_path, _config(), "task") is None
-    assert attempts == [1.5, 1.25]
-    assert clock.now == 2.5
-    assert client.cancelled == []
-
-
-def test_late_lazy_message_page_cannot_return_a_plan(
-    clock: Clock, tmp_path: Path,
-) -> None:
-    client = _poll_client("completed")
-
-    def messages(**kwargs: object) -> ItemPaged:
-        def fetch(token: str | None) -> list:
-            clock.sleep(4)
-            return []
-
-        return ItemPaged(fetch, lambda data: (None, iter(data)))
-
-    client.messages.list = messages
-    with pytest.raises(f.FoundryRunAbortedError) as error:
-        f.run_agent(client, "agent", tmp_path, _config(), "task")
-
-    assert error.value.reason == "run_deadline"
-    assert client.deleted_threads == ["thread-1"]
+    assert client.responses.retrieve.call_args.kwargs["timeout"].read == 0.75

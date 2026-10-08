@@ -1,14 +1,14 @@
 """Cost guards on the Foundry tool-calling loop.
 
 The loop in ``run_agent`` was unbounded: nothing stopped a model that kept
-asking for tool calls, and every round re-sends the thread, so a run that had
-stopped making progress kept billing. These tests pin the two guards that
+asking for tool calls, and every round re-sends the conversation, so a run that
+had stopped making progress kept billing. These tests pin the two guards that
 bound it — a hard round ceiling and a stuck detector — and, just as
 importantly, pin the failure semantics: an aborted run must never look like a
 successful plan.
 
-Hermetic: every Foundry interaction is a fake, following the fake-client
-patterns already used in ``test_foundry_agent.py``.
+Hermetic: every Foundry interaction is a fake of the OpenAI Responses surface
+(``client.responses.create/retrieve/delete``) that ``run_agent`` drives.
 """
 
 from __future__ import annotations
@@ -33,32 +33,58 @@ from tests.plan_fixtures import valid_plan
 
 # ── Fakes ────────────────────────────────────────────────────────────────────
 
+AGENT = foundry_agent.AgentVersion(name="autorefine-plan", version="7", model="gpt-4o-mini")
 
-class _DummyFunction:
-    def __init__(self, name: str, arguments: str) -> None:
+
+def agent_for(model: str = "gpt-4o-mini", mode: str = "plan") -> foundry_agent.AgentVersion:
+    return foundry_agent.AgentVersion(foundry_agent.agent_name(mode), "7", model)
+
+
+class _DummyToolCall:
+    """A Responses ``function_call`` output item."""
+
+    type = "function_call"
+
+    def __init__(self, call_id: str, name: str, arguments: str) -> None:
+        self.id = f"fc_{call_id}"
+        self.call_id = call_id
         self.name = name
         self.arguments = arguments
 
 
-class _DummyToolCall:
-    def __init__(self, tool_call_id: str, name: str, arguments: str) -> None:
-        self.id = tool_call_id
-        self.function = _DummyFunction(name, arguments)
+def _usage() -> SimpleNamespace:
+    return SimpleNamespace(
+        input_tokens=1000,
+        output_tokens=50,
+        total_tokens=1050,
+        input_tokens_details=SimpleNamespace(cached_tokens=600),
+    )
 
 
-class _DummyAction:
-    def __init__(self, tool_calls: list[_DummyToolCall]) -> None:
-        self.submit_tool_outputs = SimpleNamespace(tool_calls=tool_calls)
+def _response(
+    response_id: str,
+    status: str = "completed",
+    calls: list[_DummyToolCall] | None = None,
+    *,
+    text: str = "",
+    usage: Any = None,
+    **extra: Any,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=response_id,
+        status=status,
+        model="gpt-4o-mini",
+        output=list(calls or []),
+        output_text=text,
+        error=None,
+        incomplete_details=None,
+        usage=usage,
+        **extra,
+    )
 
 
-class _DummyToolOutput:
-    def __init__(self, tool_call_id: str, output: str) -> None:
-        self.tool_call_id = tool_call_id
-        self.output = output
-
-
-class _Runs:
-    """The ``client.runs`` surface ``run_agent`` drives."""
+class _Responses:
+    """The ``client.responses`` surface ``run_agent`` drives."""
 
     def __init__(self, client: _ToolLoopClient) -> None:
         self._client = client
@@ -66,77 +92,66 @@ class _Runs:
     def create(
         self,
         *,
-        thread_id: str,
-        agent_id: str,
-        max_prompt_tokens: int | None = None,
-        max_completion_tokens: int | None = None,
-        truncation_strategy: object = None,
+        input: list,  # noqa: A002 - mirrors the SDK keyword
+        extra_body: dict | None = None,
+        store: bool | None = None,
+        truncation: str | None = None,
+        max_output_tokens: int | None = None,
+        previous_response_id: str | None = None,
+        timeout: object = None,
         **_kwargs: object,
     ) -> SimpleNamespace:
-        return self._client.next_run()
+        self._client.requests.append({
+            "input": input,
+            "extra_body": extra_body,
+            "store": store,
+            "truncation": truncation,
+            "max_output_tokens": max_output_tokens,
+            "previous_response_id": previous_response_id,
+            "timeout": timeout,
+        })
+        response = self._client.next_response()
+        self._client.created.append(response.id)
+        return response
 
-    def submit_tool_outputs(self, **_kwargs: object) -> SimpleNamespace:
-        return self._client.next_run()
+    def retrieve(self, response_id: str, **_kwargs: object) -> SimpleNamespace:
+        return self._client.next_response()
 
-    def get(self, **_kwargs: object) -> SimpleNamespace:
-        return self._client.next_run()
-
-    def cancel(self, *, thread_id: str, run_id: str, **_kwargs: object) -> None:
-        self._client.cancelled.append(run_id)
+    def delete(self, response_id: str, **_kwargs: object) -> None:
+        self._client.deleted.append(response_id)
 
 
 class _ToolLoopClient:
-    """Fake client that scripts one batch of tool calls per round.
+    """Fake OpenAI client that scripts one batch of tool calls per response.
 
-    ``script`` receives the 1-based round number and returns that round's tool
-    calls, or ``None`` to end the run as ``completed``. ``rounds`` records how
-    many rounds the loop actually consumed, which is how these tests tell a
-    guard that fired from one that did not.
+    ``script`` receives the 1-based response number and returns that response's
+    function calls, or ``None`` to end the run with a completed text response.
+    ``rounds`` records how many responses the loop consumed, which is how these
+    tests tell a guard that fired from one that did not. Every response carries
+    the same usage, so totals are a multiple of it.
     """
 
     def __init__(self, script: Callable[[int], list[_DummyToolCall] | None]) -> None:
         self._script = script
         self.rounds = 0
-        self.cancelled: list[str] = []
-        self.deleted_threads: list[str] = []
-        self.threads = SimpleNamespace(
-            create=lambda **_kwargs: SimpleNamespace(id="thread-1"),
-            delete=lambda thread_id, **_kwargs: self.deleted_threads.append(thread_id),
-        )
-        self.messages = SimpleNamespace(
-            create=lambda **_kwargs: None,
-            list=lambda **_kwargs: [],
-        )
-        self.runs = _Runs(self)
+        self.requests: list[dict[str, Any]] = []
+        self.created: list[str] = []
+        self.deleted: list[str] = []
+        self.final_text = ""
+        self.responses = _Responses(self)
 
-    def next_run(self) -> SimpleNamespace:
+    def next_response(self) -> SimpleNamespace:
         self.rounds += 1
         calls = self._script(self.rounds)
-        if calls is None:
-            return SimpleNamespace(
-                id="run-1",
-                status="completed",
-                last_error=None,
-                usage=SimpleNamespace(
-                    prompt_tokens=1234,
-                    completion_tokens=56,
-                    total_tokens=1290,
-                ),
-            )
-        return SimpleNamespace(
-            id="run-1",
-            status="requires_action",
-            last_error=None,
-            required_action=_DummyAction(calls),
+        return _response(
+            f"resp-{self.rounds}", "completed", calls,
+            text=self.final_text if calls is None else "", usage=_usage(),
         )
 
 
 @pytest.fixture
-def loop_dummies(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Point the module's isinstance checks at the fakes above."""
-    monkeypatch.setattr(foundry_agent, "RequiredFunctionToolCall", _DummyToolCall)
-    monkeypatch.setattr(foundry_agent, "SubmitToolOutputsAction", _DummyAction)
-    monkeypatch.setattr(foundry_agent, "ToolOutput", _DummyToolOutput)
+def loop_dummies() -> None:
+    """Kept so modules importing it keep working; the fakes need no patching now."""
 
 
 @pytest.fixture(autouse=True)
@@ -146,6 +161,7 @@ def clean_guard_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "AUTOREFINE_MAX_TOOL_ROUNDS",
         "AUTOREFINE_STUCK_REPEATS",
         "AUTOREFINE_MAX_PROMPT_TOKENS",
+        "AUTOREFINE_MAX_COMPLETION_TOKENS",
         "AUTOREFINE_TRUNCATION_LAST_MESSAGES",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -160,7 +176,7 @@ def _read_call(path: str) -> list[_DummyToolCall]:
 
 
 def _run(client: _ToolLoopClient, project_dir: Path) -> dict | None:
-    return foundry_agent.run_agent(client, "agent-1", project_dir, _config(), "task")
+    return foundry_agent.run_agent(client, AGENT, project_dir, _config(), "task")
 
 
 # ── Stuck detection ──────────────────────────────────────────────────────────
@@ -179,13 +195,14 @@ def test_spinning_loop_is_cut_short(loop_dummies: None, tmp_path: Path) -> None:
         _run(client, tmp_path)
 
     assert excinfo.value.reason == "stuck_tool_loop"
-    assert excinfo.value.run_id == "run-1"
+    assert excinfo.value.run_id == "resp-3"
     # Default is 3 repeats: the third identical round is the one that aborts.
     assert client.rounds == foundry_agent.DEFAULT_STUCK_REPEATS == 3
-    # The run is torn down, not left holding a thread open for tool outputs
-    # that are never coming.
-    assert client.cancelled == ["run-1"]
-    assert client.deleted_threads == ["thread-1"]
+    # The tool outputs are simply never sent back; nothing was left running.
+    assert excinfo.value.cancellation_unconfirmed is False
+    assert len(client.requests) == 3
+    # Every stored response of the run is cleaned up, like the classic thread.
+    assert client.deleted == client.created == ["resp-1", "resp-2", "resp-3"]
 
 
 def test_stuck_detector_compares_whole_parallel_batches(
@@ -276,47 +293,32 @@ def test_round_budget_is_enforced(
     assert excinfo.value.reason == "max_tool_rounds"
     # 100 rounds are served; the 101st request is refused.
     assert client.rounds == 101
-    assert client.deleted_threads == ["thread-1"]
+    assert client.deleted == client.created
 
 
-def test_round_budget_counts_unservable_required_actions(
+def test_round_budget_counts_every_response_that_asks_for_tools(
     loop_dummies: None,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A ``requires_action`` we cannot service must still consume budget.
+    """Calls to a tool we do not have still consume budget.
 
-    That branch falls through without calling the service or sleeping, so an
-    uncounted round would busy-spin on an unchanged run forever.
+    An unknown tool gets an error output and the loop continues, so an uncounted
+    round would let a model that keeps asking for it bill forever.
     """
     monkeypatch.setenv("AUTOREFINE_MAX_TOOL_ROUNDS", "100")
-    unservable = SimpleNamespace(
-        id="run-1",
-        status="requires_action",
-        last_error=None,
-        required_action=SimpleNamespace(kind="something-we-do-not-handle"),
-    )
 
-    class StuckRuns(_Runs):
-        def create(
-            self,
-            *,
-            thread_id: str,
-            agent_id: str,
-            max_prompt_tokens: int | None = None,
-            max_completion_tokens: int | None = None,
-            truncation_strategy: object = None,
-            **_kwargs: object,
-        ) -> SimpleNamespace:
-            return unservable
+    def script(round_number: int) -> list[_DummyToolCall]:
+        return [_DummyToolCall(f"c{round_number}", "no_such_tool", f'{{"n": {round_number}}}')]
 
-    client = _ToolLoopClient(lambda _round: None)
-    client.runs = StuckRuns(client)
+    client = _ToolLoopClient(script)
 
     with pytest.raises(FoundryRunAbortedError) as excinfo:
         _run(client, tmp_path)
 
     assert excinfo.value.reason == "max_tool_rounds"
+    error = json.loads(client.requests[1]["input"][0]["output"])
+    assert error == {"error": "Unknown tool: no_such_tool"}
 
 
 def test_default_round_ceiling_clears_a_measured_plan_run() -> None:
@@ -381,8 +383,42 @@ def test_healthy_run_reaching_submit_plan_is_untouched(
 
     assert result == {**valid_plan(), "research_insights": []}
     assert client.rounds == 4
-    assert client.cancelled == [], "a healthy run must never be cancelled"
-    assert client.deleted_threads == ["thread-1"]
+    assert client.deleted == client.created
+
+
+def test_tool_outputs_are_sent_back_on_the_pinned_agent_chain(
+    loop_dummies: None,
+    tmp_path: Path,
+) -> None:
+    """The function_call -> function_call_output loop, end to end.
+
+    Each follow-up request must carry the outputs for exactly the calls the
+    previous response asked for, chained with ``previous_response_id`` and the
+    same pinned ``agent_reference``. Dropping any of those would either lose the
+    tool results or run a different agent version mid-run.
+    """
+    (tmp_path / "README.md").write_text("# demo\n", encoding="utf-8")
+    client = _ToolLoopClient(_healthy_script)
+
+    _run(client, tmp_path)
+
+    reference = {"agent_reference": {
+        "name": "autorefine-plan", "version": "7", "type": "agent_reference",
+    }}
+    assert [r["extra_body"] for r in client.requests] == [reference] * 4
+    assert [r["previous_response_id"] for r in client.requests] == [
+        None, "resp-1", "resp-2", "resp-3",
+    ]
+    first = client.requests[0]["input"]
+    assert first[0]["role"] == "user" and "## Task\ntask" in first[0]["content"]
+    for request, call_id in zip(client.requests[1:], ("c1", "call-1", "c3"), strict=True):
+        (item,) = request["input"]
+        assert item["type"] == "function_call_output"
+        assert item["call_id"] == call_id
+        json.loads(item["output"])
+    assert json.loads(client.requests[2]["input"][0]["output"])["content"] == "# demo"
+    assert json.loads(client.requests[3]["input"][0]["output"])["status"] == "plan_received"
+    assert all(r["store"] is True and r["truncation"] == "auto" for r in client.requests)
 
 
 # ── Failure semantics ────────────────────────────────────────────────────────
@@ -447,13 +483,10 @@ def test_cleanup_failure_does_not_mask_the_abort(
 
     client = _ToolLoopClient(script)
 
-    def explode(_thread_id: str, **_kwargs: object) -> None:
-        raise AzureError("thread delete failed")
+    def explode(_response_id: str, **_kwargs: object) -> None:
+        raise AzureError("response delete failed")
 
-    client.threads = SimpleNamespace(
-        create=lambda **_kwargs: SimpleNamespace(id="thread-1"),
-        delete=explode,
-    )
+    client.responses.delete = explode
 
     with pytest.raises(FoundryRunAbortedError) as excinfo:
         _run(client, tmp_path)
@@ -472,13 +505,16 @@ def test_cost_line_reports_a_healthy_run(
     _run(_ToolLoopClient(_healthy_script), tmp_path)
 
     line = _cost_line(caplog)
+    assert "run_id=resp-1" in line, "the row names the root of the response chain"
     assert "rounds=3" in line
     assert "tool_calls=3" in line
     assert "guard=none" in line
     assert "plan_captured=True" in line
-    assert "prompt_tokens=1234" in line
-    assert "completion_tokens=56" in line
-    assert "total_tokens=1290" in line
+    # Usage is summed over all four responses, not read off the last one.
+    assert "prompt_tokens=4000" in line
+    assert "completion_tokens=200" in line
+    assert "total_tokens=4200" in line
+    assert "cached_prompt_tokens=2400" in line
 
 
 def test_cost_line_names_the_guard_that_fired(
@@ -512,10 +548,12 @@ def _cost_line(caplog: pytest.LogCaptureFixture) -> str:
         None,
         {"prompt_tokens": 7, "completion_tokens": 8, "total_tokens": 15},
         SimpleNamespace(prompt_tokens=7, completion_tokens=8, total_tokens=15),
+        SimpleNamespace(input_tokens=7, output_tokens=8, total_tokens=15),
+        {"input_tokens": 7, "output_tokens": 8},
     ],
 )
 def test_token_usage_is_probed_not_assumed(usage: Any) -> None:
-    """``usage`` is absent mid-flight and shaped differently by service version."""
+    """``usage`` is absent mid-flight and shaped differently by API and version."""
     run = SimpleNamespace(id="run-1", status="completed")
     if usage is not None:
         run.usage = usage
@@ -524,6 +562,35 @@ def test_token_usage_is_probed_not_assumed(usage: Any) -> None:
 
     assert set(read) == {"prompt_tokens", "completion_tokens", "total_tokens"}
     assert read["total_tokens"] == (None if usage is None else 15)
+
+
+def test_run_wide_prompt_budget_stops_before_the_next_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The classic service-side run cap is now summed locally across responses."""
+    monkeypatch.setenv("AUTOREFINE_MAX_PROMPT_TOKENS", "20000")
+    client = _ToolLoopClient(lambda n: _read_call(f"file-{n}.md"))
+
+    with pytest.raises(FoundryRunIncompleteError) as excinfo:
+        _run(client, tmp_path)
+
+    assert excinfo.value.reason == "max_prompt_tokens"
+    assert not isinstance(excinfo.value, FoundryRunAbortedError)
+    # 20 responses x 1000 input tokens reaches the cap; no 21st request is sent.
+    assert client.rounds == 20
+
+
+def test_each_request_may_spend_only_the_completion_budget_left(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AUTOREFINE_MAX_COMPLETION_TOKENS", "120")
+    client = _ToolLoopClient(lambda n: _read_call(f"file-{n}.md"))
+
+    with pytest.raises(FoundryRunIncompleteError) as excinfo:
+        _run(client, tmp_path)
+
+    assert excinfo.value.reason == "max_completion_tokens"
+    assert [r["max_output_tokens"] for r in client.requests] == [120, 70, 20]
 
 
 def test_cost_line_survives_an_unreadable_run(caplog: pytest.LogCaptureFixture) -> None:
@@ -552,7 +619,7 @@ def test_signature_is_stable_order_insensitive_and_argument_sensitive() -> None:
     assert sign([a, b]) == sign([b, a]), "parallel calls must not depend on order"
     assert sign([a]) != sign([b]), "different arguments must not collide"
     assert sign([a]) != sign([a, b])
-    # Tool-call ids change every round and must not defeat the comparison.
+    # Call ids change every round and must not defeat the comparison.
     assert sign([a]) == sign([_DummyToolCall("99", "read_project_file", '{"path": "a.md"}')])
 
 
