@@ -4,10 +4,10 @@ version = "0.1.0"
 description = "AI agent that continuously evaluates and improves software projects"
 requires-python = ">=3.11"
 dependencies = [
-    "azure-ai-projects>=2.1.0,<3",
+    "azure-ai-projects>=2.1.0,<2.5",
     "azure-identity>=1.19.0",
     "azure-mgmt-costmanagement>=4.0.1",
-    "openai>=2.0,<3",
+    "openai>=2.8.0,<3",
     "pyyaml>=6.0.2",
     "python-dotenv>=1.0.1",
     "httpx>=0.27.0",

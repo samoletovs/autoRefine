@@ -1589,17 +1589,22 @@ def _error_code(error: Any) -> str:
 
 
 def _status_error_code(exc: openai.APIStatusError) -> str:
-    """The failure code for an HTTP error from ``responses.create``."""
+    """The failure code for an HTTP error from ``responses.create``.
+
+    The HTTP status decides transience first: Azure bodies carry their own codes
+    (``"429"``, ``"InternalServerError"``, ``"ServiceUnavailable"``) that would never
+    match ``TRANSIENT_FAILURE_CODES``, turning a throttling blip into a hard failure.
+    """
+    if exc.status_code == 429:
+        return "rate_limit_exceeded"
+    if exc.status_code >= 500:
+        return "server_error"
     body = getattr(exc, "body", None)
     if isinstance(body, dict):
         nested = body.get("error") if isinstance(body.get("error"), dict) else body
         code = nested.get("code")
         if isinstance(code, str) and code:
             return code
-    if exc.status_code == 429:
-        return "rate_limit_exceeded"
-    if exc.status_code >= 500:
-        return "server_error"
     return f"http_{exc.status_code}"
 
 

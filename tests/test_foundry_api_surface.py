@@ -80,9 +80,13 @@ def test_manifests_install_the_new_agent_service_sdk_not_the_classic_one(manifes
     assert projects.specifier.contains("2.1.0")
     assert not projects.specifier.contains("1.0.0")
     assert not projects.specifier.contains("3.0.0")
+    # azure-ai-projects 2.5+ declares openai>=3; allowing it with openai<3 would let
+    # pip pair this code with an SDK stack it was never verified on.
+    assert not projects.specifier.contains("2.5.0")
     openai = requirements["openai"]
-    assert openai.specifier.contains("2.0.0")
+    assert openai.specifier.contains("2.8.0")
     assert not openai.specifier.contains("1.99.0")
+    assert not openai.specifier.contains("3.0.0")
 
 
 def test_installed_sdk_offers_the_agent_version_api_this_code_drives() -> None:
