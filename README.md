@@ -70,9 +70,9 @@ python -m agent.main --repo owner/repo --mode dashboard --output dashboard.html
 ```
 
 `--model` selects the deployment for `plan`, `refine`, and both technical and functional
-planning in `file-ideas`. It overrides `FOUNDRY_DEFAULT_DEPLOYMENT`; the classic
+planning in `file-ideas`. It overrides `FOUNDRY_DEFAULT_DEPLOYMENT`; the
 default remains `gpt-4o-mini`. Only mini and GPT-4.1 are enabled. Luna/Sol
-overrides fail before work starts until the [classic gate](#model-pilot) passes.
+overrides fail before work starts until the [model gate](#model-pilot) passes.
 
 `file-ideas --dry-run` suppresses issue creation and Telegram notifications, but can
 still use Foundry to generate plans. The governance filer must support `--repo` and
@@ -153,8 +153,8 @@ autoRefine/
 
 autoRefine is a **Foundry hosted agent** with function-calling tools:
 
-- **Model**: `gpt-4o-mini` for classic planning, `gpt-6-luna` for health Chat.
-  Classic Luna/Sol, including explicit manual Sol plans, remain blocked.
+- **Model**: `gpt-4o-mini` for Foundry agent planning, `gpt-6-luna` for health Chat.
+  Agent-planning Luna/Sol, including explicit manual Sol plans, remain blocked.
   The closed-loop PR reviewer (deep-review) lives in `samoletovs/nauroLabs-github`
   and uses Claude Opus 4 (via GitHub Models) — see that repo's AGENT_ROLES.md.
 - **Tools**: GitHub API, file system, test runner, quality checkers
@@ -179,8 +179,8 @@ Even a real `--dry-run` calls services and spends money.
 | Surface | Resource, deployment and actual model | Configuration |
 |---|---|---|
 | Health analyst, Chat Completions | `foundrylab-aiservices`, `gpt-6-luna`, `gpt-6-luna` v2026-09-22 | `AZURE_OPENAI_ENDPOINT=https://foundrylab-aiservices.cognitiveservices.azure.com/`, `HEALTH_SCAN_MODEL=gpt-6-luna` |
-| Classic Foundry planning | same account, `gpt-4o-mini` | `FOUNDRY_PROJECT_ENDPOINT=https://foundrylab-aiservices.services.ai.azure.com/api/projects/foundrylab`, `FOUNDRY_DEFAULT_DEPLOYMENT=gpt-4o-mini` |
-| Classic Luna / on-demand Sol | same account, candidate models v2026-09-22 | **Blocked**, including explicit `--model` overrides |
+| Foundry agent planning | same account, `gpt-4o-mini` | `FOUNDRY_PROJECT_ENDPOINT=https://foundrylab-aiservices.services.ai.azure.com/api/projects/foundrylab`, `FOUNDRY_DEFAULT_DEPLOYMENT=gpt-4o-mini` |
+| Foundry agent Luna / on-demand Sol | same account, candidate models v2026-09-22 | **Blocked**, including explicit `--model` overrides |
 
 Deployment aliases are not inferred: use the same-named actual deployments.
 The health analyst uses `max_completion_tokens<=4000` and
@@ -188,16 +188,23 @@ The health analyst uses `max_completion_tokens<=4000` and
 pilot ceiling. `AZURE_OPENAI_DEPLOYMENT` is not used by this health path.
 Sol is refused by scheduled health analysis and fleet/write modes.
 
-Classic agents have run-wide input/output ceilings, not Chat Completions
-parameters: routine **200,000 / 16,000**, prepared Sol limits **40,000 / 4,000**.
+Foundry planning runs on the Foundry Agent Service API (`azure-ai-projects` 2.x):
+persistent, versioned prompt agents `autorefine-plan` / `autorefine-refine`, driven
+through the project's Responses API (`agent_reference` pinned to an exact version,
+tool results chained with `previous_response_id`). The classic `azure-ai-agents`
+threads/runs surface was removed on 2026-10-08 ahead of its 2027-03-31 retirement.
+Runs keep run-wide input/output ceilings, now summed locally over every response:
+routine **200,000 / 16,000**, prepared Sol limits **40,000 / 4,000**.
 `AUTOREFINE_MAX_PROMPT_TOKENS` and `AUTOREFINE_MAX_COMPLETION_TOKENS` can lower
-these. The Sol limits do not enable Sol or constitute compatibility proof. The existing
-1,800-second run deadline, 12-message window, round/repetition guards,
-cancellation/cleanup and fail-closed plan contracts are unchanged.
+these. The Sol limits do not enable Sol or constitute compatibility proof. The
+classic 12-message window has no Responses equivalent (`truncation="auto"` is used and
+`AUTOREFINE_TRUNCATION_LAST_MESSAGES` is ignored with a warning; see AGENTS.md "What
+the sweep actually costs"). The 1,800-second run deadline, round/repetition guards,
+cleanup and fail-closed plan contracts are unchanged.
 
-**Classic gate is closed in code and IaC.** Parent reported on 2026-10-02 that
-both Luna and Sol accepted ephemeral agent/thread creation on actual classic
-v1, but each bounded run (4,000 prompt / 1,024 completion tokens, one synthetic
+**Model gate is closed in code and IaC.** Parent reported on 2026-10-02 that
+both Luna and Sol accepted ephemeral agent/thread creation on the (since removed)
+classic v1 surface, but each bounded run (4,000 prompt / 1,024 completion tokens, one synthetic
 sum tool) ended with `server_error`. Owned test objects were deleted. Baseline
 control is pending: this is not proof that either model is unsupported, but it
 is not a passed end-to-end gate.
@@ -206,23 +213,21 @@ is not a passed end-to-end gate.
 unverified models before repo processing, and both `create_agent` and
 `run_agent` enforce the same allowlist before SDK side effects. Manual permission,
 deployment creation and a passing Chat Completions test do not bypass it.
-There is no environment flag to enable unverified classic models. Promotion
-requires a reviewed allowlist/IaC change after the actual classic gate passes.
+There is no environment flag to enable unverified models. Promotion requires a
+reviewed allowlist/IaC change after the gate passes — and the 2026-10-02 result was
+measured on the classic surface, so the gate must be re-run on the Responses surface.
 
-The installed `azure-ai-agents`
-1.1 SDK and its documented create/run signatures do not declare
-`reasoning_effort`. This branch deliberately does not pass it through
-`**kwargs`, since a generated client may drop it. No claim of `low` reasoning
-is made for classic Sol. Parent must verify Luna/Sol completion, tools and
-run-wide completion caps synthetically on this exact service before promotion.
-If explicit reasoning effort is required, classic promotion stays blocked;
-a service/API migration is separate work, not a hidden fallback.
+`PromptAgentDefinition` declares `reasoning`, but no agent version sets it; no
+claim of `low` reasoning is made for Sol. Parent must verify Luna/Sol completion,
+tools and run-wide completion caps synthetically on this exact service before
+promotion.
 
 Run telemetry now includes the service-reported model and an
 `estimated_usd_uncached` upper-bound estimate. Global short-context USD/M:
 Luna **0.10 input / 0.50 output / 0.01 cached input**; Sol **2 / 10 / 0.20**.
-Classic usage has no reliable cached-input count, so **all input is priced
-uncached**, not at the cached rate. Unknown model or missing usage yields
+Responses report cached input (summed onto the `run_cost` log line as
+`cached_prompt_tokens`), but the cost-row estimate still prices **all input
+uncached**, as an upper bound, so the row schema is unchanged. Unknown model or missing usage yields
 `cost_basis=unavailable` and no price estimate, with a warning.
 
 ### Parent activation and rollback
@@ -240,13 +245,14 @@ uncached**, not at the cached rate. Unknown model or missing usage yields
   override**, so changing the code default alone would change its next run.
   Code, CLI, example environment and IaC therefore all retain `gpt-4o-mini`.
   Health Chat remains independently configured as Luna.
-- Agents named `autorefine` are ephemeral, created and cleaned up per run;
-  there is no persistent agent to update. Existing unrelated shared-project
-  agents must not be edited.
+- Agents `autorefine-plan` and `autorefine-refine` are persistent; a run reuses
+  the newest version whose definition hash matches and publishes a new version
+  only when model, instructions, tools or sampling change. Existing unrelated
+  shared-project agents (`atlas-*`, `lab-memory`) must not be edited.
 - Health rollback sets `HEALTH_SCAN_MODEL` to `gpt-4o-mini` or `gpt-4.1`;
-  classic `FOUNDRY_DEFAULT_DEPLOYMENT` must already be one of those values.
+  `FOUNDRY_DEFAULT_DEPLOYMENT` must already be one of those values.
   Health requests regain
-  legacy `max_tokens`/temperature; classic requests retain their finite
+  legacy `max_tokens`/temperature; agent runs retain their finite
   run caps. Do not raise budgets or change cadence to hide a failed gate.
 - There is no repository-owned `copilot-triage` workflow in this repo.
 

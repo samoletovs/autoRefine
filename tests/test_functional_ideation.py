@@ -8,7 +8,6 @@ API services".
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from unittest.mock import ANY
 
 import agent.main as m
 
@@ -384,14 +383,17 @@ def _patch_functional_agent(monkeypatch, run_agent_impl):
     from types import SimpleNamespace
     from unittest.mock import MagicMock
 
-    fake_client = SimpleNamespace(delete_agent=MagicMock())
+    fake_project = SimpleNamespace(agents=MagicMock())
+    create = MagicMock(return_value="agent-version")
     monkeypatch.setenv("FOUNDRY_PROJECT_ENDPOINT", "https://example.test")
     monkeypatch.setattr(m.time, "sleep", lambda *_a, **_k: None)
-    monkeypatch.setattr("azure.ai.agents.AgentsClient", lambda **_k: fake_client)
-    monkeypatch.setattr("azure.identity.DefaultAzureCredential", lambda *_a, **_k: None)
-    monkeypatch.setattr("agent.foundry_agent.create_agent", lambda *_a, **_k: "agent-1")
+    monkeypatch.setattr(
+        "agent.foundry_agent.open_foundry_clients", lambda _endpoint: (fake_project, object()),
+    )
+    monkeypatch.setattr("agent.foundry_agent.create_agent", create)
     monkeypatch.setattr("agent.foundry_agent.run_agent", run_agent_impl)
-    return fake_client
+    fake_project.create = create
+    return fake_project
 
 
 def test_plan_functional_retries_on_transient_none(monkeypatch, tmp_path):
@@ -410,13 +412,12 @@ def test_plan_functional_retries_on_transient_none(monkeypatch, tmp_path):
 
     assert calls["n"] == 2  # retried once after the transient None
     assert result == plan
-    fake_client.delete_agent.assert_called_once_with(
-        "agent-1", connection_timeout=ANY, read_timeout=ANY, retry_total=0,
-    )
+    fake_client.create.assert_called_once()  # one agent version serves every attempt
+    assert fake_client.agents.mock_calls == []
 
 
 def test_plan_functional_gives_up_after_all_attempts(monkeypatch, tmp_path):
-    """When every attempt fails, plan_functional returns None and still cleans up."""
+    """When every attempt fails, plan_functional returns None without agent teardown."""
     from types import SimpleNamespace
 
     calls = {"n": 0}
@@ -430,6 +431,5 @@ def test_plan_functional_gives_up_after_all_attempts(monkeypatch, tmp_path):
 
     assert result is None
     assert calls["n"] == m.FUNCTIONAL_PLAN_ATTEMPTS  # exhausted all attempts
-    fake_client.delete_agent.assert_called_once_with(
-        "agent-1", connection_timeout=ANY, read_timeout=ANY, retry_total=0,
-    )
+    fake_client.create.assert_called_once()
+    assert fake_client.agents.mock_calls == []

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -10,24 +9,21 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import httpx
+import openai
 import pytest
-from azure.ai.agents import AgentsClient
-from azure.core.credentials import AccessToken
 from azure.core.exceptions import ServiceResponseError
-from azure.core.pipeline.transport import HttpRequest, HttpTransport, RequestsTransport
+from azure.core.pipeline.transport import HttpRequest, RequestsTransport
 
 from agent import foundry_agent as f
 from agent import main as m
 from agent.config import ProjectConfig
 from agent.sdk_boundary import SdkBoundary, client_boundary
-from tests.test_foundry_loop_guards import (
-    _DummyAction,
-    _DummyToolCall,
-    _ToolLoopClient,
-    loop_dummies,  # noqa: F401
-)
+from tests.test_foundry_loop_guards import AGENT, _DummyToolCall, _response, _ToolLoopClient
 
-pytestmark = pytest.mark.usefixtures("loop_dummies")
+
+def _config() -> ProjectConfig:
+    return ProjectConfig(name="fixture", purpose="", users="", stage="active")
 
 
 def test_continuously_arriving_body_bytes_cannot_extend_the_caller_deadline() -> None:
@@ -83,34 +79,47 @@ def test_continuously_arriving_body_bytes_cannot_extend_the_caller_deadline() ->
         thread.join(2)
 
 
-@pytest.mark.parametrize("entrypoint", ["plan", "functional", "refine"])
-@pytest.mark.parametrize("outcome", ["success", "deadline"])
-def test_expected_agent_delete_failure_does_not_replace_primary_result_or_error(
-    entrypoint: str, outcome: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    primary = f.FoundryRunAbortedError("run", "run_deadline", "synthetic timeout")
-    no_gap = {"outcome": "no_gap", "score": 100, "improvements": [], "summary": "Reviewed"}
-    client = SimpleNamespace(delete_agent=Mock(side_effect=ServiceResponseError("cleanup offline")))
-    run = Mock(side_effect=primary) if outcome == "deadline" else Mock(return_value=no_gap)
+def _wire_entrypoint(
+    monkeypatch: pytest.MonkeyPatch, run: Mock,
+) -> tuple[SimpleNamespace, SimpleNamespace, Mock, list[str]]:
+    project = SimpleNamespace(agents=Mock())
+    client = SimpleNamespace(responses=Mock())
+    opened: list[str] = []
+    create = Mock(return_value=AGENT)
+
+    def open_clients(endpoint: str) -> tuple[SimpleNamespace, SimpleNamespace]:
+        opened.append(endpoint)
+        return project, client
+
     monkeypatch.setenv("FOUNDRY_PROJECT_ENDPOINT", "https://example.test")
-    monkeypatch.setattr("azure.ai.agents.AgentsClient", lambda **kw: client)
-    monkeypatch.setattr("azure.identity.DefaultAzureCredential", lambda: None)
-    monkeypatch.setattr(f, "create_agent", lambda *a, **kw: "agent")
+    monkeypatch.setattr(f, "open_foundry_clients", open_clients)
+    monkeypatch.setattr(f, "create_agent", create)
     monkeypatch.setattr(f, "run_agent", run)
     monkeypatch.setattr(m, "_extract_relevant_wiki_insights", lambda name: "")
     monkeypatch.setattr(m, "_worktree_snapshot", lambda path: set())
     monkeypatch.setattr(m, "_worktree_status", lambda path: {})
     monkeypatch.setattr(m, "_rollback_agent_changes", lambda *a: [])
     monkeypatch.setattr("agent.tools.github_tools.create_branch", lambda *a: True)
-    monkeypatch.setattr(f._call_foundry_with_retry.retry, "sleep", lambda _: None)
-    config = ProjectConfig(name="fixture", purpose="", users="", stage="active")
+    return project, client, create, opened
+
+
+@pytest.mark.parametrize("entrypoint", ["plan", "functional", "refine"])
+@pytest.mark.parametrize("outcome", ["success", "deadline"])
+def test_entrypoints_keep_the_persistent_agent_and_the_primary_outcome(
+    entrypoint: str, outcome: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One endpoint, one project client, one responses client; no per-run agent teardown."""
+    primary = f.FoundryRunAbortedError("run", "run_deadline", "synthetic timeout")
+    no_gap = {"outcome": "no_gap", "score": 100, "improvements": [], "summary": "Reviewed"}
+    run = Mock(side_effect=primary) if outcome == "deadline" else Mock(return_value=no_gap)
+    project, client, create, opened = _wire_entrypoint(monkeypatch, run)
 
     def invoke() -> object:
         if entrypoint == "plan":
-            return m.plan_project(tmp_path, config, [])
+            return m.plan_project(tmp_path, _config(), [])
         if entrypoint == "functional":
-            return m.plan_functional(tmp_path, config)
-        return m.refine_project(tmp_path, config, no_gap, "owner/fixture")
+            return m.plan_functional(tmp_path, _config())
+        return m.refine_project(tmp_path, _config(), no_gap, "owner/fixture")
 
     if outcome == "deadline" and entrypoint != "refine":
         with pytest.raises(f.FoundryRunAbortedError) as error:
@@ -118,46 +127,44 @@ def test_expected_agent_delete_failure_does_not_replace_primary_result_or_error(
         assert error.value is primary
     else:
         assert invoke() == (False if entrypoint == "refine" else no_gap)
-    client.delete_agent.assert_called()
+
+    assert opened == ["https://example.test"]
+    assert create.call_args.args[0] is project
+    assert create.call_args.kwargs["mode"] == ("refine" if entrypoint == "refine" else "plan")
+    assert run.call_args.args[:2] == (client, AGENT)
+    assert project.agents.mock_calls == [], "a persistent agent version is never deleted"
 
 
-def test_late_run_never_dispatches_tools_and_cleanup_waits_for_its_client_lease(
+def test_late_response_never_dispatches_tools_and_cleanup_waits_for_its_client_lease(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    release, cancelled, deleted = threading.Event(), threading.Event(), threading.Event()
+    release, deleted = threading.Event(), threading.Event()
     client = _ToolLoopClient(lambda n: None)
     monkeypatch.setattr(f, "resolve_run_timeout_seconds", lambda: 1)
     monkeypatch.setattr(f, "CLEANUP_TIMEOUT_SECONDS", 0.05)
     dispatched = Mock()
     monkeypatch.setitem(f.TOOL_HANDLERS, "write_project_file", dispatched)
 
-    def late_run() -> SimpleNamespace:
+    def late_response() -> SimpleNamespace:
         assert release.wait(4)
-        return SimpleNamespace(id="late-run", status="requires_action", required_action=_DummyAction([
+        return _response("late-resp", "completed", [
             _DummyToolCall("write", "write_project_file", '{"path":"late.py","content":"bad"}'),
-        ]))
+        ])
 
-    def cancel(**kwargs: object) -> None:
+    def delete(response_id: str, **kwargs: object) -> None:
         assert release.is_set(), "cleanup cannot use a client still owned by an in-flight call"
-        assert kwargs["run_id"] == "late-run"
-        cancelled.set()
-
-    def delete(thread_id: str, **kwargs: object) -> None:
-        assert release.is_set()
+        assert response_id == "late-resp"
         deleted.set()
 
-    client.next_run = late_run
-    client.runs.cancel = cancel
-    client.threads.delete = delete
+    client.next_response = late_response
+    client.responses.delete = delete
     started = time.monotonic()
     try:
         with pytest.raises(f.FoundryRunAbortedError) as error:
-            f.run_agent(client, "agent", tmp_path, ProjectConfig(
-                name="fixture", purpose="", users="", stage="active",
-            ), "task", mode="refine")
+            f.run_agent(client, AGENT, tmp_path, _config(), "task", mode="refine")
         assert error.value.reason == "run_deadline"
+        assert error.value.cancellation_unconfirmed is True
         assert time.monotonic() - started < 1.7
-        assert not cancelled.is_set()
         assert not deleted.is_set()
         # Even a caller ignoring the failure cannot reuse this client for paid work.
         with pytest.raises(f._RunDeadlineExceeded, match="retired"):
@@ -167,144 +174,147 @@ def test_late_run_never_dispatches_tools_and_cleanup_waits_for_its_client_lease(
             )
     finally:
         release.set()
-        assert cancelled.wait(2)
         assert deleted.wait(2)
     dispatched.assert_not_called()
     assert not (tmp_path / "late.py").exists()
 
 
-def test_agent_delete_itself_has_an_absolute_caller_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_response_cleanup_has_an_absolute_caller_boundary_and_fails_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     release, finished = threading.Event(), threading.Event()
     monkeypatch.setattr(f, "CLEANUP_TIMEOUT_SECONDS", 0.1)
+    attempted: list[str] = []
 
-    def delete(agent_id: str, **kwargs: object) -> None:
+    def delete(response_id: str, **kwargs: object) -> None:
+        attempted.append(response_id)
         try:
             assert release.wait(2)
         finally:
             finished.set()
 
-    client = SimpleNamespace(delete_agent=delete)
+    client = SimpleNamespace(responses=SimpleNamespace(delete=delete))
     started = time.monotonic()
     try:
-        assert f.cleanup_agent(client, "agent") is False
+        assert f._cleanup_responses(client, ["resp-1", "resp-2"]) is False
         assert time.monotonic() - started < 0.5
+        assert attempted == ["resp-1"], "stop at the first failure; the service expires the rest"
     finally:
         release.set()
         assert finished.wait(2)
 
 
-def test_agent_cleanup_programming_error_still_propagates() -> None:
+def test_response_cleanup_programming_error_still_propagates() -> None:
     primary = RuntimeError("synthetic programming bug")
-    client = SimpleNamespace(delete_agent=Mock(side_effect=primary))
+    client = SimpleNamespace(responses=SimpleNamespace(delete=Mock(side_effect=primary)))
     with pytest.raises(RuntimeError) as error:
-        f.cleanup_agent(client, "agent")
+        f._cleanup_responses(client, ["resp-1"])
     assert error.value is primary
 
 
-def test_agent_created_after_deadline_is_only_used_for_cleanup(
+def test_agent_version_published_after_deadline_is_harmless(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    release, deleted = threading.Event(), threading.Event()
+    """A late version is a reusable definition, not an orphan needing cleanup."""
+    release, published = threading.Event(), threading.Event()
     monkeypatch.setattr(f, "resolve_run_timeout_seconds", lambda: 1)
-    monkeypatch.setattr(f, "CLEANUP_TIMEOUT_SECONDS", 0.05)
 
-    def create(**kwargs: object) -> SimpleNamespace:
-        assert release.wait(4)
-        return SimpleNamespace(id="late-agent")
+    def create_version(**kwargs: object) -> SimpleNamespace:
+        try:
+            assert release.wait(4)
+            return SimpleNamespace(name=kwargs["agent_name"], version="1", metadata={})
+        finally:
+            published.set()
 
-    def delete(agent_id: str, **kwargs: object) -> None:
-        assert agent_id == "late-agent"
-        deleted.set()
-
-    client = SimpleNamespace(create_agent=create, delete_agent=delete)
+    project = SimpleNamespace(agents=SimpleNamespace(
+        list_versions=lambda *a, **kw: [], create_version=create_version,
+    ))
+    started = time.monotonic()
     try:
         with pytest.raises(f.FoundryRunAbortedError) as error:
-            f.create_agent(client)
+            f.create_agent(project)
         assert error.value.reason == "run_deadline"
+        assert time.monotonic() - started < 1.7
     finally:
         release.set()
-        assert deleted.wait(2)
+        assert published.wait(2)
 
 
 def test_real_sdk_blocked_auth_cannot_hold_the_caller_or_reuse_closed_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The real OpenAI client, authenticated the way ``get_openai_client`` does it."""
     release, deleted = threading.Event(), threading.Event()
     requests: list[str] = []
     monkeypatch.setattr(f, "resolve_run_timeout_seconds", lambda: 1)
     monkeypatch.setattr(f, "CLEANUP_TIMEOUT_SECONDS", 0.05)
 
-    class Credential:
-        def get_token(self, *scopes: str, **kwargs: object) -> AccessToken:
-            assert release.wait(4)
-            return AccessToken("synthetic-only", 9_999_999_999)
+    def token_provider() -> str:
+        assert release.wait(4)
+        return "synthetic-only"
 
-    class Response:
-        status_code = 200
-        headers = {"content-type": "application/json"}
-        reason = "OK"
-        content_type = "application/json"
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request.method)
+        if request.method == "DELETE":
+            deleted.set()
+            return httpx.Response(200, json={"id": "resp_1", "object": "response", "deleted": True})
+        return httpx.Response(200, json={
+            "id": "resp_1", "object": "response", "created_at": 0, "status": "completed",
+            "model": "gpt-4o-mini", "output": [], "parallel_tool_calls": True,
+            "tool_choice": "auto", "tools": [],
+        })
 
-        def json(self) -> dict:
-            return {"id": "thread-1", "object": "thread", "created_at": 0, "metadata": {}}
-
-        @property
-        def content(self) -> bytes:
-            return json.dumps(self.json()).encode()
-
-        def text(self, encoding: str | None = None) -> str:
-            return json.dumps(self.json())
-
-        def body(self) -> bytes:
-            return self.content
-
-        def read(self) -> bytes:
-            return self.content
-
-    class Transport(HttpTransport):
-        closed = False
-
-        def open(self) -> None:
-            pass
-
-        def close(self) -> None:
-            self.closed = True
-
-        def __enter__(self) -> Transport:
-            return self
-
-        def __exit__(self, *args: object) -> None:
-            self.close()
-
-        def send(self, request: HttpRequest, **kwargs: object) -> Response:
-            assert not self.closed, "a late SDK call must not access a closed transport"
-            requests.append(request.method)
-            response = Response()
-            response.request = request
-            if request.method == "DELETE":
-                response.status_code = 204
-                deleted.set()
-            return response
-
-    transport = Transport()
-    client = AgentsClient(
-        endpoint="https://example.test/api/projects/synthetic",
-        credential=Credential(), transport=transport,
+    http_client = httpx.Client(transport=httpx.MockTransport(respond))
+    client = openai.OpenAI(
+        base_url="https://example.test/api/projects/synthetic/openai/v1",
+        api_key=token_provider, max_retries=0, http_client=http_client,
     )
+    # Resource modules load lazily on first access; keep that import out of the timing.
+    assert callable(client.responses.create)
     started = time.monotonic()
     try:
         with pytest.raises(f.FoundryRunAbortedError) as error:
-            f.run_agent(client, "agent", tmp_path, ProjectConfig(
-                name="fixture", purpose="", users="", stage="active",
-            ), "task")
+            f.run_agent(client, AGENT, tmp_path, _config(), "task")
         assert error.value.reason == "run_deadline"
         assert time.monotonic() - started < 1.7
         assert requests == []
     finally:
         release.set()
-        assert deleted.wait(2), "late-created thread must still get a cleanup attempt"
-        client.close()
+        assert deleted.wait(2), "late-created response must still get a cleanup attempt"
     assert requests == ["POST", "DELETE"]
+    http_client.close()
+
+
+def test_retired_agent_lease_does_not_retire_the_responses_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = threading.Event()
+    monkeypatch.setattr(f, "resolve_run_timeout_seconds", lambda: 1)
+
+    def stalled(*args: object, **kwargs: object) -> list:
+        assert release.wait(4)
+        return []
+
+    project = SimpleNamespace(agents=SimpleNamespace(list_versions=stalled))
+    client = _ToolLoopClient(lambda n: None)
+    try:
+        with pytest.raises(f.FoundryRunAbortedError):
+            f.create_agent(project)
+        assert client_boundary(project) is not client_boundary(client)
+        assert f.run_agent(client, AGENT, tmp_path, _config(), "task") is None
+    finally:
+        release.set()
+
+
+def test_expected_cleanup_failure_is_reported_not_raised(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = SimpleNamespace(responses=SimpleNamespace(delete=Mock(
+        side_effect=ServiceResponseError("synthetic cleanup failure"),
+    )))
+    monkeypatch.setattr(f._call_foundry_with_retry.retry, "sleep", lambda _: None)
+    assert f._cleanup_responses(client, ["resp-1"]) is False
+    assert "Could not delete response resp-1" in caplog.text
 
 
 def test_work_queued_before_retirement_is_never_dispatched_afterwards() -> None:
@@ -344,130 +354,3 @@ def test_work_queued_before_retirement_is_never_dispatched_afterwards() -> None:
         second_thread.join(2)
     assert len(errors) == 2
     queued_work.assert_not_called()
-
-
-def test_stalled_isolated_orphan_sweep_does_not_retire_the_work_client(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    release, finished = threading.Event(), threading.Event()
-    monkeypatch.setattr(f, "CLEANUP_TIMEOUT_SECONDS", 0.1)
-
-    def list_agents(**kwargs: object) -> list:
-        try:
-            assert release.wait(3)
-            return []
-        finally:
-            finished.set()
-
-    orphan_client = SimpleNamespace(list_agents=list_agents)
-    work_client = SimpleNamespace(create_agent=Mock(return_value=SimpleNamespace(id="agent")))
-    started = time.monotonic()
-    try:
-        assert f.create_agent(work_client, orphan_client=orphan_client) == "agent"
-        assert time.monotonic() - started < 0.75
-        work_client.create_agent.assert_called_once()
-    finally:
-        release.set()
-        assert finished.wait(2)
-
-
-@pytest.mark.parametrize("cancel_status", ["cancelled", "cancelling"])
-def test_known_run_cancels_through_independent_channel_while_poll_still_owns_client(
-    cancel_status: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    release, poll_finished, deleted = threading.Event(), threading.Event(), threading.Event()
-    run = SimpleNamespace(id="known-run", status="in_progress")
-    client = _ToolLoopClient(lambda n: None)
-    client.next_run = lambda: run
-    monkeypatch.setattr(f, "resolve_run_timeout_seconds", lambda: 1)
-    monkeypatch.setattr(f, "CLEANUP_TIMEOUT_SECONDS", 0.05)
-    monkeypatch.setattr(f.time, "sleep", lambda _: None)
-
-    def poll(**kwargs: object) -> SimpleNamespace:
-        try:
-            assert release.wait(4)
-            return SimpleNamespace(id="known-run", status="completed")
-        finally:
-            poll_finished.set()
-
-    def cancel(**kwargs: object) -> SimpleNamespace:
-        assert not release.is_set(), "cancellation must not wait for the abandoned poll"
-        assert kwargs["run_id"] == "known-run"
-        return SimpleNamespace(status=cancel_status)
-
-    client.runs.get = poll
-    client.threads.delete = lambda *a, **kw: deleted.set()
-    cancellation = Mock(side_effect=cancel)
-    client._autorefine_cancel_client = SimpleNamespace(runs=SimpleNamespace(cancel=cancellation))
-    started = time.monotonic()
-    try:
-        with pytest.raises(f.FoundryRunAbortedError) as error:
-            f.run_agent(client, "agent", tmp_path, ProjectConfig(
-                name="fixture", purpose="", users="", stage="active",
-            ), "task")
-        assert time.monotonic() - started < 1.7
-        assert error.value.cancellation_unconfirmed is (cancel_status != "cancelled")
-        cancellation.assert_called_once()
-        assert not poll_finished.is_set()
-        assert not deleted.is_set(), "owning-client teardown must remain serialized"
-        if cancel_status == "cancelling":
-            assert "cancellation_unconfirmed" in caplog.text
-    finally:
-        release.set()
-        assert poll_finished.wait(2)
-        assert deleted.wait(2)
-
-
-def test_failed_cancellation_is_explicitly_unconfirmed(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
-) -> None:
-    client = SimpleNamespace(runs=SimpleNamespace(cancel=Mock(
-        side_effect=ServiceResponseError("synthetic cancellation failure"),
-    )))
-    monkeypatch.setattr(f._call_foundry_with_retry.retry, "sleep", lambda _: None)
-    with pytest.raises(f.FoundryRunAbortedError) as error:
-        f._abort_run(
-            client, "thread", SimpleNamespace(id="run"), "run_deadline", "synthetic deadline",
-        )
-    assert error.value.cancellation_unconfirmed is True
-    assert "cancellation_unconfirmed" in caplog.text
-
-
-@pytest.mark.parametrize("entrypoint", ["plan", "functional", "refine"])
-def test_entrypoints_provision_only_isolated_sdk_channels_at_the_existing_endpoint(
-    entrypoint: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    clients: list[SimpleNamespace] = []
-    no_gap = {"outcome": "no_gap", "score": 100, "improvements": [], "summary": "Reviewed"}
-
-    def new_client(**kwargs: object) -> SimpleNamespace:
-        assert kwargs["endpoint"] == "https://example.test"
-        client = SimpleNamespace(delete_agent=Mock())
-        clients.append(client)
-        return client
-
-    def create(client: SimpleNamespace, **kwargs: object) -> str:
-        assert client._autorefine_cancel_client is not client
-        assert kwargs["orphan_client"] is not client
-        assert kwargs["orphan_client"] is not client._autorefine_cancel_client
-        return "agent"
-
-    monkeypatch.setenv("FOUNDRY_PROJECT_ENDPOINT", "https://example.test")
-    monkeypatch.setattr("azure.ai.agents.AgentsClient", new_client)
-    monkeypatch.setattr("azure.identity.DefaultAzureCredential", lambda: None)
-    monkeypatch.setattr(f, "create_agent", create)
-    monkeypatch.setattr(f, "run_agent", Mock(return_value=no_gap))
-    monkeypatch.setattr(m, "_extract_relevant_wiki_insights", lambda name: "")
-    monkeypatch.setattr(m, "_worktree_snapshot", lambda path: set())
-    monkeypatch.setattr(m, "_worktree_status", lambda path: {})
-    monkeypatch.setattr("agent.tools.github_tools.create_branch", lambda *a: True)
-    config = ProjectConfig(name="fixture", purpose="", users="", stage="active")
-
-    if entrypoint == "plan":
-        assert m.plan_project(tmp_path, config, []) == no_gap
-    elif entrypoint == "functional":
-        assert m.plan_functional(tmp_path, config) == no_gap
-    else:
-        assert m.refine_project(tmp_path, config, no_gap, "owner/fixture") is False
-    assert len(clients) == 3

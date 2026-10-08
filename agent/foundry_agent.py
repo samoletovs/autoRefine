@@ -1,8 +1,10 @@
 """Foundry agent — the AI brain of autoRefine.
 
-Uses Azure AI Agents SDK to create a Foundry-hosted agent with function-calling
-tools. The agent reasons about project findings, compares against provided
-similar products, creates improvement plans, and can execute changes.
+Uses the Foundry Agent Service (``azure-ai-projects`` 2.x) to keep a persistent,
+versioned prompt agent with function-calling tools, and drives it through the
+project's OpenAI-compatible Responses API. The agent reasons about project
+findings, compares against provided similar products, creates improvement
+plans, and can execute changes.
 
 Requires:
     FOUNDRY_PROJECT_ENDPOINT in .env
@@ -20,25 +22,18 @@ import shutil
 import subprocess
 import time
 from collections.abc import Callable, Sequence
-from datetime import UTC, datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NoReturn, TypeVar
 
 import httpx
-from azure.ai.agents import AgentsClient
-from azure.ai.agents.models import (
-    FunctionTool,
-    ListSortOrder,
-    MessageRole,
-    RequiredFunctionToolCall,
-    SubmitToolOutputsAction,
-    ToolOutput,
-    TruncationObject,
-    TruncationStrategy,
-)
+import openai
+from azure.ai.projects.models import FunctionTool, PromptAgentDefinition
 from azure.core.exceptions import (
     AzureError,
     HttpResponseError,
+    ResourceNotFoundError,
     ServiceRequestError,
     ServiceResponseError,
 )
@@ -69,10 +64,15 @@ MODEL_PRICES: dict[str, tuple[float, float, float]] = {
 MAX_FOUNDRY_RETRY_ATTEMPTS = 5
 RETRYABLE_FOUNDRY_STATUS_CODES = {429, 502, 503, 504}
 
+# Persistent agent names are ``autorefine-plan`` and ``autorefine-refine``: one per
+# tool set. Never widen this to a prefix match over the project — ``atlas-*`` and
+# ``lab-memory`` share the Foundry project and belong to other repos.
 AGENT_NAME = "autorefine"
-# Only sweep agents older than a full run. A run is ~43 min today; 6h leaves
-# generous headroom so a concurrent run's live agent is never collected.
-ORPHAN_AGENT_MAX_AGE = timedelta(hours=6)
+AGENT_DEFINITION_METADATA_KEY = "autorefine_definition_sha256"
+# How many recent versions to scan for one whose definition already matches. A
+# --model override alternates definitions; scanning a few back reuses the older
+# version instead of minting a new one on every flip.
+AGENT_VERSION_SCAN = 20
 
 # Back-compat alias. Older imports referenced DEPLOYMENT directly; keep it
 # pointing at the env-resolved default so any cached imports still work.
@@ -81,52 +81,57 @@ DEPLOYMENT = DEFAULT_DEPLOYMENT
 SYSTEM_PROMPT = (Path(__file__).parent / "prompts" / "system.md").read_text(encoding="utf-8")
 # Keep system.md at or above ~1,150 tokens. Azure prompt caching only engages on
 # a prefix of at least 1,024 identical tokens, so instructions shorter than that
-# cache nothing and every tool round of every run pays full input rate. The run
-# object exposes no cached-token count (RunCompletionUsage carries only
-# prompt/completion/total), so falling under the cliff is invisible until the
-# bill arrives — tests/test_prompt_cache_prefix.py is what makes it visible.
+# cache nothing and every tool round of every run pays full input rate.
+# tests/test_prompt_cache_prefix.py is what makes falling under the cliff visible.
 # Append durable guidance; never reorder or templatize, which would break the
 # byte-identical prefix the cache matches on.
 
 # ── Prompt budget ────────────────────────────────────────────────────────────
-# Two distinct levers, easy to conflate:
+# The classic Agents run carried two service-side levers that the Responses API
+# does not have:
 #
-#   max_prompt_tokens  — RUN-WIDE and CUMULATIVE across every turn of a run,
-#                        not a per-call limit. The service ends the run as
-#                        ``incomplete`` once the sum of prompt tokens over all
-#                        turns crosses it. Measured traffic averages ~11.5k
-#                        input tokens per call (23M/day over ~2,000 calls), so
-#                        a plan doing a dozen tool rounds legitimately spends
-#                        well over 100k run-wide. This is therefore only a
-#                        runaway guard, deliberately set high enough that a
-#                        healthy run never trips it. We have no per-run
-#                        distribution yet, so the default is safety-first: a
-#                        tighter cap is opt-in via the env var below, and
-#                        should only be lowered with quality evidence that
-#                        runs still reach submit_plan.
+#   max_prompt_tokens / max_completion_tokens — RUN-WIDE and CUMULATIVE across
+#                        every turn of a run. The service ended the run as
+#                        ``incomplete`` once a sum crossed its cap. A response is
+#                        one turn, so these are now enforced *locally*: usage is
+#                        summed across every response in the tool loop and the
+#                        loop stops (``FoundryRunIncompleteError``, same reasons)
+#                        before issuing a request past either cap. Overshoot is
+#                        at most one response. Each request also carries
+#                        ``max_output_tokens`` = the completion budget left, so
+#                        one response cannot spend more than the run has left.
 #
-#   truncation_strategy — the actual PER-TURN cost lever. ``last_messages``
-#                        bounds how much accumulated thread history is re-sent
-#                        on each round, which is what turns a run's input cost
-#                        from O(rounds^2) into roughly O(rounds).
+#   truncation_strategy(last_messages) — the classic per-turn window. Responses
+#                        has no last-N equivalent; ``truncation="auto"`` only
+#                        drops items when the context window would overflow. With
+#                        ``previous_response_id`` chaining the full history is
+#                        re-sent each round, so input grows O(rounds^2) again —
+#                        but as an append-only, byte-identical prefix, which is
+#                        exactly what Azure prompt caching rewards. See AGENTS.md
+#                        "What the sweep actually costs".
+#
+# The run-wide prompt cap remains a runaway guard, deliberately set high enough
+# that a healthy run never trips it; a tighter cap is opt-in via the env var.
 DEFAULT_MAX_PROMPT_TOKENS = 200_000
 DEFAULT_MAX_COMPLETION_TOKENS = 16_000
 DEEP_MAX_PROMPT_TOKENS = 40_000
 DEEP_MAX_COMPLETION_TOKENS = 4_000
-DEFAULT_TRUNCATION_LAST_MESSAGES = 12
+RESPONSES_TRUNCATION = "auto"
+# The Responses API rejects max_output_tokens below 16.
+MIN_OUTPUT_TOKENS = 16
 # A run-wide ceiling below ~20k cannot survive more than a couple of turns and
 # would kill plans before submit_plan, so reject it rather than accept a value
 # that silently breaks the agent.
 MIN_MAX_PROMPT_TOKENS = 20_000
-MIN_TRUNCATION_LAST_MESSAGES = 2
+# Classic-only knob, kept so a stale deployment setting is reported, not obeyed.
+LEGACY_TRUNCATION_ENV = "AUTOREFINE_TRUNCATION_LAST_MESSAGES"
 
 # ── Tool-round budget ────────────────────────────────────────────────────────
 # Two *local* guards on the number of tool rounds, complementing the two
-# service-side prompt guards above. They exist because the loop in
-# ``run_agent`` is otherwise unbounded: nothing stops a model that keeps
-# asking for tool calls, and every round re-sends the thread, so a run that
-# has stopped making progress keeps billing for rounds that add no
-# information.
+# prompt guards above. They exist because the loop in ``run_agent`` is
+# otherwise unbounded: nothing stops a model that keeps asking for tool calls,
+# and every round re-sends the conversation, so a run that has stopped making
+# progress keeps billing for rounds that add no information.
 #
 #   max_tool_rounds — hard ceiling on rounds. A measured plan run is ~74
 #                     rounds (AGENTS.md, "What the sweep actually costs"), so
@@ -154,6 +159,8 @@ MIN_STUCK_REPEATS = 2
 DEFAULT_RUN_TIMEOUT_SECONDS = 1800
 CLEANUP_TIMEOUT_SECONDS = 10
 MAX_PLAN_REJECTIONS = 3
+# Statuses a Responses object can still leave on the server side.
+IN_FLIGHT_STATUSES = ("queued", "in_progress")
 
 T = TypeVar("T")
 
@@ -162,8 +169,8 @@ class FoundryRunIncompleteError(RuntimeError):
     """A run stopped early (``status == "incomplete"``) instead of finishing.
 
     Raised so a truncated, partial result can never be mistaken for a
-    successful plan. ``reason`` carries ``incomplete_details.reason``, e.g.
-    ``max_prompt_tokens``.
+    successful plan. ``reason`` carries ``incomplete_details.reason`` or the
+    run-wide budget that was exhausted, e.g. ``max_prompt_tokens``.
     """
 
     def __init__(self, run_id: str, reason: str | None) -> None:
@@ -171,7 +178,7 @@ class FoundryRunIncompleteError(RuntimeError):
         self.reason = reason
         super().__init__(
             f"Foundry run {run_id} ended incomplete (reason={reason or 'unknown'}). "
-            "Raise AUTOREFINE_MAX_PROMPT_TOKENS / AUTOREFINE_TRUNCATION_LAST_MESSAGES "
+            "Raise AUTOREFINE_MAX_PROMPT_TOKENS / AUTOREFINE_MAX_COMPLETION_TOKENS "
             "or reduce tool output if this recurs."
         )
 
@@ -189,6 +196,9 @@ class FoundryRunAbortedError(FoundryRunIncompleteError):
     a PR.
 
     ``reason`` names the round, stuck, elapsed-time or plan-validation guard.
+    ``cancellation_unconfirmed`` is True when a request may still be executing
+    server-side (the abort happened while one was in flight); a synchronous
+    response that already returned leaves nothing running.
     """
 
     def __init__(
@@ -233,7 +243,7 @@ def _positive_int_from_env(name: str, default: int, minimum: int) -> int:
 
 
 def resolve_max_prompt_tokens() -> int:
-    """Prompt-token ceiling for a run. Override: ``AUTOREFINE_MAX_PROMPT_TOKENS``."""
+    """Run-wide prompt-token ceiling. Override: ``AUTOREFINE_MAX_PROMPT_TOKENS``."""
     return _positive_int_from_env(
         "AUTOREFINE_MAX_PROMPT_TOKENS",
         DEFAULT_MAX_PROMPT_TOKENS,
@@ -241,19 +251,10 @@ def resolve_max_prompt_tokens() -> int:
     )
 
 
-def resolve_truncation_last_messages() -> int:
-    """Thread window size. Override: ``AUTOREFINE_TRUNCATION_LAST_MESSAGES``."""
-    return _positive_int_from_env(
-        "AUTOREFINE_TRUNCATION_LAST_MESSAGES",
-        DEFAULT_TRUNCATION_LAST_MESSAGES,
-        MIN_TRUNCATION_LAST_MESSAGES,
-    )
-
-
 def resolve_max_completion_tokens() -> int:
     """A run-wide ceiling, including any reasoning the service performs."""
     value = _positive_int_from_env(
-        "AUTOREFINE_MAX_COMPLETION_TOKENS", DEFAULT_MAX_COMPLETION_TOKENS, 1,
+        "AUTOREFINE_MAX_COMPLETION_TOKENS", DEFAULT_MAX_COMPLETION_TOKENS, MIN_OUTPUT_TOKENS,
     )
     if value > DEFAULT_MAX_COMPLETION_TOKENS:
         raise ValueError("AUTOREFINE_MAX_COMPLETION_TOKENS must be <= 16000")
@@ -307,30 +308,36 @@ def resolve_cost_log_path() -> Path | None:
 
 
 class FoundryPromptBudgetUnsupportedError(RuntimeError):
-    """The installed SDK cannot express the token budgets on ``runs.create``.
+    """The installed SDK cannot express the token budget on ``responses.create``.
 
     Fails closed. A ``**kwargs``-only signature is *not* evidence of support:
-    the generated clients accept arbitrary kwargs and silently drop unknown
-    ones, which would leave runs unbounded while appearing to succeed.
+    a client that accepts arbitrary kwargs may drop unknown ones, which would
+    leave runs unbounded while appearing to succeed.
     """
 
 
-def _prompt_budget_kwargs(
-    create: Callable[..., Any], model: str | None = None,
-) -> dict[str, Any]:
-    """Build run-wide input/output bounds, requiring explicit SDK support.
+@dataclass(frozen=True)
+class RunBudget:
+    """Run-wide token caps, enforced locally across every response in a run."""
 
-    ``max_prompt_tokens``, ``max_completion_tokens`` and ``truncation_strategy`` must appear as named
-    parameters of the pinned ``azure-ai-agents`` ``RunsOperations.create``. If
-    they do not, we raise rather than fall back to an unbounded run, so a
-    dependency bump can never silently restore the runaway-cost behaviour.
+    max_prompt_tokens: int
+    max_completion_tokens: int
+    truncation: str = RESPONSES_TRUNCATION
+
+
+def _run_budget(create: Callable[..., Any], model: str | None = None) -> RunBudget:
+    """Resolve the run's token caps, requiring explicit SDK support for the bounds.
+
+    ``truncation`` and ``max_output_tokens`` must appear as named parameters of
+    the installed ``responses.create``; otherwise we raise rather than start an
+    unbounded run, so a dependency bump can never silently restore the
+    runaway-cost behaviour.
     """
     max_prompt_tokens = resolve_max_prompt_tokens()
     max_completion_tokens = resolve_max_completion_tokens()
     if model == "gpt-6-sol":
         max_prompt_tokens = min(max_prompt_tokens, DEEP_MAX_PROMPT_TOKENS)
         max_completion_tokens = min(max_completion_tokens, DEEP_MAX_COMPLETION_TOKENS)
-    last_messages = resolve_truncation_last_messages()
 
     try:
         parameters = inspect.signature(create).parameters
@@ -341,30 +348,36 @@ def _prompt_budget_kwargs(
 
     missing = [
         name
-        for name in ("max_prompt_tokens", "max_completion_tokens", "truncation_strategy")
+        for name in ("truncation", "max_output_tokens", "previous_response_id")
         if name not in parameters
         or parameters[name].kind is inspect.Parameter.VAR_KEYWORD
     ]
     if missing:
         raise FoundryPromptBudgetUnsupportedError(
-            "Installed azure-ai-agents SDK does not declare "
-            f"{', '.join(missing)} as named parameter(s) of runs.create; "
+            "Installed openai SDK does not declare "
+            f"{', '.join(missing)} as named parameter(s) of responses.create; "
             "refusing to start an unbounded run. Pin a supported SDK version."
         )
 
+    if os.environ.get(LEGACY_TRUNCATION_ENV, "").strip():
+        log.warning(
+            "%s is ignored: the Responses API has no last-N message window; "
+            "truncation=%s is used and the run-wide prompt cap bounds cost.",
+            LEGACY_TRUNCATION_ENV, RESPONSES_TRUNCATION,
+        )
     log.info(
-        "Prompt budget: max_prompt_tokens=%d (run-wide), truncation=last_messages(%d)",
-        max_prompt_tokens,
-        last_messages,
+        "Prompt budget: max_prompt_tokens=%d max_completion_tokens=%d (run-wide), "
+        "truncation=%s",
+        max_prompt_tokens, max_completion_tokens, RESPONSES_TRUNCATION,
     )
-    return {
-        "max_prompt_tokens": max_prompt_tokens,
-        "max_completion_tokens": max_completion_tokens,
-        "truncation_strategy": TruncationObject(
-            type=TruncationStrategy.LAST_MESSAGES,
-            last_messages=last_messages,
-        ),
-    }
+    return RunBudget(max_prompt_tokens, max_completion_tokens)
+
+
+# Errors a service/transport call can raise that are expected rather than bugs.
+# ``SdkDeadlineExceeded`` is a ``TimeoutError`` and therefore an ``OSError``.
+_SERVICE_ERRORS: tuple[type[BaseException], ...] = (
+    AzureError, OSError, httpx.HTTPError, openai.APIError,
+)
 
 
 def _is_retryable_foundry_exception(exception: BaseException) -> bool:
@@ -372,6 +385,10 @@ def _is_retryable_foundry_exception(exception: BaseException) -> bool:
     if isinstance(exception, HttpResponseError):
         status_code = getattr(exception, "status_code", None)
         return status_code in RETRYABLE_FOUNDRY_STATUS_CODES
+    if isinstance(exception, openai.APIStatusError):
+        return exception.status_code in RETRYABLE_FOUNDRY_STATUS_CODES
+    if isinstance(exception, openai.APIConnectionError):  # includes APITimeoutError
+        return True
 
     return isinstance(
         exception,
@@ -438,6 +455,8 @@ def _call_foundry_with_retry(
     The worker boundary bounds the entire call, including auth and complete body
     consumption. Transport timeouts remain helpful inactivity limits, not the gate.
     Late-created IDs are handed only to cleanup, never back to a stopped run.
+    ``fn`` receives azure-core transport kwargs; OpenAI methods are adapted by
+    :func:`_openai_call`.
     """
     if deadline is not None:
         def invoke(call_deadline: float) -> T:
@@ -455,72 +474,210 @@ def _call_foundry_with_retry(
     return fn(*args, **kwargs)
 
 
-# ── Tool definitions as typed Python functions (SDK inspects these) ──────────
+def _openai_call(method: Callable[..., T]) -> Callable[..., T]:
+    """Translate the boundary's transport kwargs into an OpenAI per-request timeout.
 
-def read_project_file(path: str, max_lines: int = 200) -> str:
-    """Read a file from the project repository to inspect source code, configs, or docs.
-
-    :param path: Relative path from project root, e.g. 'src/App.tsx' or 'package.json'
-    :param max_lines: Maximum number of lines to return (default 200)
+    ``retry_total`` has no per-request OpenAI equivalent: SDK-internal retries are
+    disabled where the client is built (:func:`open_foundry_clients`,
+    ``max_retries=0``) so the bounded application retries above stay the only ones.
     """
-    return ""  # Stub — actual execution in TOOL_HANDLERS
+    def call(
+        *args: Any, connection_timeout: float | None = None,
+        read_timeout: float | None = None, retry_total: int | None = None, **kwargs: Any,
+    ) -> T:
+        if read_timeout is not None:
+            kwargs["timeout"] = httpx.Timeout(
+                read_timeout, connect=connection_timeout or read_timeout,
+            )
+        return method(*args, **kwargs)
+
+    return call
 
 
-def list_directory(path: str = ".") -> str:
-    """List files and subdirectories in a project directory.
+def open_foundry_clients(endpoint: str) -> tuple[Any, Any]:
+    """Project client (agent versions) and its OpenAI client (responses), one endpoint.
 
-    :param path: Relative path from project root. Use '.' for root.
+    Same ``FOUNDRY_PROJECT_ENDPOINT`` and ``DefaultAzureCredential`` chain as the
+    classic client; the OpenAI client authenticates for ``https://ai.azure.com``,
+    the scope the workflows already pre-warm. Internal OpenAI retries are off so
+    ``_call_foundry_with_retry`` owns every retry inside the elapsed deadline.
     """
-    return ""
+    from azure.ai.projects import AIProjectClient
+    from azure.identity import DefaultAzureCredential
+
+    project = AIProjectClient(endpoint=endpoint, credential=DefaultAzureCredential())
+    return project, project.get_openai_client(max_retries=0)
 
 
-def run_project_tests() -> str:
-    """Run the project's test suite. Returns pass/fail and output."""
-    return ""
+# ── Tool definitions (JSON schemas sent with the agent version) ──────────────
+
+_PLAN_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
+    {
+        "name": "read_project_file",
+        "description": (
+            "Read a file from the project repository to inspect source code, configs, or docs."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": (
+                        "Relative path from project root, e.g. 'src/App.tsx' or 'package.json'"
+                    ),
+                },
+                "max_lines": {
+                    "type": "integer",
+                    "description": "Maximum number of lines to return (default 200)",
+                },
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "list_directory",
+        "description": "List files and subdirectories in a project directory.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Relative path from project root. Use '.' for root.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "run_project_tests",
+        "description": "Run the project's test suite. Returns pass/fail and output.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "submit_plan",
+        "description": (
+            "Submit a structured improvement plan after analyzing the project. Each "
+            "improvement's `approach` must name the actual files/commands to change, not "
+            "restate the title; `success_criteria` must be checkable by someone who did not "
+            "do the work, e.g. 'pytest exits 0 with >=60 passing tests'. Use outcome "
+            "'no_gap' with improvements [] only when no evidence-backed P0-P2 gap exists, "
+            "citing files successfully read this run in no_gap_evidence."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "score": {
+                    "type": "integer",
+                    "description": "Overall project quality score 0-100",
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "2-3 sentence executive summary of findings",
+                },
+                "improvements": {
+                    "type": "array",
+                    "description": "Ordered list of recommended improvements.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "description": {"type": "string"},
+                            "priority": {"type": "string", "description": "P0, P1, P2 or P3"},
+                            "effort": {"type": "string", "description": "S, M or L"},
+                            "category": {"type": "string"},
+                            "approach": {"type": "string"},
+                            "success_criteria": {"type": "string"},
+                        },
+                    },
+                },
+                "research_insights": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Insights from researching similar products",
+                },
+                "outcome": {
+                    "type": "string",
+                    "enum": ["improvements", "no_gap"],
+                    "description": (
+                        "'improvements', or 'no_gap' if no evidence-backed P0-P2 gap exists."
+                    ),
+                },
+                "no_gap_evidence": {
+                    "type": "array",
+                    "description": (
+                        "For no_gap: files successfully read this run and what they showed."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "observation": {"type": "string"},
+                        },
+                    },
+                },
+            },
+            "required": ["score", "summary", "improvements"],
+        },
+    },
+)
+
+_REFINE_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
+    {
+        "name": "write_project_file",
+        "description": (
+            "Write or overwrite a file in the project repository. Use for applying improvements."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": (
+                        "Relative path from project root, e.g. 'src/utils/helpers.ts'"
+                    ),
+                },
+                "content": {"type": "string", "description": "The full file content to write"},
+            },
+            "required": ["path", "content"],
+        },
+    },
+    {
+        "name": "apply_improvement",
+        "description": (
+            "Signal that an improvement has been applied. Call after writing all files for "
+            "one improvement."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string", "description": "Title of the improvement being applied",
+                },
+                "description": {
+                    "type": "string", "description": "Brief description of what was changed",
+                },
+                "files_changed": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of file paths that were modified",
+                },
+            },
+            "required": ["title", "description", "files_changed"],
+        },
+    },
+)
 
 
-def submit_plan(
-    score: int,
-    summary: str,
-    improvements: list,
-    research_insights: list | None = None,
-    outcome: str = "improvements",
-    no_gap_evidence: list | None = None,
-) -> str:
-    """Submit a structured improvement plan after analyzing the project.
-
-    :param score: Overall project quality score 0-100
-    :param summary: 2-3 sentence executive summary of findings
-    :param improvements: Ordered list of recommended improvements. Each is a dict with
-        title, description, priority, effort, category, approach, success_criteria.
-        `approach` must name the actual files/commands to change — not a restatement
-        of the title. `success_criteria` must be checkable by someone who did not do
-        the work, e.g. "pytest exits 0 with >=60 passing tests", not "it is implemented".
-    :param research_insights: Insights from researching similar products
-    :param outcome: 'improvements', or 'no_gap' if no evidence-backed P0-P2 gap exists.
-    :param no_gap_evidence: For no_gap, list objects with path and observation for files
-        successfully read this run. Explain the no-gap conclusion in summary and use [] improvements.
-    """
-    return ""
-
-
-def write_project_file(path: str, content: str) -> str:
-    """Write or overwrite a file in the project repository. Use for applying improvements.
-
-    :param path: Relative path from project root, e.g. 'src/utils/helpers.ts'
-    :param content: The full file content to write
-    """
-    return ""
-
-
-def apply_improvement(title: str, description: str, files_changed: list) -> str:
-    """Signal that an improvement has been applied. Call after writing all files for one improvement.
-
-    :param title: Title of the improvement being applied
-    :param description: Brief description of what was changed
-    :param files_changed: List of file paths that were modified
-    """
-    return ""
+def tool_definitions(mode: str = "plan") -> list[FunctionTool]:
+    """Function tools for a mode; refine adds the write tools to the plan set."""
+    schemas = _PLAN_TOOL_SCHEMAS + (_REFINE_TOOL_SCHEMAS if mode == "refine" else ())
+    return [
+        FunctionTool(
+            name=schema["name"], description=schema["description"],
+            parameters=schema["parameters"], strict=False,
+        )
+        for schema in schemas
+    ]
 
 
 # ── Tool implementations ─────────────────────────────────────────────────────
@@ -1001,144 +1158,205 @@ TOOL_HANDLERS = {
 }
 
 
+
+
 # ── Agent orchestration ──────────────────────────────────────────────────────
 
-def _is_sweepable_orphan(agent: Any, cutoff: datetime) -> bool:
-    """Whether one listed agent is an autoRefine orphan old enough to delete.
 
-    Total by construction: the client is generated and ``created_at`` is whatever
-    the service put on the wire, so a single odd record must not be able to abort
-    the sweep. A naive timestamp is read as UTC — Foundry sends UTC — because
-    comparing it against the aware cutoff would otherwise raise ``TypeError`` and
-    take the whole run down with it. ``_hours_since_last_commit`` normalises the
-    same way for the same reason.
+@dataclass(frozen=True)
+class AgentVersion:
+    """One pinned version of a persistent autoRefine prompt agent.
+
+    The exact version is pinned in every ``agent_reference`` so a concurrent run
+    that publishes a different definition (another ``--model``) cannot change
+    the agent underneath a run already in progress.
     """
-    if getattr(agent, "name", None) != AGENT_NAME:
-        return False
 
-    created = getattr(agent, "created_at", None)
-    if created is None:
-        return False
+    name: str
+    version: str
+    model: str
 
-    if created.tzinfo is None:
-        created = created.replace(tzinfo=cutoff.tzinfo)
-
-    return created < cutoff
+    def reference(self) -> dict[str, str]:
+        return {"name": self.name, "version": self.version, "type": "agent_reference"}
 
 
-def sweep_orphaned_agents(
-    client: AgentsClient,
-    max_age: timedelta = ORPHAN_AGENT_MAX_AGE,
-) -> int:
-    """Delete ``autorefine`` agents stranded by runs that died before cleanup.
+def agent_name(mode: str) -> str:
+    """One persistent agent per tool set: refine can write files, everything else cannot."""
+    return f"{AGENT_NAME}-{'refine' if mode == 'refine' else 'plan'}"
 
-    Every run creates an ephemeral agent and deletes it in a ``finally`` block,
-    but a hard kill (CI timeout, OOM, container eviction) never reaches that
-    block and leaves the agent behind in the Foundry project. Sweeping on
-    startup makes the leak self-healing: the next run collects it.
 
-    Agents younger than ``max_age`` are left alone so a run happening in
-    parallel never has its live agent deleted out from under it.
+def build_agent_definition(mode: str, deployment: str) -> PromptAgentDefinition:
+    # Reasoning effort is not set: the gpt-6 models that would use it stay blocked
+    # by the deployment gate, and a model that ignores it must not be told otherwise.
+    sampling = {} if deployment.startswith("gpt-6-") else {"temperature": 0.3}
+    return PromptAgentDefinition(
+        model=deployment,
+        instructions=SYSTEM_PROMPT,
+        tools=tool_definitions(mode),
+        **sampling,
+    )
 
-    Fails open, like the activity gate: this is cleanup, and cleanup that cannot
-    reach the service must never destroy the work the run came to do. Note the
-    catch is ``AzureError``, not ``HttpResponseError`` — a connection reset or a
-    read timeout raises ``ServiceRequestError``/``ServiceResponseError``, which
-    are *siblings* of ``HttpResponseError`` under ``AzureError``, not subclasses
-    of it. Catching only the narrower type let a transient network blip during
-    housekeeping abort agent creation and fail the entire sweep.
 
-    :return: number of orphans deleted.
+def definition_fingerprint(definition: PromptAgentDefinition) -> str:
+    """Stable hash of everything that makes a version behave differently."""
+    canonical = json.dumps(definition.as_dict(), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _recent_agent_versions(project: Any, name: str, **kwargs: Any) -> list[Any]:
+    """First page only, newest first. A missing agent simply has no versions yet.
+
+    ``list_versions`` is lazy, so the page fetch happens here, inside the retry and
+    deadline boundary, and the pager is recreated on retry.
     """
-    cutoff = datetime.now(timezone.utc) - max_age
-
     try:
-        orphans = _call_foundry_with_retry(
-            "client.list_agents",
-            lambda **kw: [
-                agent for agent in client.list_agents(**kw)
-                if _is_sweepable_orphan(agent, cutoff)
-            ],
-            deadline=time.monotonic() + CLEANUP_TIMEOUT_SECONDS,
-            boundary=client_boundary(client),
+        pager = project.agents.list_versions(
+            name, limit=AGENT_VERSION_SCAN, order="desc", **kwargs,
         )
-    except (AzureError, OSError, httpx.HTTPError) as exc:
-        log.warning("Could not list agents to sweep orphans: %s", exc)
-        return 0
-
-    swept = 0
-    for agent in orphans:
-        if not cleanup_agent(client, agent.id):
-            continue
-        swept += 1
-        log.info("Swept orphaned agent %s (created %s)", agent.id, agent.created_at)
-
-    if swept:
-        log.info("Swept %d orphaned %r agent(s) from previous runs.", swept, AGENT_NAME)
-    return swept
+        pages = getattr(pager, "by_page", None)
+        return list(next(pages(), [])) if callable(pages) else list(pager)
+    except ResourceNotFoundError:
+        return []
 
 
 def create_agent(
-    client: AgentsClient,
+    project: Any,
     mode: str = "plan",
     model: str | None = None,
-    *,
-    orphan_client: AgentsClient | None = None,
-) -> str:
-    """Create the autoRefine Foundry agent. In refine mode, includes write tools.
+) -> AgentVersion:
+    """Ensure the persistent agent version for this mode and model exists.
+
+    Reuses the newest version whose stored definition fingerprint matches, and
+    publishes a new version only when model, instructions, tools or sampling
+    differ. Nothing is created per run, so nothing can be orphaned by a hard
+    kill; this replaced the classic per-run create/delete and its orphan sweep.
 
     :param model: Foundry deployment name to use. Falls back to
         ``FOUNDRY_DEFAULT_DEPLOYMENT`` env var, then to ``gpt-4o-mini``.
-        Luna/Sol are blocked until their separate classic-service gate passes,
+        Luna/Sol are blocked until their separate service gate passes,
         including explicit manual overrides.
-    :param orphan_client: Separate SDK client for fail-open housekeeping. Omit to
-        skip sweeping; an abandoned housekeeping call must not retire the work client.
     """
     deployment = _deployment(model, mode)
     deadline = time.monotonic() + resolve_run_timeout_seconds()
-    # Housekeeping only — never allowed to block agent creation. sweep_orphaned_agents
-    # already swallows AzureError, so this catches what is left: a generated client can
-    # raise anything on a malformed response, and losing the run to a failed *cleanup*
-    # would invert the point of the sweep.
-    if orphan_client is not None and orphan_client is not client:
-        try:
-            sweep_orphaned_agents(orphan_client)
-        except Exception as exc:  # noqa: BLE001 - cleanup must never fail the run
-            log.warning("Orphan sweep failed, continuing: %s", exc)
-
-    tool_functions = {
-        read_project_file,
-        list_directory,
-        run_project_tests,
-        submit_plan,
-    }
-
-    if mode == "refine":
-        tool_functions.add(write_project_file)
-        tool_functions.add(apply_improvement)
-
-    tools = FunctionTool(functions=tool_functions)
-    # Classic AgentsClient does not declare reasoning_effort. Do not pass an
-    # ignored kwarg and claim it controls reasoning; bound the run instead.
-    sampling = {} if deployment.startswith("gpt-6-") else {"temperature": 0.3}
+    definition = build_agent_definition(mode, deployment)
+    fingerprint = definition_fingerprint(definition)
+    name = agent_name(mode)
+    boundary = client_boundary(project)
 
     try:
-        agent = _call_foundry_with_retry(
-            "client.create_agent", client.create_agent,
-            deadline=deadline, boundary=client_boundary(client),
-            late_result=lambda late_agent: cleanup_agent(client, late_agent.id),
-            model=deployment,
-            name=AGENT_NAME,
-            instructions=SYSTEM_PROMPT,
-            tools=tools.definitions,
-            **sampling,
+        versions = _call_foundry_with_retry(
+            "project.agents.list_versions", _recent_agent_versions, project, name,
+            deadline=deadline, boundary=boundary,
         )
+        match = next((
+            version for version in versions
+            if (getattr(version, "metadata", None) or {}).get(AGENT_DEFINITION_METADATA_KEY)
+            == fingerprint
+        ), None)
+        if match is None:
+            match = _call_foundry_with_retry(
+                "project.agents.create_version", project.agents.create_version,
+                deadline=deadline, boundary=boundary,
+                agent_name=name,
+                definition=definition,
+                metadata={AGENT_DEFINITION_METADATA_KEY: fingerprint},
+                description=f"autoRefine {mode} agent ({deployment}); managed by autoRefine.",
+            )
+            log.info(
+                "Published agent %s version %s (mode=%s, model=%s)",
+                name, match.version, mode, deployment,
+            )
+        else:
+            log.info(
+                "Reusing agent %s version %s (mode=%s, model=%s)",
+                name, match.version, mode, deployment,
+            )
     except _RunDeadlineExceeded as exc:
         raise FoundryRunAbortedError(
-            "unknown", "run_deadline", "agent creation exceeded the caller deadline",
+            "unknown", "run_deadline", "agent provisioning exceeded the caller deadline",
         ) from exc
-    log.info("Created agent: %s (mode=%s, model=%s)", agent.id, mode, deployment)
-    return agent.id
+    return AgentVersion(name=name, version=str(match.version), model=deployment)
+
+
+class _RunSummary:
+    """Aggregate of every response in one tool loop — the unit a cost row describes.
+
+    ``id`` is the first response (the root of the ``previous_response_id`` chain),
+    ``status``/``model`` come from the latest one, and usage is summed over all of
+    them. Responses report usage per response; the classic run reported it
+    run-wide, so summing keeps the row's ``prompt_tokens``/``completion_tokens``
+    meaning the same thing.
+    """
+
+    def __init__(self) -> None:
+        self.id: str | None = None
+        self.status: str | None = None
+        self.model: str | None = None
+        self.last: Any = None
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.total_tokens = 0
+        self.cached_prompt_tokens = 0
+        self._usage_seen = False
+
+    def observe(self, response: Any) -> None:
+        if self.id is None:
+            self.id = getattr(response, "id", None)
+        self.last = response
+        self.status = _run_status(response)
+        model = getattr(response, "model", None)
+        if isinstance(model, str):
+            self.model = model
+
+    def add_usage(self, response: Any) -> None:
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        read = _usage_counts(usage)
+        self.prompt_tokens += read["prompt_tokens"] or 0
+        self.completion_tokens += read["completion_tokens"] or 0
+        self.total_tokens += read["total_tokens"] or 0
+        self.cached_prompt_tokens += read["cached_prompt_tokens"] or 0
+        self._usage_seen = True
+
+    @property
+    def usage(self) -> dict[str, int] | None:
+        if not self._usage_seen:
+            return None
+        return {
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+            "cached_prompt_tokens": self.cached_prompt_tokens,
+        }
+
+
+def _usage_counts(usage: Any) -> dict[str, Any]:
+    """Read usage in either the Responses or the classic/summed shape."""
+    def field(source: Any, key: str) -> Any:
+        if isinstance(source, dict):
+            return source.get(key)
+        return getattr(source, key, None)
+
+    prompt = field(usage, "prompt_tokens")
+    if prompt is None:
+        prompt = field(usage, "input_tokens")
+    completion = field(usage, "completion_tokens")
+    if completion is None:
+        completion = field(usage, "output_tokens")
+    total = field(usage, "total_tokens")
+    if total is None and type(prompt) is int and type(completion) is int:
+        total = prompt + completion
+    cached = field(usage, "cached_prompt_tokens")
+    if cached is None:
+        details = field(usage, "input_tokens_details")
+        cached = field(details, "cached_tokens") if details is not None else None
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": total,
+        "cached_prompt_tokens": cached,
+    }
 
 
 def _append_cost_row(
@@ -1165,9 +1383,11 @@ def _append_cost_row(
     against a plan-run figure with no refine equivalent, and a row that cannot
     say which mode produced it cannot close that gap.
 
-    Fails open, like ``sweep_orphaned_agents``. Telemetry is strictly less
-    important than the work it measures, and a bad path or a full disk must
-    never cost a 116-minute sweep.
+    The schema is unchanged by the Responses migration: ``run_id`` is the root
+    response of the chain and the token fields are summed over every response.
+
+    Fails open. Telemetry is strictly less important than the work it measures,
+    and a bad path or a full disk must never cost a 116-minute sweep.
     """
     path = resolve_cost_log_path()
     if path is None:
@@ -1196,6 +1416,16 @@ def _append_cost_row(
         log.warning("Could not append a cost row to %s", path, exc_info=True)
 
 
+def _call_name_and_arguments(call: Any) -> tuple[str, str]:
+    """A function call's name and raw JSON arguments, from either item shape."""
+    function = getattr(call, "function", None)
+    name = getattr(call, "name", None) or getattr(function, "name", "") or ""
+    arguments = getattr(call, "arguments", None)
+    if arguments is None:
+        arguments = getattr(function, "arguments", "")
+    return str(name), arguments or ""
+
+
 def _tool_call_signature(tool_calls: Sequence[Any]) -> str:
     """Fingerprint one round's requested tool calls, for stuck detection.
 
@@ -1211,9 +1441,7 @@ def _tool_call_signature(tool_calls: Sequence[Any]) -> str:
     """
     parts = []
     for call in tool_calls:
-        function = getattr(call, "function", None)
-        name = getattr(function, "name", "") or ""
-        arguments = getattr(function, "arguments", "") or ""
+        name, arguments = _call_name_and_arguments(call)
         parts.append(f"{name}\x1f{arguments}")
 
     joined = "\x1e".join(sorted(parts))
@@ -1221,24 +1449,20 @@ def _tool_call_signature(tool_calls: Sequence[Any]) -> str:
 
 
 def _run_token_usage(run: Any) -> dict[str, Any]:
-    """Best-effort token usage read off a run object.
+    """Best-effort token usage read off a run summary or a single response.
 
-    ``usage`` is not guaranteed: it is absent while a run is in flight, absent
+    ``usage`` is not guaranteed: it is absent until a response finishes, absent
     on a run we abandoned mid-flight, and shaped as either a model or a plain
-    dict depending on service version. Every field is therefore probed rather
-    than assumed, and a run without it reports ``None`` — this feeds a log
-    line in a ``finally`` block, so it must never raise and mask a real error.
+    dict. Every field is therefore probed rather than assumed, and a run
+    without it reports ``None`` — this feeds a log line in a ``finally`` block,
+    so it must never raise and mask a real error.
     """
     usage = getattr(run, "usage", None)
     if usage is None:
         return dict.fromkeys(("prompt_tokens", "completion_tokens", "total_tokens"))
 
-    def field(key: str) -> Any:
-        if isinstance(usage, dict):
-            return usage.get(key)
-        return getattr(usage, key, None)
-
-    return {key: field(key) for key in ("prompt_tokens", "completion_tokens", "total_tokens")}
+    read = _usage_counts(usage)
+    return {key: read[key] for key in ("prompt_tokens", "completion_tokens", "total_tokens")}
 
 
 def _run_cost_estimate(run: Any) -> dict[str, Any]:
@@ -1275,13 +1499,17 @@ def _log_run_cost(
     A single greppable ``key=value`` line so a month of runs can be summed
     from logs, instead of the by-hand Azure meter forensics AGENTS.md
     describes. ``guard`` names the guard that fired, or ``none`` — which is
-    how a run cut short is told apart from one that finished.
+    how a run cut short is told apart from one that finished. Responses report
+    cached input, so the line also carries ``cached_prompt_tokens`` (a subset of
+    ``prompt_tokens``); the cost-row schema is deliberately left unchanged.
     """
     try:
         usage = _run_token_usage(run)
+        cached = _usage_counts(getattr(run, "usage", None) or {})["cached_prompt_tokens"]
         log.info(
             "run_cost run_id=%s status=%s rounds=%d tool_calls=%d guard=%s "
-            "plan_captured=%s prompt_tokens=%s completion_tokens=%s total_tokens=%s",
+            "plan_captured=%s prompt_tokens=%s completion_tokens=%s total_tokens=%s "
+            "cached_prompt_tokens=%s",
             getattr(run, "id", "unknown"),
             getattr(run, "status", "unknown"),
             rounds,
@@ -1291,92 +1519,62 @@ def _log_run_cost(
             usage["prompt_tokens"],
             usage["completion_tokens"],
             usage["total_tokens"],
+            cached,
         )
     except Exception:  # observability must never fail a run
         log.warning("Could not emit the run cost line.", exc_info=True)
 
 
-def _cancel_run(client: AgentsClient, thread_id: str, run: Any) -> bool:
-    """Best-effort cancellation, including cleanup-only handling of late-created IDs."""
-    run_id = getattr(run, "id", "unknown")
-    cancel_client = vars(client).get("_autorefine_cancel_client", client)
-    channel = "serialized" if cancel_client is client else "independent"
-    cancel = getattr(getattr(cancel_client, "runs", None), "cancel", None)
-    if run is not None and callable(cancel):
-        try:
-            response = _call_foundry_with_retry(
-                "client.runs.cancel", cancel,
-                deadline=time.monotonic() + CLEANUP_TIMEOUT_SECONDS,
-                boundary=client_boundary(cancel_client), cleanup=True,
-                thread_id=thread_id, run_id=run_id,
-            )
-            if _run_status(response) == "cancelled":
-                log.info("cancellation_confirmed run_id=%s channel=%s", run_id, channel)
-                return True
-            log.warning(
-                "cancellation_unconfirmed run_id=%s channel=%s status=%s",
-                run_id, channel, _run_status(response),
-            )
-        except (AzureError, OSError, httpx.HTTPError) as exc:
-            log.warning(
-                "Could not cancel aborted run %s: %s; cancellation_unconfirmed channel=%s",
-                run_id, exc, channel,
-            )
-    else:
-        log.warning(
-            "cancellation_unconfirmed run_id=%s channel=%s reason=no_cancellable_run",
-            run_id, channel,
-        )
-    return False
-
-
 def _abort_run(
-    client: AgentsClient,
-    thread_id: str,
-    run: Any,
+    response: Any,
     reason: str,
     detail: str,
+    *,
+    in_flight: bool = False,
 ) -> NoReturn:
-    """Cancel a run a cost guard has given up on, then raise.
+    """Stop issuing requests for a run a guard has given up on, then raise.
 
-    Attempt cancellation before cleanup, without equating an accepted request
-    with a terminal service acknowledgement. Thread deletion belongs to ``run_agent``'s
-    single lifecycle cleanup path. ``cancel`` is probed because the fakes in
-    the test suite — and older SDKs — do not expose it.
+    There is nothing to cancel for a synchronous response: once it has returned,
+    no work continues server-side, and simply not sending the tool outputs back
+    ends the run. Only a request still in flight when the guard fired — an
+    abandoned call at the deadline, or a response left ``queued``/``in_progress``
+    — may still be billing, and that is reported as ``cancellation_unconfirmed``.
     """
-    run_id = getattr(run, "id", "unknown")
+    run_id = getattr(response, "id", None) or "unknown"
     log.error("Aborting Foundry run %s (%s): %s", run_id, reason, detail)
 
-    confirmed = _cancel_run(client, thread_id, run)
+    unconfirmed = (
+        in_flight or response is None or _run_status(response) in IN_FLIGHT_STATUSES
+    )
+    if unconfirmed:
+        log.warning("cancellation_unconfirmed run_id=%s reason=request_in_flight", run_id)
+    else:
+        log.info("no_server_side_work run_id=%s", run_id)
     raise FoundryRunAbortedError(
-        run_id, reason, detail, cancellation_unconfirmed=not confirmed,
+        run_id, reason, detail, cancellation_unconfirmed=unconfirmed,
     )
 
 
-def _cleanup_thread(client: AgentsClient, thread_id: str) -> None:
-    """Delete one run thread without hiding expected service/OS cleanup failures."""
-    try:
-        _call_foundry_with_retry(
-            "client.threads.delete", client.threads.delete, thread_id,
-            deadline=time.monotonic() + CLEANUP_TIMEOUT_SECONDS,
-            boundary=client_boundary(client), cleanup=True,
-        )
-    except (AzureError, OSError, httpx.HTTPError) as exc:
-        log.warning("Could not delete thread %s: %s", thread_id, exc)
+def _cleanup_responses(client: Any, response_ids: Sequence[str]) -> bool:
+    """Delete a run's stored responses; the Responses analogue of thread deletion.
 
-
-def cleanup_agent(client: AgentsClient, agent_id: str) -> bool:
-    """Bound agent deletion without masking a result/primary failure on expected errors."""
-    try:
-        _call_foundry_with_retry(
-            "client.delete_agent", client.delete_agent, agent_id,
-            deadline=time.monotonic() + CLEANUP_TIMEOUT_SECONDS,
-            boundary=client_boundary(client), cleanup=True,
-        )
-    except (AzureError, OSError, httpx.HTTPError) as exc:
-        log.warning("Could not delete agent %s: %s", agent_id, exc)
+    Each delete has its own bounded caller grace. Fails open on the first
+    expected service/OS failure — the service expires stored responses on its
+    own — but unexpected programming errors still propagate.
+    """
+    delete = getattr(getattr(client, "responses", None), "delete", None)
+    if not callable(delete):
         return False
-    log.info("Agent %s cleaned up.", agent_id)
+    for response_id in response_ids:
+        try:
+            _call_foundry_with_retry(
+                "client.responses.delete", _openai_call(delete), response_id,
+                deadline=time.monotonic() + CLEANUP_TIMEOUT_SECONDS,
+                boundary=client_boundary(client), cleanup=True,
+            )
+        except _SERVICE_ERRORS as exc:
+            log.warning("Could not delete response %s: %s", response_id, exc)
+            return False
     return True
 
 
@@ -1385,26 +1583,54 @@ def _run_status(run: Any) -> str:
     return str(getattr(status, "value", status) or "unknown").lower()
 
 
-def _get_final_message(
-    client: AgentsClient, *, thread_id: str, run_id: str, **kwargs: Any,
-) -> Any:
-    """Fetch only the latest message, inside the retry/deadline boundary.
+def _error_code(error: Any) -> str:
+    code = error.get("code") if isinstance(error, dict) else getattr(error, "code", None)
+    return str(getattr(code, "value", code) or "unknown")
 
-    SDK list() is lazy and limit is a page size, not an iteration limit.
-    Recreate the pager on retry; never pay to walk the rest of the thread.
-    """
-    messages = client.messages.list(
-        thread_id=thread_id, run_id=run_id, order=ListSortOrder.DESCENDING,
-        limit=1, **kwargs,
-    )
-    pages = getattr(messages, "by_page", None)
-    first_page = next(pages(), []) if callable(pages) else messages
-    return next(iter(first_page), None)
+
+def _status_error_code(exc: openai.APIStatusError) -> str:
+    """The failure code for an HTTP error from ``responses.create``."""
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        nested = body.get("error") if isinstance(body.get("error"), dict) else body
+        code = nested.get("code")
+        if isinstance(code, str) and code:
+            return code
+    if exc.status_code == 429:
+        return "rate_limit_exceeded"
+    if exc.status_code >= 500:
+        return "server_error"
+    return f"http_{exc.status_code}"
+
+
+def _function_calls(response: Any) -> list[Any]:
+    return [
+        item for item in (getattr(response, "output", None) or [])
+        if getattr(item, "type", None) == "function_call"
+    ]
+
+
+def _response_text(response: Any) -> str:
+    text = getattr(response, "output_text", None)
+    if isinstance(text, str):
+        return text
+    parts = []
+    for item in getattr(response, "output", None) or []:
+        if getattr(item, "type", None) != "message":
+            continue
+        for content in getattr(item, "content", None) or []:
+            value = getattr(content, "text", None)
+            if isinstance(value, str):
+                parts.append(value)
+    return "".join(parts)
+
+
+TRANSIENT_FAILURE_CODES = {"server_error", "rate_limit_exceeded"}
 
 
 def run_agent(
-    client: AgentsClient,
-    agent_id: str,
+    client: Any,
+    agent: AgentVersion,
     project_dir: Path,
     config: ProjectConfig,
     task: str,
@@ -1414,12 +1640,19 @@ def run_agent(
 ) -> dict | None:
     """Run the agent with a task message. Returns the parsed plan or None.
 
-    Local guards bound tool rounds, repeated calls, rejected submissions and
-    elapsed time (``AUTOREFINE_RUN_TIMEOUT_SECONDS``), including status polling.
-    Any guard firing raises
-    :class:`FoundryRunAbortedError` rather than returning ``None`` — callers
-    read ``None`` as "the model declined to plan" and retry it, which would
-    pay for a spinning run two more times.
+    ``client`` is the project's OpenAI client (``responses``); ``agent`` is the
+    exact version to drive, pinned in every request's ``agent_reference``. Tool
+    calls come back as ``function_call`` output items; their results are sent
+    as ``function_call_output`` items chained with ``previous_response_id``.
+
+    Local guards bound tool rounds, repeated calls, rejected submissions,
+    run-wide tokens and elapsed time (``AUTOREFINE_RUN_TIMEOUT_SECONDS``),
+    including status polling. Any guard firing raises
+    :class:`FoundryRunAbortedError` (or :class:`FoundryRunIncompleteError` for a
+    token budget) rather than returning ``None`` — callers read ``None`` as "the
+    model declined to plan" and retry it, which would pay for a spinning run two
+    more times. ``None`` is returned only for a transient service failure
+    outside refine mode.
 
     :param mode: What this run is for, recorded on the cost row so a round and
         token distribution can be read per mode. This is the *run's* purpose,
@@ -1429,15 +1662,24 @@ def run_agent(
         so a caller that says nothing is visible as such in the data.
     """
     deployment = _deployment(model, mode)
-    budget_options = _prompt_budget_kwargs(client.runs.create, deployment)
+    if agent.model != deployment:
+        raise ValueError(
+            f"Agent {agent.name} v{agent.version} is pinned to {agent.model}, "
+            f"not the requested {deployment}"
+        )
+    budget = _run_budget(client.responses.create, deployment)
     max_tool_rounds = resolve_max_tool_rounds()
     stuck_repeats = resolve_stuck_repeats()
     timeout_seconds = resolve_run_timeout_seconds()
     started = time.monotonic()
     deadline = started + timeout_seconds
-    thread: Any = None
+    boundary = client_boundary(client)
+    agent_reference = {"agent_reference": agent.reference()}
 
-    run: Any = None
+    summary = _RunSummary()
+    response: Any = None
+    created: list[str] = []
+    in_flight = False
     plan_result: dict | None = None
     rounds = 0
     tool_calls = 0
@@ -1447,234 +1689,231 @@ def run_agent(
     plan_rejections = 0
     read_paths: set[str] = set()
 
+    def late_response(late: Any) -> None:
+        late_id = getattr(late, "id", None)
+        if late_id:
+            _cleanup_responses(client, [late_id])
+
+    def stop_for_budget(reason: str) -> NoReturn:
+        nonlocal guard_fired
+        guard_fired = reason
+        log.error("Run %s stopped: run-wide %s budget exhausted", summary.id, reason)
+        raise FoundryRunIncompleteError(getattr(response, "id", None) or "unknown", reason)
+
     try:
-        thread = _call_foundry_with_retry(
-            "client.threads.create", client.threads.create, deadline=deadline,
-            boundary=client_boundary(client),
-            late_result=lambda late_thread: _cleanup_thread(client, late_thread.id),
-        )
-        log.info("Thread: %s", thread.id)
         context = config.to_context()
-        message_text = f"""## Project context
+        pending_input: list[dict[str, Any]] = [{
+            "role": "user",
+            "content": f"""## Project context
 {context}
 
 ## Task
-{task}"""
+{task}""",
+        }]
+        previous_id: str | None = None
 
-        _call_foundry_with_retry(
-            "client.messages.create", client.messages.create, deadline=deadline,
-            boundary=client_boundary(client),
-            thread_id=thread.id,
-            role=MessageRole.USER,
-            content=message_text,
-        )
-
-        # Bound accumulated tool output instead of re-sending it in full each round.
-        run = _call_foundry_with_retry(
-            "client.runs.create",
-            client.runs.create,
-            deadline=deadline,
-            boundary=client_boundary(client),
-            late_result=lambda late_run: _cancel_run(client, thread.id, late_run),
-            thread_id=thread.id,
-            agent_id=agent_id,
-            model=deployment,
-            **budget_options,
-        )
-        log.info("Run started: %s", run.id)
-
-        while _run_status(run) in ("queued", "in_progress", "requires_action", "cancelling"):
+        while True:
             _remaining_seconds(deadline)
-            if _run_status(run) == "requires_action":
-                # Counted before the isinstance check below on purpose. A
-                # required action we cannot service falls through to
-                # `continue` without touching the service or sleeping, so
-                # without this the loop would spin on an unchanged run
-                # forever — the exact failure the ceiling exists to stop.
-                rounds += 1
-                if rounds > max_tool_rounds:
-                    guard_fired = "max_tool_rounds"
-                    _abort_run(
-                        client,
-                        thread.id,
-                        run,
-                        guard_fired,
-                        f"exhausted its {max_tool_rounds}-round tool budget without "
-                        "reaching submit_plan",
-                    )
+            if summary.prompt_tokens >= budget.max_prompt_tokens:
+                stop_for_budget("max_prompt_tokens")
+            output_budget = budget.max_completion_tokens - summary.completion_tokens
+            if output_budget < MIN_OUTPUT_TOKENS:
+                stop_for_budget("max_completion_tokens")
 
-                action = run.required_action
-                if isinstance(action, SubmitToolOutputsAction):
-                    batch = list(action.submit_tool_outputs.tool_calls)
+            request: dict[str, Any] = {
+                "input": pending_input,
+                "extra_body": agent_reference,
+                "store": True,
+                "truncation": budget.truncation,
+                "max_output_tokens": output_budget,
+            }
+            if previous_id is not None:
+                request["previous_response_id"] = previous_id
 
-                    signature = _tool_call_signature(batch)
-                    repeat_streak = repeat_streak + 1 if signature == last_signature else 1
-                    last_signature = signature
-                    plan_batch = all(
-                        getattr(getattr(call, "function", None), "name", "") == "submit_plan"
-                        for call in batch
-                    )
-                    repairing_plan = plan_batch and plan_rejections > 0 and plan_result is None
-                    if repeat_streak >= stuck_repeats and not repairing_plan:
-                        guard_fired = "stuck_tool_loop"
-                        _abort_run(
-                            client,
-                            thread.id,
-                            run,
-                            guard_fired,
-                            f"asked for an identical batch of tool calls {repeat_streak} "
-                            f"rounds running (round {rounds}) — it has stopped making "
-                            "progress",
-                        )
+            in_flight = True
+            try:
+                response = _call_foundry_with_retry(
+                    "client.responses.create", _openai_call(client.responses.create),
+                    deadline=deadline, boundary=boundary, late_result=late_response,
+                    **request,
+                )
+            except openai.APIStatusError as exc:
+                if time.monotonic() >= deadline:
+                    raise
+                in_flight = False
+                code = _status_error_code(exc)
+                failed_id = getattr(response, "id", None) or "unknown"
+                log.error("Response request failed (%s): %s", code, exc)
+                if code in TRANSIENT_FAILURE_CODES and mode != "refine":
+                    return None
+                raise FoundryRunFailedError(failed_id, code) from exc
 
-                    tool_outputs = []
-                    for tool_call in batch:
-                        _remaining_seconds(deadline)
-                        if isinstance(tool_call, RequiredFunctionToolCall):
-                            tool_calls += 1
-                            fn_name = tool_call.function.name
-                            try:
-                                fn_args = json.loads(tool_call.function.arguments)
-                            except (json.JSONDecodeError, TypeError):
-                                if fn_name != "submit_plan":
-                                    raise
-                                fn_args = None
-                            log.info("Tool call: %s(%s)", fn_name, fn_args)
+            created.append(response.id)
+            summary.observe(response)
+            if previous_id is None:
+                log.info("Run started: %s (agent %s v%s)", response.id, agent.name, agent.version)
+            while _run_status(response) in IN_FLIGHT_STATUSES:
+                time.sleep(min(1, _remaining_seconds(deadline)))
+                response = _call_foundry_with_retry(
+                    "client.responses.retrieve", _openai_call(client.responses.retrieve),
+                    response.id, deadline=deadline, boundary=boundary,
+                )
+                summary.observe(response)
+            in_flight = False
+            summary.add_usage(response)
 
-                            handler = TOOL_HANDLERS.get(fn_name)
-                            if handler:
-                                if fn_name == "submit_plan":
-                                    plan_result = None
-                                    output = _handle_submit_plan(
-                                        project_dir, fn_args, read_paths=read_paths,
-                                    )
-                                    feedback = json.loads(output)
-                                    if feedback["status"] == "plan_received":
-                                        plan_result = _normalize_plan_args(fn_args)
-                                    else:
-                                        plan_rejections += 1
-                                        if plan_rejections >= MAX_PLAN_REJECTIONS:
-                                            guard_fired = "invalid_plan"
-                                            _abort_run(
-                                                client, thread.id, run, guard_fired,
-                                                f"plan rejected {plan_rejections} times: "
-                                                f"{feedback['errors']}",
-                                            )
-                                        feedback["repairs_remaining"] = (
-                                            MAX_PLAN_REJECTIONS - plan_rejections
-                                        )
-                                        output = json.dumps(feedback)
-                                elif fn_name == "run_project_tests":
-                                    output = handler(
-                                        project_dir, fn_args,
-                                        timeout_seconds=min(300, _remaining_seconds(deadline)),
-                                    )
-                                else:
-                                    output = handler(project_dir, fn_args)
-                                _remaining_seconds(deadline)
-                                if fn_name == "read_project_file":
-                                    read = json.loads(output)
-                                    if "error" not in read and read.get("content"):
-                                        read_paths.add(read["path"])
-                            else:
-                                output = json.dumps({"error": f"Unknown tool: {fn_name}"})
+            if _run_status(response) != "completed":
+                break
+            batch = _function_calls(response)
+            if not batch:
+                break
 
-                            tool_outputs.append(ToolOutput(
-                                tool_call_id=tool_call.id,
-                                output=output,
-                            ))
+            rounds += 1
+            if rounds > max_tool_rounds:
+                guard_fired = "max_tool_rounds"
+                _abort_run(
+                    response,
+                    guard_fired,
+                    f"exhausted its {max_tool_rounds}-round tool budget without "
+                    "reaching submit_plan",
+                )
 
-                    run = _call_foundry_with_retry(
-                        "client.runs.submit_tool_outputs",
-                        client.runs.submit_tool_outputs,
-                        deadline=deadline,
-                        boundary=client_boundary(client),
-                        thread_id=thread.id,
-                        run_id=run.id,
-                        tool_outputs=tool_outputs,
-                    )
-                continue
-
-            # Poll
-            time.sleep(min(1, _remaining_seconds(deadline)))
-            run = _call_foundry_with_retry(
-                "client.runs.get",
-                client.runs.get,
-                deadline=deadline,
-                boundary=client_boundary(client),
-                thread_id=thread.id,
-                run_id=run.id,
+            signature = _tool_call_signature(batch)
+            repeat_streak = repeat_streak + 1 if signature == last_signature else 1
+            last_signature = signature
+            plan_batch = all(
+                _call_name_and_arguments(call)[0] == "submit_plan" for call in batch
             )
+            repairing_plan = plan_batch and plan_rejections > 0 and plan_result is None
+            if repeat_streak >= stuck_repeats and not repairing_plan:
+                guard_fired = "stuck_tool_loop"
+                _abort_run(
+                    response,
+                    guard_fired,
+                    f"asked for an identical batch of tool calls {repeat_streak} "
+                    f"rounds running (round {rounds}) — it has stopped making progress",
+                )
+
+            tool_outputs: list[dict[str, Any]] = []
+            for tool_call in batch:
+                _remaining_seconds(deadline)
+                tool_calls += 1
+                fn_name, raw_arguments = _call_name_and_arguments(tool_call)
+                try:
+                    fn_args = json.loads(raw_arguments)
+                except (json.JSONDecodeError, TypeError):
+                    if fn_name != "submit_plan":
+                        raise
+                    fn_args = None
+                log.info("Tool call: %s(%s)", fn_name, fn_args)
+
+                handler = TOOL_HANDLERS.get(fn_name)
+                if handler:
+                    if fn_name == "submit_plan":
+                        plan_result = None
+                        output = _handle_submit_plan(
+                            project_dir, fn_args, read_paths=read_paths,
+                        )
+                        feedback = json.loads(output)
+                        if feedback["status"] == "plan_received":
+                            plan_result = _normalize_plan_args(fn_args)
+                        else:
+                            plan_rejections += 1
+                            if plan_rejections >= MAX_PLAN_REJECTIONS:
+                                guard_fired = "invalid_plan"
+                                _abort_run(
+                                    response, guard_fired,
+                                    f"plan rejected {plan_rejections} times: "
+                                    f"{feedback['errors']}",
+                                )
+                            feedback["repairs_remaining"] = (
+                                MAX_PLAN_REJECTIONS - plan_rejections
+                            )
+                            output = json.dumps(feedback)
+                    elif fn_name == "run_project_tests":
+                        output = handler(
+                            project_dir, fn_args,
+                            timeout_seconds=min(300, _remaining_seconds(deadline)),
+                        )
+                    else:
+                        output = handler(project_dir, fn_args)
+                    _remaining_seconds(deadline)
+                    if fn_name == "read_project_file":
+                        read = json.loads(output)
+                        if "error" not in read and read.get("content"):
+                            read_paths.add(read["path"])
+                else:
+                    output = json.dumps({"error": f"Unknown tool: {fn_name}"})
+
+                tool_outputs.append({
+                    "type": "function_call_output",
+                    "call_id": getattr(tool_call, "call_id", None),
+                    "output": output,
+                })
+
+            pending_input = tool_outputs
+            previous_id = response.id
 
         _remaining_seconds(deadline)
-        status = _run_status(run)
+        status = _run_status(response)
         if status == "failed":
-            log.error("Run failed: %s", run.last_error)
-            error = run.last_error
-            code = error.get("code") if isinstance(error, dict) else getattr(error, "code", None)
-            code = str(getattr(code, "value", code) or "unknown")
-            if code in {"server_error", "rate_limit_exceeded"} and mode != "refine":
+            code = _error_code(getattr(response, "error", None))
+            log.error("Response %s failed: %s", response.id, getattr(response, "error", None))
+            if code in TRANSIENT_FAILURE_CODES and mode != "refine":
                 return None
-            raise FoundryRunFailedError(run.id, code)
+            raise FoundryRunFailedError(response.id, code)
 
         if status == "incomplete":
-            details = getattr(run, "incomplete_details", None)
-            reason = getattr(details, "reason", None)
-            log.error("Run %s incomplete (reason=%s)", run.id, reason)
-            raise FoundryRunIncompleteError(run.id, str(reason) if reason is not None else None)
+            details = getattr(response, "incomplete_details", None)
+            reason = (
+                details.get("reason") if isinstance(details, dict)
+                else getattr(details, "reason", None)
+            )
+            log.error("Response %s incomplete (reason=%s)", response.id, reason)
+            raise FoundryRunIncompleteError(response.id, str(reason) if reason is not None else None)
 
         if status != "completed":
-            log.error("Run %s ended without completing (status=%s)", run.id, status)
-            raise FoundryRunFailedError(run.id, status)
+            log.error("Response %s ended without completing (status=%s)", response.id, status)
+            raise FoundryRunFailedError(response.id, status)
 
-        # Get the final message
-        msg = _call_foundry_with_retry(
-            "client.messages.list", _get_final_message, client, deadline=deadline,
-            boundary=client_boundary(client),
-            thread_id=thread.id,
-            run_id=run.id,
-        )
-        _remaining_seconds(deadline)
-        if msg is not None and msg.role == MessageRole.AGENT:
-            for block in msg.text_messages:
-                agent_text = block.text.value
-                log.info("Agent response:\n%s", agent_text)
-
-                # Fallback: if agent didn't call submit_plan, parse from text
-                if plan_result is None and "Score:" in agent_text:
-                    candidate = _parse_plan_from_text(agent_text)
-                    if candidate and not plan_errors(candidate, read_paths=read_paths):
-                        plan_result = candidate
-                        log.info("Parsed plan from text response (submit_plan not called)")
+        agent_text = _response_text(response)
+        if agent_text:
+            log.info("Agent response:\n%s", agent_text)
+            # Fallback: if agent didn't call submit_plan, parse from text
+            if plan_result is None and "Score:" in agent_text:
+                candidate = _parse_plan_from_text(agent_text)
+                if candidate and not plan_errors(candidate, read_paths=read_paths):
+                    plan_result = candidate
+                    log.info("Parsed plan from text response (submit_plan not called)")
 
         _remaining_seconds(deadline)
         if plan_result is None and plan_rejections:
             guard_fired = "invalid_plan"
             _abort_run(
-                client, thread.id, run, guard_fired,
-                "run completed without repairing the rejected plan",
+                response, guard_fired, "run completed without repairing the rejected plan",
             )
         return plan_result
-    except (AzureError, OSError, httpx.HTTPError) as exc:
+    except _SERVICE_ERRORS as exc:
         if not isinstance(exc, _RunDeadlineExceeded) and time.monotonic() < deadline:
             raise
         guard_fired = "run_deadline"
         plan_result = None
         _abort_run(
-            client, thread.id if thread else "unknown", run, guard_fired,
-            f"exhausted its {timeout_seconds}s elapsed budget (status={_run_status(run)})",
+            response, guard_fired,
+            f"exhausted its {timeout_seconds}s elapsed budget (status={_run_status(response)})",
+            in_flight=in_flight,
         )
     finally:
-        if run is not None:
+        if summary.id is not None:
             _log_run_cost(
-                run,
+                summary,
                 rounds=rounds,
                 tool_calls=tool_calls,
                 guard=guard_fired,
                 plan_captured=plan_result is not None,
             )
             _append_cost_row(
-                run,
+                summary,
                 project=config.name,
                 mode=mode,
                 rounds=rounds,
@@ -1683,8 +1922,8 @@ def run_agent(
                 plan_captured=plan_result is not None,
                 duration_s=time.monotonic() - started,
             )
-        if thread is not None:
-            _cleanup_thread(client, thread.id)
+        if created:
+            _cleanup_responses(client, created)
 
 
 def _parse_plan_from_text(text: str) -> dict | None:

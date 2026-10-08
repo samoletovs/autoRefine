@@ -4,14 +4,12 @@ Azure prompt caching only engages on a prefix of **at least 1024 identical
 tokens**, then in 128-token increments, and bills a hit at a reduced input
 rate. Below that threshold nothing caches at all.
 
-That makes prompt length a cost cliff with no telemetry behind it: the Agents
-run object reports only ``prompt_tokens``/``completion_tokens``/``total_tokens``
-(see ``RunCompletionUsage`` in the installed ``azure-ai-agents``), with no
-``cached_tokens`` field, so a run that quietly stopped caching looks exactly
-like one that did not. The only instrument is the Azure bill, weeks later.
+That makes prompt length a cost cliff. The classic Agents run reported no
+cached-token count at all; Responses do (``input_tokens_details.cached_tokens``,
+summed onto the ``run_cost`` log line as ``cached_prompt_tokens``), but that
+only shows the cliff *after* a run has paid for it.
 
-These tests are the substitute for that missing telemetry. They turn an
-invisible cost cliff into a failing build.
+These tests turn the cliff into a failing build before any run does.
 
 Note the guarantee we pin is deliberately stronger than "instructions + tools
 exceed 1024": Microsoft documents *that* tool definitions are cacheable but not
@@ -60,7 +58,7 @@ def _encoding() -> Any:
 
 
 def _plan_tool_definitions() -> list[dict]:
-    """The tool definitions ``create_agent`` actually puts on a plan run.
+    """The tool definitions ``create_agent`` actually puts on the plan agent version.
 
     Captured through ``create_agent`` rather than rebuilt here, so adding or
     removing a tool moves this measurement instead of silently drifting from
@@ -68,14 +66,16 @@ def _plan_tool_definitions() -> list[dict]:
     """
     captured: dict[str, Any] = {}
 
-    class Recorder:
-        # No list_agents, so the orphan sweep is skipped.
-        def create_agent(self, **kwargs: Any) -> SimpleNamespace:
-            captured.update(kwargs)
-            return SimpleNamespace(id="agent-1")
+    class Agents:
+        def list_versions(self, *_args: Any, **_kwargs: Any) -> list:
+            return []
 
-    foundry_agent.create_agent(Recorder(), mode="plan")
-    return [definition.as_dict() for definition in captured["tools"]]
+        def create_version(self, **kwargs: Any) -> SimpleNamespace:
+            captured.update(kwargs)
+            return SimpleNamespace(version="1", metadata=kwargs["metadata"])
+
+    foundry_agent.create_agent(SimpleNamespace(agents=Agents()), mode="plan")
+    return captured["definition"].as_dict()["tools"]
 
 
 def test_system_prompt_alone_clears_the_cache_threshold() -> None:

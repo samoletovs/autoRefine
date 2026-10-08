@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -331,23 +331,29 @@ def test_plan_project_passes_model_to_create_agent(
 ) -> None:
     from agent import main as main_module
 
-    fake_client = SimpleNamespace(delete_agent=MagicMock())
+    fake_project = SimpleNamespace(agents=MagicMock())
+    fake_client = object()
     monkeypatch.setenv("FOUNDRY_PROJECT_ENDPOINT", "https://example.test")
 
     with (
-        patch("azure.ai.agents.AgentsClient", return_value=fake_client),
-        patch("azure.identity.DefaultAzureCredential"),
+        patch(
+            "agent.foundry_agent.open_foundry_clients",
+            return_value=(fake_project, fake_client),
+        ) as mock_open,
         patch("agent.foundry_agent.create_agent", return_value="agent-1") as mock_create,
         patch("agent.foundry_agent.build_plan_task", return_value="plan-task"),
-        patch("agent.foundry_agent.run_agent", return_value={"score": 80, "improvements": []}),
+        patch(
+            "agent.foundry_agent.run_agent", return_value={"score": 80, "improvements": []},
+        ) as mock_run,
     ):
         result = main_module.plan_project(tmp_path, project_config, findings=[], model="gpt-4.1")
 
     assert result == {"score": 80, "improvements": []}
+    mock_open.assert_called_once_with("https://example.test")
+    assert mock_create.call_args.args == (fake_project,)
     assert mock_create.call_args.kwargs["model"] == "gpt-4.1"
-    fake_client.delete_agent.assert_called_once_with(
-        "agent-1", connection_timeout=ANY, read_timeout=ANY, retry_total=0,
-    )
+    assert mock_run.call_args.args[:2] == (fake_client, "agent-1")
+    assert fake_project.agents.mock_calls == []
 
 
 def test_refine_project_passes_model_to_create_agent(
@@ -355,12 +361,13 @@ def test_refine_project_passes_model_to_create_agent(
 ) -> None:
     from agent import main as main_module
 
-    fake_client = SimpleNamespace(delete_agent=MagicMock())
+    fake_project = SimpleNamespace(agents=MagicMock())
     monkeypatch.setenv("FOUNDRY_PROJECT_ENDPOINT", "https://example.test")
 
     with (
-        patch("azure.ai.agents.AgentsClient", return_value=fake_client),
-        patch("azure.identity.DefaultAzureCredential"),
+        patch(
+            "agent.foundry_agent.open_foundry_clients", return_value=(fake_project, object()),
+        ),
         patch("agent.foundry_agent.create_agent", return_value="agent-2") as mock_create,
         patch("agent.foundry_agent.build_refine_task", return_value="refine-task"),
         patch("agent.foundry_agent.run_agent", return_value={"score": 99}),
@@ -387,6 +394,5 @@ def test_refine_project_passes_model_to_create_agent(
 
     assert result is True
     assert mock_create.call_args.kwargs["model"] == "gpt-4.1"
-    fake_client.delete_agent.assert_called_once_with(
-        "agent-2", connection_timeout=ANY, read_timeout=ANY, retry_total=0,
-    )
+    assert mock_create.call_args.kwargs["mode"] == "refine"
+    assert fake_project.agents.mock_calls == []

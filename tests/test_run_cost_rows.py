@@ -26,6 +26,7 @@ from agent import foundry_agent
 from agent.config import ProjectConfig
 from tests.plan_fixtures import valid_plan
 from tests.test_foundry_loop_guards import (  # reuse the loop-driving fakes
+    AGENT,
     _DummyToolCall,
     _ToolLoopClient,
     loop_dummies,  # noqa: F401 - fixture re-export
@@ -69,7 +70,7 @@ def test_no_row_is_written_when_the_env_var_is_unset(
     """Unset means off, so CI and laptops are untouched."""
     assert foundry_agent.resolve_cost_log_path() is None
 
-    foundry_agent.run_agent(_ToolLoopClient(_plan_script), "a1", tmp_path, _config(), "task")
+    foundry_agent.run_agent(_ToolLoopClient(_plan_script), AGENT, tmp_path, _config(), "task")
 
     assert list(tmp_path.glob("*.jsonl")) == []
 
@@ -93,7 +94,7 @@ def test_row_records_mode_rounds_and_tokens(
 
     client = _ToolLoopClient(_plan_script)
     foundry_agent.run_agent(
-        client, "agent-1", tmp_path, _config("payArc"), "task", mode="refine"
+        client, AGENT, tmp_path, _config("payArc"), "task", mode="refine"
     )
 
     rows = _rows(log_path)
@@ -106,8 +107,13 @@ def test_row_records_mode_rounds_and_tokens(
     assert row["guard"] is None
     assert row["plan_captured"] is True
     assert row["status"] == "completed"
-    assert row["prompt_tokens"] == 1234
-    assert row["total_tokens"] == 1290
+    assert row["run_id"] == "resp-1", "the root of the response chain"
+    # Summed over both responses of the run, mapped onto the unchanged fields.
+    assert row["prompt_tokens"] == 2000
+    assert row["completion_tokens"] == 100
+    assert row["total_tokens"] == 2100
+    assert row["model"] == "gpt-4o-mini"
+    assert row["estimated_usd_uncached"] == pytest.approx((2000 * 0.15 + 100 * 0.60) / 1e6)
     assert isinstance(row["duration_s"], float)
     assert row["ts"].endswith("+00:00")
 
@@ -128,7 +134,7 @@ def test_mode_describes_the_run_not_the_agents_tool_set(
 
     for mode in ("plan", "file-ideas"):
         foundry_agent.run_agent(
-            _ToolLoopClient(_plan_script), "agent-1", tmp_path, _config(), "task", mode=mode
+            _ToolLoopClient(_plan_script), AGENT, tmp_path, _config(), "task", mode=mode
         )
 
     assert [row["mode"] for row in _rows(log_path)] == ["plan", "file-ideas"]
@@ -143,7 +149,7 @@ def test_mode_defaults_to_unknown_rather_than_a_guess(
     log_path = tmp_path / "rows.jsonl"
     monkeypatch.setenv("AUTOREFINE_COST_LOG", str(log_path))
 
-    foundry_agent.run_agent(_ToolLoopClient(_plan_script), "a1", tmp_path, _config(), "t")
+    foundry_agent.run_agent(_ToolLoopClient(_plan_script), AGENT, tmp_path, _config(), "t")
 
     assert _rows(log_path)[0]["mode"] == "unknown"
 
@@ -159,7 +165,7 @@ def test_rows_are_append_only(
 
     for project in ("alpha", "beta", "gamma"):
         foundry_agent.run_agent(
-            _ToolLoopClient(_plan_script), "a1", tmp_path, _config(project), "task"
+            _ToolLoopClient(_plan_script), AGENT, tmp_path, _config(project), "task"
         )
 
     assert [row["project"] for row in _rows(log_path)] == ["alpha", "beta", "gamma"]
@@ -180,12 +186,30 @@ def test_row_is_written_even_when_a_cost_guard_aborts_the_run(
         ]
 
     with pytest.raises(foundry_agent.FoundryRunAbortedError):
-        foundry_agent.run_agent(_ToolLoopClient(spin), "a1", tmp_path, _config(), "task")
+        foundry_agent.run_agent(_ToolLoopClient(spin), AGENT, tmp_path, _config(), "task")
 
     row = _rows(log_path)[0]
     assert row["guard"] == "stuck_tool_loop"
     assert row["rounds"] == 3
     assert row["plan_captured"] is False
+
+
+def test_row_schema_is_unchanged_by_the_responses_migration(
+    loop_dummies: None,  # noqa: F811
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Downstream readers of reports/cost key on exactly these fields."""
+    log_path = tmp_path / "rows.jsonl"
+    monkeypatch.setenv("AUTOREFINE_COST_LOG", str(log_path))
+
+    foundry_agent.run_agent(_ToolLoopClient(_plan_script), AGENT, tmp_path, _config(), "t")
+
+    assert set(_rows(log_path)[0]) == {
+        "ts", "project", "mode", "run_id", "status", "rounds", "tool_calls", "guard",
+        "plan_captured", "duration_s", "prompt_tokens", "completion_tokens",
+        "total_tokens", "model", "estimated_usd_uncached", "cost_basis",
+    }
 
 
 # ── Fail-open ────────────────────────────────────────────────────────────────
@@ -204,7 +228,7 @@ def test_an_unwritable_path_does_not_fail_the_run(
     monkeypatch.setenv("AUTOREFINE_COST_LOG", str(blocker / "nested" / "rows.jsonl"))
 
     result = foundry_agent.run_agent(
-        _ToolLoopClient(_plan_script), "a1", tmp_path, _config(), "task"
+        _ToolLoopClient(_plan_script), AGENT, tmp_path, _config(), "task"
     )
 
     assert result == {**valid_plan(71), "research_insights": []}

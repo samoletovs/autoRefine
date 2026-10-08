@@ -522,37 +522,27 @@ def plan_project(
         log.info("Set it in .env or environment. See .env.example.")
         return None
 
-    from azure.ai.agents import AgentsClient
-    from azure.identity import DefaultAzureCredential
-
-    from agent.foundry_agent import build_plan_task, cleanup_agent, create_agent, run_agent
-
-    client = AgentsClient(
-        endpoint=endpoint,
-        credential=DefaultAzureCredential(),
-    )
-    client._autorefine_cancel_client = AgentsClient(
-        endpoint=endpoint, credential=DefaultAzureCredential(),
+    from agent.foundry_agent import (
+        build_plan_task,
+        create_agent,
+        open_foundry_clients,
+        run_agent,
     )
 
-    agent_id = create_agent(
-        client, mode="plan", model=model,
-        orphan_client=AgentsClient(endpoint=endpoint, credential=DefaultAzureCredential()),
-    )
+    project, client = open_foundry_clients(endpoint)
+    # Persistent, versioned agent: nothing to delete afterwards, nothing to orphan.
+    agent = create_agent(project, mode="plan", model=model)
 
-    try:
-        task = build_plan_task(findings, config)
-        plan = run_agent(client, agent_id, project_dir, config, task, mode="plan", model=model)
+    task = build_plan_task(findings, config)
+    plan = run_agent(client, agent, project_dir, config, task, mode="plan", model=model)
 
-        if plan:
-            log.info(
-                "Plan received: score=%d, %d improvements",
-                plan.get("score", 0),
-                len(plan.get("improvements", [])),
-            )
-        return plan
-    finally:
-        cleanup_agent(client, agent_id)
+    if plan:
+        log.info(
+            "Plan received: score=%d, %d improvements",
+            plan.get("score", 0),
+            len(plan.get("improvements", [])),
+        )
+    return plan
 
 
 def _priority_in_scope(priority: str, allowed: set[str] | None = None) -> bool:
@@ -1106,19 +1096,10 @@ def plan_functional(
         log.error("FOUNDRY_PROJECT_ENDPOINT not set — cannot run functional ideation.")
         return None
 
-    from azure.ai.agents import AgentsClient
-    from azure.identity import DefaultAzureCredential
+    from agent.foundry_agent import create_agent, open_foundry_clients, run_agent
 
-    from agent.foundry_agent import cleanup_agent, create_agent, run_agent
-
-    client = AgentsClient(endpoint=endpoint, credential=DefaultAzureCredential())
-    client._autorefine_cancel_client = AgentsClient(
-        endpoint=endpoint, credential=DefaultAzureCredential(),
-    )
-    agent_id = create_agent(
-        client, mode="plan", model=model,
-        orphan_client=AgentsClient(endpoint=endpoint, credential=DefaultAzureCredential()),
-    )
+    project, client = open_foundry_clients(endpoint)
+    agent = create_agent(project, mode="plan", model=model)
     wiki_context = _extract_relevant_wiki_insights(config.name)
     if wiki_context:
         log.info(
@@ -1127,29 +1108,27 @@ def plan_functional(
             len(wiki_context),
         )
     task = _functional_task(avoid_context=avoid_context, wiki_context=wiki_context)
-    try:
-        # Foundry runs fail transiently (server_error / rate_limit); each run_agent uses
-        # a fresh thread, so a retry with the same agent recovers a one-off blip.
-        for attempt in range(1, FUNCTIONAL_PLAN_ATTEMPTS + 1):
-            # "file-ideas", not "plan": the agent is built with the plan tool set, but
-            # this is the daily sweep, and its cost rows are the ones worth telling
-            # apart from an on-demand plan.
-            plan = run_agent(client, agent_id, project_dir, config, task, mode="file-ideas", model=model)
-            if plan is not None:
-                if plan.get("outcome") == "no_gap":
-                    log.info("Functional ideation for %s: evidence-backed no_gap.", config.name)
-                return plan
-            if attempt < FUNCTIONAL_PLAN_ATTEMPTS:
-                log.warning(
-                    "Functional ideation returned no plan for %s (attempt %d/%d); retrying.",
-                    config.name,
-                    attempt,
-                    FUNCTIONAL_PLAN_ATTEMPTS,
-                )
-                time.sleep(FUNCTIONAL_RETRY_DELAY_S)
-        return None
-    finally:
-        cleanup_agent(client, agent_id)
+    # Foundry responses fail transiently (server_error / rate_limit); each run_agent
+    # starts a fresh response chain, so a retry with the same agent version recovers
+    # a one-off blip.
+    for attempt in range(1, FUNCTIONAL_PLAN_ATTEMPTS + 1):
+        # "file-ideas", not "plan": the agent is built with the plan tool set, but
+        # this is the daily sweep, and its cost rows are the ones worth telling
+        # apart from an on-demand plan.
+        plan = run_agent(client, agent, project_dir, config, task, mode="file-ideas", model=model)
+        if plan is not None:
+            if plan.get("outcome") == "no_gap":
+                log.info("Functional ideation for %s: evidence-backed no_gap.", config.name)
+            return plan
+        if attempt < FUNCTIONAL_PLAN_ATTEMPTS:
+            log.warning(
+                "Functional ideation returned no plan for %s (attempt %d/%d); retrying.",
+                config.name,
+                attempt,
+                FUNCTIONAL_PLAN_ATTEMPTS,
+            )
+            time.sleep(FUNCTIONAL_RETRY_DELAY_S)
+    return None
 
 
 def _normalize_priority(raw: object) -> str:
@@ -1720,15 +1699,12 @@ def refine_project(
         )
         return False
 
-    from azure.ai.agents import AgentsClient
-    from azure.identity import DefaultAzureCredential
-
     from agent.foundry_agent import (
         FoundryRunIncompleteError,
         _handle_run_tests,
         build_refine_task,
-        cleanup_agent,
         create_agent,
+        open_foundry_clients,
         run_agent,
     )
     from agent.tools.github_tools import (
@@ -1737,13 +1713,7 @@ def refine_project(
         create_pr,
     )
 
-    client = AgentsClient(
-        endpoint=endpoint,
-        credential=DefaultAzureCredential(),
-    )
-    client._autorefine_cancel_client = AgentsClient(
-        endpoint=endpoint, credential=DefaultAzureCredential(),
-    )
+    project, client = open_foundry_clients(endpoint)
 
     # Create branch
     import datetime
@@ -1759,10 +1729,7 @@ def refine_project(
             log.error("Cannot create branch — skipping refine")
             return False
 
-    agent_id = create_agent(
-        client, mode="refine", model=model,
-        orphan_client=AgentsClient(endpoint=endpoint, credential=DefaultAzureCredential()),
-    )
+    agent = create_agent(project, mode="refine", model=model)
     preserve_changes = False
 
     try:
@@ -1770,7 +1737,7 @@ def refine_project(
         # Refine writes into the live worktree, so an aborted run must not leave
         # half-applied edits behind for a later run to commit.
         try:
-            run_agent(client, agent_id, project_dir, config, task, mode="refine", model=model)
+            run_agent(client, agent, project_dir, config, task, mode="refine", model=model)
         except FoundryRunIncompleteError as exc:
             log.error("Refine run ended incomplete (%s) — rolling back partial changes.", exc.reason)
             return False
@@ -1875,14 +1842,11 @@ def refine_project(
         return pr_created
 
     finally:
-        try:
-            if not preserve_changes:
-                try:
-                    _rollback_agent_changes(project_dir, baseline)
-                except (OSError, subprocess.SubprocessError) as exc:
-                    log.error("Could not roll back unvalidated refine changes: %s", exc)
-        finally:
-            cleanup_agent(client, agent_id)
+        if not preserve_changes:
+            try:
+                _rollback_agent_changes(project_dir, baseline)
+            except (OSError, subprocess.SubprocessError) as exc:
+                log.error("Could not roll back unvalidated refine changes: %s", exc)
 
 
 def run_health_scan_mode(
