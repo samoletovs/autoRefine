@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -812,6 +813,56 @@ def test_plan_functional_includes_wiki_context_in_the_agent_task(
     assert "evidence-backed no_gap" in caplog.text
 
 
+def test_plan_functional_without_endpoint_returns_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("FOUNDRY_PROJECT_ENDPOINT", raising=False)
+
+    assert main_module.plan_functional(
+        tmp_path, ProjectConfig(name="demo", purpose="", users="", stage="active"),
+    ) is None
+
+
+def test_wiki_insight_extraction_ignores_irrelevant_and_truncates_long_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wiki = tmp_path / "wiki"
+    insights = wiki / "insights"
+    insights.mkdir(parents=True)
+    (insights / "unrelated.md").write_text(
+        "# Other project\n\n**Last verified:** 2020-01-01\n\n## TL;DR\nOld finding.\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main_module, "_resolve_lab_wiki_dir", lambda: wiki)
+    assert main_module._extract_relevant_wiki_insights("demo") == ""
+
+    (insights / "demo.md").write_text(
+        f"# Demo approach\n\n**Last verified:** {datetime.now(UTC):%Y-%m-%d}\n\n## TL;DR\n"
+        + ("A useful and detailed observation. " * 200),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main_module, "WIKI_CONTEXT_MAX_CHARS", 180)
+    context = main_module._extract_relevant_wiki_insights("demo")
+    assert len(context) <= 180
+    assert context.startswith("- **Demo approach**")
+
+
+def test_select_functional_improvements_ignores_invalid_and_blank_items() -> None:
+    plan = {
+        "improvements": [
+            None,
+            {"title": "  ", "priority": "P1"},
+            {"title": "Out of scope", "priority": "P3"},
+            {"title": "Ship exports", "priority": "[P1 — High]"},
+        ],
+    }
+
+    selected = main_module._select_functional_improvements(plan)
+
+    assert [item["title"] for item in selected] == ["Ship exports"]
+    assert selected[0]["priority"] == "P1"
+
+
 @pytest.mark.parametrize(
     ("returncode", "stdout", "raises"),
     [
@@ -907,15 +958,33 @@ def test_file_idea_script_resolution_uses_environment_then_fails_cleanly(
     assert main_module._resolve_file_idea_script() == script
 
     monkeypatch.delenv("NAURO_GOVERNANCE_PATH")
+    checkout_script = tmp_path / "checkout" / ".github-gov" / "scripts" / "file-idea.py"
+    checkout_script.parent.mkdir(parents=True)
+    checkout_script.touch()
     monkeypatch.setattr(main_module, "REPO_ROOT", tmp_path / "checkout")
-    tmp_clone = tmp_path / "missing-checkout"
-    monkeypatch.setattr(main_module, "Path", lambda _path: tmp_clone)
+    assert main_module._resolve_file_idea_script() == checkout_script
+
+    checkout_script.unlink()
+    tmp_clone = tmp_path / "tmp-clone"
+    real_path = main_module.Path
+
+    def map_tmp_repo(path: str | Path) -> Path:
+        if path == "/tmp/nauroLabs-github":
+            return tmp_clone
+        return real_path(path)
+
+    monkeypatch.setattr(main_module, "Path", map_tmp_repo)
     monkeypatch.setattr(
         main_module.subprocess,
         "run",
         lambda *_args, **_kwargs: SimpleNamespace(returncode=1, stderr="offline"),
     )
     assert main_module._resolve_file_idea_script() is None
+
+    clone_script = tmp_clone / "scripts" / "file-idea.py"
+    clone_script.parent.mkdir(parents=True)
+    clone_script.touch()
+    assert main_module._resolve_file_idea_script() == clone_script
 
 
 def test_file_ideas_for_plan_skips_bad_items_and_logs_filing_failures(
@@ -998,6 +1067,28 @@ def test_open_idea_card_returns_last_issue_and_fails_open(
     assert main_module._open_idea_card("owner/repo") is None
 
 
+def test_file_and_card_functional_ideas_skips_missing_script_and_unparseable_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(main_module, "_resolve_file_idea_script", lambda: None)
+    assert main_module.file_and_card_functional_ideas(
+        "owner/repo", [{"title": "No script"}],
+    ) == 0
+
+    monkeypatch.setattr(
+        main_module, "_resolve_file_idea_script", lambda: Path("/fake/file-idea.py"),
+    )
+    monkeypatch.setattr(main_module, "_build_run_references", lambda: "local")
+    carded: list[dict] = []
+    assert main_module.file_and_card_functional_ideas(
+        "owner/repo",
+        [{"title": "A"}, {"title": "B"}],
+        filer=lambda idea: f"not-a-url/{idea['title']}",
+        carder=lambda *_args: carded.append({}) or True,
+    ) == 0
+    assert carded == []
+
+
 def test_recent_declined_reasons_collects_human_feedback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1022,6 +1113,32 @@ def test_recent_declined_reasons_collects_human_feedback(
         "Add exports — Too broad",
         "No issue number",
     ]
+
+
+def test_recent_declined_reasons_returns_empty_when_github_read_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        main_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=1, stdout="", stderr="offline"),
+    )
+    assert main_module._recent_declined_reasons("owner/repo") == []
+
+
+def test_human_close_reason_skips_bots_and_truncates_long_human_comment() -> None:
+    reason = main_module._human_close_reason({
+        "comments": {
+            "nodes": [
+                {"authorAssociation": "OWNER", "body": "   "},
+                {"authorAssociation": "NONE", "body": "bot noise"},
+                {"authorAssociation": "MEMBER", "body": "why " * 100},
+            ],
+        },
+    })
+
+    assert len(reason) <= main_module.AVOID_REASON_MAX_CHARS
+    assert reason.endswith("…")
 
 
 def test_idea_card_reminder_and_functional_filing_dry_run(
