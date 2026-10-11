@@ -18,11 +18,13 @@ from azure.core.exceptions import (
 )
 
 from agent import foundry_agent
+from agent import main as main_module
 from agent.config import ProjectConfig
 from agent.foundry_agent import (
     _call_foundry_with_retry,
     create_agent,
 )
+from agent.tools.quality_tools import DimensionResult, QualityCoverage, QualityFinding
 from tests.plan_fixtures import valid_plan
 from tests.test_foundry_loop_guards import AGENT, _DummyToolCall, _ToolLoopClient
 
@@ -717,3 +719,342 @@ def test_open_foundry_clients_disables_hidden_sdk_retries(monkeypatch: pytest.Mo
     assert client.max_retries == 0
     assert str(client.base_url).rstrip("/").endswith("/api/projects/p/openai/v1")
     assert hasattr(project.agents, "create_version")
+
+
+def test_evaluate_project_reports_advisory_findings_and_coverage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = ProjectConfig(name="demo", purpose="", users="", stage="active")
+    finding = QualityFinding(
+        category="security",
+        description="Default branch is unprotected",
+        priority="P0",
+        weight=120,
+        advisory=True,
+    )
+    coverage = QualityCoverage([
+        DimensionResult("tests", skip_reason="not-declared", detail="Not configured"),
+    ])
+    monkeypatch.setattr(
+        main_module,
+        "run_quality_checks_with_coverage",
+        lambda *_args: ([finding], coverage),
+    )
+
+    with caplog.at_level(logging.INFO):
+        report = main_module.evaluate_project(tmp_path, config)
+
+    assert report["score"] == 0
+    assert report["findings"] == [{
+        "category": "security",
+        "description": "Default branch is unprotected",
+        "priority": "P0",
+        "advisory": True,
+    }]
+    assert report["coverage"]["summary"] == "0/1 measured"
+    assert "dimensions not measured: tests" in caplog.text
+
+
+def test_feature_suggestions_skip_blanks_and_keep_the_existing_cap() -> None:
+    config = ProjectConfig(
+        name="demo",
+        purpose="",
+        users="",
+        stage="active",
+        goals=[" ", " Ship exports ", "Improve search"],
+        similar=["", "Competitor A", "Competitor B"],
+    )
+
+    suggestions = main_module.suggest_feature_improvements(config)
+
+    assert [item["title"] for item in suggestions] == [
+        "Goal-aligned capability: Ship exports",
+        "Feature parity review with Competitor A",
+    ]
+
+
+def test_plan_project_without_endpoint_returns_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("FOUNDRY_PROJECT_ENDPOINT", raising=False)
+    config = ProjectConfig(name="demo", purpose="", users="", stage="active")
+
+    assert main_module.plan_project(tmp_path, config, []) is None
+
+
+def test_plan_functional_includes_wiki_context_in_the_agent_task(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = ProjectConfig(name="demo", purpose="", users="", stage="active")
+    fake_project = SimpleNamespace(agents=Mock())
+    client = object()
+    monkeypatch.setenv("FOUNDRY_PROJECT_ENDPOINT", "https://example.test")
+    monkeypatch.setattr(
+        "agent.foundry_agent.open_foundry_clients",
+        lambda _endpoint: (fake_project, client),
+    )
+    monkeypatch.setattr("agent.foundry_agent.create_agent", lambda *_a, **_kw: "agent-1")
+    monkeypatch.setattr(main_module, "_extract_relevant_wiki_insights", lambda _name: "wiki insight")
+    run = Mock(return_value={"outcome": "no_gap", "improvements": []})
+    monkeypatch.setattr("agent.foundry_agent.run_agent", run)
+
+    with caplog.at_level(logging.INFO):
+        result = main_module.plan_functional(tmp_path, config, avoid_context="declined idea")
+
+    assert result == {"outcome": "no_gap", "improvements": []}
+    assert run.call_args.args[:2] == (client, "agent-1")
+    assert "wiki insight" in run.call_args.args[4]
+    assert "declined idea" in run.call_args.args[4]
+    assert "evidence-backed no_gap" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "raises"),
+    [
+        (1, "", False),
+        (0, "not-a-date", False),
+        (0, "", True),
+    ],
+)
+def test_commit_age_failures_are_unknown_not_inactive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    returncode: int,
+    stdout: str,
+    raises: bool,
+) -> None:
+    now = main_module.datetime(2026, 10, 11, tzinfo=main_module.timezone.utc)
+    if raises:
+        monkeypatch.setattr(main_module.subprocess, "run", Mock(side_effect=OSError("git missing")))
+    else:
+        monkeypatch.setattr(
+            main_module.subprocess,
+            "run",
+            Mock(return_value=SimpleNamespace(returncode=returncode, stdout=stdout)),
+        )
+
+    assert main_module._hours_since_last_commit(tmp_path, now) is None
+
+
+def test_activity_gate_handles_naive_commit_dates_and_due_rotation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = main_module.datetime(2026, 10, 11, tzinfo=main_module.timezone.utc)
+    monkeypatch.setattr(
+        main_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0, stdout="2026-10-10T00:00:00",
+        ),
+    )
+    assert main_module._hours_since_last_commit(tmp_path, now) == 24
+
+    monkeypatch.setenv("AUTOREFINE_ACTIVITY_LOOKBACK_HOURS", "1")
+    monkeypatch.setenv("AUTOREFINE_ROTATION_DAYS", "1")
+    monkeypatch.setattr(main_module, "_hours_since_last_commit", lambda *_a: float("inf"))
+    should_plan, reason = main_module.should_plan_repo("owner/repo", tmp_path, now=now)
+    assert should_plan is True
+    assert "rotation slot due" in reason
+
+
+def test_build_run_references_falls_back_to_local_invocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for key in ("GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_REPOSITORY"):
+        monkeypatch.delenv(key, raising=False)
+
+    assert "local invocation" in main_module._build_run_references()
+
+
+def test_file_idea_option_discovery_handles_success_and_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    script = tmp_path / "file-idea.py"
+    monkeypatch.setattr(
+        main_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0, stdout="--repo --title", stderr="--dry-run",
+        ),
+    )
+    assert main_module._discover_file_idea_options(script) == {
+        "--repo", "--title", "--dry-run",
+    }
+
+    monkeypatch.setattr(
+        main_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=1, stdout="", stderr="unsupported",
+        ),
+    )
+    with caplog.at_level(logging.WARNING):
+        assert main_module._discover_file_idea_options(script) == set()
+    assert "Could not inspect file-idea.py options" in caplog.text
+
+
+def test_file_idea_script_resolution_uses_environment_then_fails_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = tmp_path / "configured" / "scripts" / "file-idea.py"
+    script.parent.mkdir(parents=True)
+    script.touch()
+    monkeypatch.setenv("NAURO_GOVERNANCE_PATH", str(script.parents[1]))
+    assert main_module._resolve_file_idea_script() == script
+
+    monkeypatch.delenv("NAURO_GOVERNANCE_PATH")
+    monkeypatch.setattr(main_module, "REPO_ROOT", tmp_path / "checkout")
+    tmp_clone = tmp_path / "missing-checkout"
+    monkeypatch.setattr(main_module, "Path", lambda _path: tmp_clone)
+    monkeypatch.setattr(
+        main_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=1, stderr="offline"),
+    )
+    assert main_module._resolve_file_idea_script() is None
+
+
+def test_file_ideas_for_plan_skips_bad_items_and_logs_filing_failures(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(main_module, "_resolve_file_idea_script", lambda: Path("/fake/file-idea.py"))
+    monkeypatch.setattr(main_module, "_build_run_references", lambda: "local")
+    monkeypatch.setattr(main_module, "_open_idea_titles", lambda _repo: [])
+    monkeypatch.setattr(
+        main_module,
+        "_build_file_idea_command",
+        lambda *_args, **_kwargs: ["file-idea"],
+    )
+    results = iter([
+        SimpleNamespace(returncode=1, stdout="", stderr="failed"),
+        SimpleNamespace(returncode=0, stdout="", stderr=""),
+    ])
+    monkeypatch.setattr(main_module.subprocess, "run", lambda *_a, **_kw: next(results))
+    good = {
+        "priority": "P1",
+        "approach": "Add a focused regression test in tests/test_feature.py.",
+        "success_criteria": "The new test fails before the fix and passes after it.",
+    }
+
+    with caplog.at_level(logging.WARNING):
+        filed = main_module.file_ideas_for_plan(
+            "owner/repo",
+            {"improvements": [
+                {**good, "title": "out of scope", "priority": "P3"},
+                {"title": " ", "priority": "P1", **good},
+                {"title": "unspecified", "priority": "P1"},
+                {"title": "first", **good},
+                {"title": "second", **good},
+            ]},
+        )
+
+    assert filed == 1
+    assert "Failed to file idea" in caplog.text
+    assert "filed 1, dropped 1 unspecified" in caplog.text
+
+
+def test_file_one_idea_validates_before_running_and_returns_cli_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = tmp_path / "file-idea.py"
+    improvement = {
+        "title": "Add tests",
+        "approach": "Cover planner edge cases in tests/test_main.py.",
+        "success_criteria": "The targeted tests pass and measure at least 90% coverage.",
+    }
+    run = Mock(side_effect=[
+        SimpleNamespace(returncode=0, stdout="https://github.com/owner/repo/issues/8\n", stderr=""),
+        SimpleNamespace(returncode=1, stdout="", stderr="rejected"),
+    ])
+    monkeypatch.setattr(main_module, "_build_file_idea_command", lambda *_a, **_kw: ["file-idea"])
+    monkeypatch.setattr(main_module.subprocess, "run", run)
+
+    assert main_module._file_one_idea(script, "owner/repo", improvement, "", False).endswith("/8")
+    assert main_module._file_one_idea(script, "owner/repo", {"title": "vague"}, "", False) is None
+    assert main_module._file_one_idea(script, "owner/repo", improvement, "", False) is None
+    assert run.call_count == 2
+
+
+def test_open_idea_card_returns_last_issue_and_fails_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = SimpleNamespace(
+        returncode=0,
+        stdout='[{"number": 3}, {"number": 4}]',
+    )
+    run = Mock(side_effect=[
+        response,
+        SimpleNamespace(returncode=0, stdout="[]"),
+        OSError("gh missing"),
+    ])
+    monkeypatch.setattr(main_module.subprocess, "run", run)
+
+    assert main_module._open_idea_card("owner/repo") == {"number": 4}
+    assert main_module._open_idea_card("owner/repo") is None
+    assert main_module._open_idea_card("owner/repo") is None
+
+
+def test_recent_declined_reasons_collects_human_feedback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        if command[2] == "list":
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([
+                    {"number": 5, "title": "[idea] Add exports"},
+                    {"title": "[idea] No issue number"},
+                    {"number": 7, "title": "[idea] "},
+                ]),
+            )
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"comments": [{"body": "Feedback from Telegram: Too broad"}]}),
+        )
+
+    monkeypatch.setattr(main_module.subprocess, "run", fake_run)
+
+    assert main_module._recent_declined_reasons("owner/repo") == [
+        "Add exports — Too broad",
+        "No issue number",
+    ]
+
+
+def test_idea_card_reminder_and_functional_filing_dry_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    assert main_module._idea_card_reminder_due("owner/repo", 12) is True
+
+    sent: list[tuple[str, int, dict]] = []
+    monkeypatch.setattr(
+        main_module,
+        "_notify_idea_card",
+        lambda repo, number, improvement: sent.append((repo, number, improvement)) or True,
+    )
+    issue = {
+        "number": 12,
+        "title": "[idea]  Add exports",
+        "labels": [{"name": "P1"}, "ignored"],
+    }
+    assert main_module._remind_open_idea_card("owner/repo", issue) is True
+    assert sent == [("owner/repo", 12, {"title": "Add exports", "priority": "P1"})]
+
+    monkeypatch.setattr(main_module, "_resolve_file_idea_script", lambda: Path("/fake/file-idea.py"))
+    monkeypatch.setattr(main_module, "_build_run_references", lambda: "local")
+    filed: list[str] = []
+    carded: list[str] = []
+    improvements = [{"title": "A"}, {"title": "B"}]
+    assert main_module.file_and_card_functional_ideas(
+        "owner/repo",
+        improvements,
+        dry_run=True,
+        filer=lambda idea: filed.append(idea["title"]) or "ignored",
+        carder=lambda *_a: carded.append("card") or True,
+    ) == 2
+    assert filed == ["A", "B"]
+    assert carded == []
