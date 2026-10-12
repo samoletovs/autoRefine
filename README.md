@@ -84,6 +84,57 @@ workflow's `dry_run` dispatch input also dry-runs the PR sweep and suppresses fa
 notifications. Identity configuration still needs
 operator approval.
 
+## Usage
+
+These examples assume dependencies are installed and the environment is configured as
+described above. Replace `owner/repo` with a GitHub repository you can access.
+
+### Evaluate a repository
+
+Run the deterministic checks and inspect the JSON report:
+
+```bash
+python -m agent.main --repo owner/repo --mode evaluate
+```
+
+The output is a JSON object containing the project name, score, findings, measurement
+coverage, and feature suggestions.
+
+### Generate an improvement plan
+
+Ask Foundry to turn the evaluation findings into a prioritized plan:
+
+```bash
+python -m agent.main --repo owner/repo --mode plan
+```
+
+The output includes the evaluation report, followed by an `--- IMPROVEMENT PLAN ---`
+section with a summary and proposed improvements. This calls Foundry and may incur
+usage charges.
+
+### Preview idea filing
+
+Generate a plan without creating GitHub issues or sending Telegram notifications:
+
+```bash
+python -m agent.main --repo owner/repo --mode file-ideas --dry-run
+```
+
+The command prints the evaluation report and runs planning, but suppresses issue creation
+and Telegram delivery. Foundry is still called and may incur usage charges.
+
+### Evaluate a workspace manifest
+
+Evaluate every repository listed in a workspace manifest:
+
+```bash
+python -m agent.main --manifest config/workspace-manifest.json --mode evaluate
+```
+
+The command prints one JSON evaluation report per repository. If any repository fails,
+it continues with the others and exits nonzero with a final `run_status: "failed"` object
+listing the failed repositories.
+
 ### Health alert evidence
 
 Health alerts use measured workflow outcomes, confirmed URL checks and numeric
