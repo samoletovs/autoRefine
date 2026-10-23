@@ -1947,13 +1947,28 @@ def run_dashboard_mode(
     print(report)
 
 
+def run_onboarding_mode(output: str = "onboarding.html") -> None:
+    """Write the self-guided onboarding page to *output*."""
+    from agent.onboarding import render_onboarding_html
+
+    out_path = Path(output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    html = render_onboarding_html()
+    out_path.write_text(html, encoding="utf-8")
+    log.info("Onboarding guide written to %s (%d bytes)", out_path, len(html))
+    print(f"Onboarding guide saved: {out_path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="autoRefine — project improvement agent")
     parser.add_argument("--repo", type=str, help="Single repo (owner/name)")
     parser.add_argument("--manifest", type=str, help="Path to workspace-manifest.json")
     parser.add_argument(
         "--mode",
-        choices=["evaluate", "plan", "file-ideas", "refine", "health-scan", "pr-cards", "dashboard"],
+        choices=[
+            "evaluate", "plan", "file-ideas", "refine", "health-scan",
+            "pr-cards", "dashboard", "onboarding",
+        ],
         default="evaluate",
     )
     parser.add_argument(
@@ -1974,8 +1989,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--output",
-        default="dashboard.html",
-        help="Output file path for dashboard mode (default: dashboard.html)",
+        default=None,
+        help="Output file path (defaults to dashboard.html or onboarding.html by mode)",
     )
     parser.add_argument(
         "--report",
@@ -1988,6 +2003,12 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    if args.mode == "onboarding":
+        log.info("autoRefine starting — mode=onboarding")
+        run_onboarding_mode(args.output or "onboarding.html")
+        log.info("autoRefine complete.")
+        return
+
     requested_model = args.model
     args.model = args.model or os.environ.get("FOUNDRY_DEFAULT_DEPLOYMENT", DEFAULT_CLASSIC_DEPLOYMENT)
     if args.mode in {"plan", "file-ideas", "refine"}:
@@ -2040,7 +2061,7 @@ def main() -> None:
     # dashboard mode: run health-scan pipeline then emit an HTML dashboard file.
     if args.mode == "dashboard":
         log.info("autoRefine starting — mode=dashboard, %d repos", len(repos))
-        run_dashboard_mode(repos, output=args.output, report_path=args.report)
+        run_dashboard_mode(repos, output=args.output or "dashboard.html", report_path=args.report)
         log.info("autoRefine complete.")
         return
     if args.mode == "refine":

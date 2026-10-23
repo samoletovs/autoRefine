@@ -96,7 +96,9 @@ def test_load_config_reads_project_yaml(tmp_path: Path) -> None:
     assert loaded.quality == ["tests"]
 
 
-@pytest.mark.parametrize("mode", ["evaluate", "plan", "refine", "health-scan", "dashboard"])
+@pytest.mark.parametrize(
+    "mode", ["evaluate", "plan", "refine", "health-scan", "dashboard", "onboarding"]
+)
 def test_main_accepts_valid_modes(
     tmp_path: Path, project_config: ProjectConfig, mode: str
 ) -> None:
@@ -118,6 +120,7 @@ def test_main_accepts_valid_modes(
         patch("agent.main.refine_project", return_value=False),
         patch("agent.main.run_health_scan_mode"),
         patch("agent.main.run_dashboard_mode"),
+        patch("agent.main.run_onboarding_mode"),
         patch("builtins.print"),
     ):
         main()
@@ -195,6 +198,28 @@ def test_main_exits_when_no_repo_or_manifest_and_default_missing() -> None:
     ):
         with pytest.raises(SystemExit, match="1"):
             main()
+
+
+def test_main_onboarding_does_not_require_a_repo_or_manifest(tmp_path: Path) -> None:
+    output = tmp_path / "onboarding.html"
+    with (
+        patch("sys.argv", ["autorefine", "--mode", "onboarding", "--output", str(output)]),
+        patch("agent.main.MANIFEST_PATH", Path("/definitely/missing/workspace-manifest.json")),
+        patch("agent.main.run_onboarding_mode") as onboarding,
+    ):
+        main()
+
+    onboarding.assert_called_once_with(str(output))
+
+
+def test_main_onboarding_uses_its_own_default_output() -> None:
+    with (
+        patch("sys.argv", ["autorefine", "--mode", "onboarding"]),
+        patch("agent.main.run_onboarding_mode") as onboarding,
+    ):
+        main()
+
+    onboarding.assert_called_once_with("onboarding.html")
 
 
 def test_main_health_scan_short_circuits_per_repo_flow() -> None:
