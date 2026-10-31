@@ -23,7 +23,16 @@ project.yaml → Discover → Research → Evaluate → Plan → [Ask?] → Exec
 
 ## Getting started
 
-### 1. Add a `project.yaml` to your repo
+### 1. Install dependencies
+
+Use Python 3.11 or newer and install the project requirements from the repository root:
+
+```bash
+python --version
+python -m pip install -r requirements.txt
+```
+
+### 2. Add a `project.yaml` to your repo
 
 ```yaml
 name: my-project
@@ -43,14 +52,18 @@ quality:               # traits you care about
   - i18n
 ```
 
-### 2. Configure
+### 3. Configure
 
 ```bash
 cp .env.example .env
-# Set your Foundry connection string and GitHub token
 ```
 
-### 3. Run
+Set `FOUNDRY_PROJECT_ENDPOINT` for Foundry planning modes, authenticate with Azure
+(for example, run `az login` locally), and set `GH_TOKEN` or `GITHUB_TOKEN` for
+GitHub access. Only configure the credentials needed for the mode you plan to run.
+Keep `.env` local; it contains credentials and must not be committed.
+
+### 4. Run
 
 ```bash
 # Evaluate a single project
