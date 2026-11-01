@@ -692,7 +692,7 @@ def measure_project_yaml(
         ))
         return _measured("metadata", findings)
 
-    if not _config.purpose.strip():
+    if not isinstance(_config.purpose, str) or not _config.purpose.strip():
         findings.append(QualityFinding(
             category="metadata",
             description="project.yaml has no 'purpose' field",

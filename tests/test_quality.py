@@ -444,6 +444,25 @@ class TestProjectYamlEdgeCases:
 
         assert len(findings) == 3
 
+    @pytest.mark.parametrize("purpose", [None, 0])
+    def test_non_string_purpose_is_reported_instead_of_raising(
+        self, tmp_path: Path, purpose: object
+    ) -> None:
+        (tmp_path / "project.yaml").write_text("name: demo\n", encoding="utf-8")
+        config = ProjectConfig(
+            name="demo",
+            purpose=purpose,
+            users="u",
+            stage="active",
+            goals=["goal"],
+            similar=["product"],
+        )
+
+        findings = measure_project_yaml(tmp_path, config).findings
+
+        assert len(findings) == 1
+        assert "purpose" in findings[0].description
+
 
 class TestEvaluationEdgeCases:
     @pytest.mark.parametrize(
