@@ -1,17 +1,24 @@
 """Tests for autoRefine quality checks."""
 
+import json
 from pathlib import Path
 
 import pytest
 import yaml
 
 from agent.config import ProjectConfig
+from agent.main import evaluate_project, suggest_feature_improvements
 from agent.tools.quality_tools import (
+    QualityCoverage,
+    QualityFinding,
     check_ci_cd,
     check_i18n,
     check_project_yaml,
     check_security_headers,
     check_tests,
+    measure_i18n,
+    measure_project_yaml,
+    measure_security_headers,
     run_quality_checks,
 )
 
@@ -171,3 +178,361 @@ class TestRunQualityChecks:
         assert priorities == sorted(
             priorities, key=lambda p: {"P0": 0, "P1": 1, "P2": 2, "P3": 3}.get(p, 9)
         )
+
+
+class TestSecurityHeaderEdgeCases:
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            "[]",
+            '"headers"',
+            "0",
+            "true",
+            "null",
+        ],
+    )
+    def test_non_object_config_is_reported_instead_of_raising(
+        self, tmp_path: Path, sample_config: ProjectConfig, payload: str
+    ) -> None:
+        (tmp_path / "staticwebapp.config.json").write_text(payload, encoding="utf-8")
+
+        findings = measure_security_headers(tmp_path, sample_config).findings
+
+        assert len(findings) == 1
+        assert findings[0].category == "security"
+        assert findings[0].priority == "P0"
+        assert "invalid structure" in findings[0].description
+
+    @pytest.mark.parametrize("headers", ["null", "[]", '"headers"', "0", "true"])
+    def test_non_object_global_headers_are_reported_instead_of_raising(
+        self, tmp_path: Path, sample_config: ProjectConfig, headers: str
+    ) -> None:
+        (tmp_path / "staticwebapp.config.json").write_text(
+            f'{{"globalHeaders": {headers}}}', encoding="utf-8"
+        )
+
+        findings = measure_security_headers(tmp_path, sample_config).findings
+
+        assert len(findings) == 1
+        assert findings[0].category == "security"
+        assert findings[0].priority == "P0"
+        assert "invalid structure" in findings[0].description
+
+    @pytest.mark.parametrize("payload", ["{", '{"globalHeaders":', "not-json", "[1,"])
+    def test_invalid_json_is_reported_as_a_security_finding(
+        self, tmp_path: Path, sample_config: ProjectConfig, payload: str
+    ) -> None:
+        (tmp_path / "staticwebapp.config.json").write_text(payload, encoding="utf-8")
+
+        findings = measure_security_headers(tmp_path, sample_config).findings
+
+        assert len(findings) == 1
+        assert findings[0].category == "security"
+        assert "invalid JSON" in findings[0].description
+
+    @pytest.mark.parametrize(
+        "missing",
+        [
+            "X-Content-Type-Options",
+            "X-Frame-Options",
+            "Referrer-Policy",
+            "Strict-Transport-Security",
+        ],
+    )
+    def test_each_required_header_is_checked_independently(
+        self, tmp_path: Path, sample_config: ProjectConfig, missing: str
+    ) -> None:
+        headers = {
+            "X-Content-Type-Options": "nosniff",
+            "X-Frame-Options": "DENY",
+            "Referrer-Policy": "strict-origin-when-cross-origin",
+            "Strict-Transport-Security": "max-age=31536000",
+        }
+        del headers[missing]
+        (tmp_path / "staticwebapp.config.json").write_text(
+            json.dumps({"globalHeaders": headers}), encoding="utf-8"
+        )
+
+        findings = measure_security_headers(tmp_path, sample_config).findings
+
+        assert len(findings) == 1
+        assert missing in findings[0].description
+
+    def test_all_required_headers_are_clean(
+        self, tmp_path: Path, sample_config: ProjectConfig
+    ) -> None:
+        headers = {
+            "X-Content-Type-Options": "nosniff",
+            "X-Frame-Options": "DENY",
+            "Referrer-Policy": "strict-origin-when-cross-origin",
+            "Strict-Transport-Security": "max-age=31536000",
+        }
+        (tmp_path / "staticwebapp.config.json").write_text(
+            json.dumps({"globalHeaders": headers}), encoding="utf-8"
+        )
+
+        assert measure_security_headers(tmp_path, sample_config).findings == []
+
+    def test_missing_global_headers_checks_all_required_headers(
+        self, tmp_path: Path, sample_config: ProjectConfig
+    ) -> None:
+        (tmp_path / "staticwebapp.config.json").write_text("{}", encoding="utf-8")
+
+        findings = measure_security_headers(tmp_path, sample_config).findings
+
+        assert len(findings) == 1
+        assert findings[0].priority == "P1"
+        assert "Missing security headers" in findings[0].description
+
+
+class TestI18nEdgeCases:
+    @pytest.mark.parametrize(
+        "relative",
+        [
+            "src/i18n",
+            "src/locales",
+            "public/locales",
+            "locales",
+            "i18n",
+        ],
+    )
+    def test_each_standard_locale_directory_counts(
+        self, tmp_path: Path, relative: str
+    ) -> None:
+        (tmp_path / relative).mkdir(parents=True)
+        config = ProjectConfig(
+            name="demo", purpose="p", users="u", stage="active", quality=["i18n"]
+        )
+
+        result = measure_i18n(tmp_path, config)
+
+        assert result.measured is True
+        assert result.findings == []
+
+    @pytest.mark.parametrize("attribute", ["data-en", "data-ru", "data-lv"])
+    def test_each_supported_html_language_attribute_counts(
+        self, tmp_path: Path, attribute: str
+    ) -> None:
+        (tmp_path / "index.html").write_text(
+            f'<h1 {attribute}="Hello">Hello</h1>', encoding="utf-8"
+        )
+        config = ProjectConfig(
+            name="demo", purpose="p", users="u", stage="active", quality=["i18n"]
+        )
+
+        assert measure_i18n(tmp_path, config).findings == []
+
+    @pytest.mark.parametrize(
+        "signal",
+        ['language="lv"', 'locale="lv-LV"', 'locale="ru-RU"', "lv-LV", "ru-RU"],
+    )
+    def test_each_supported_python_language_signal_counts(
+        self, tmp_path: Path, signal: str
+    ) -> None:
+        (tmp_path / "app.py").write_text(f'config = "{signal}"\n', encoding="utf-8")
+        config = ProjectConfig(
+            name="demo", purpose="p", users="u", stage="active", quality=["i18n"]
+        )
+
+        assert measure_i18n(tmp_path, config).findings == []
+
+    @pytest.mark.parametrize("vendor", [".venv", "node_modules", "site-packages"])
+    def test_python_language_signal_in_vendor_tree_does_not_count(
+        self, tmp_path: Path, vendor: str
+    ) -> None:
+        vendor_file = tmp_path / vendor / "app.py"
+        vendor_file.parent.mkdir(parents=True)
+        vendor_file.write_text('language="lv"\n', encoding="utf-8")
+        config = ProjectConfig(
+            name="demo", purpose="p", users="u", stage="active", quality=["i18n"]
+        )
+
+        findings = measure_i18n(tmp_path, config).findings
+
+        assert len(findings) == 1
+        assert findings[0].category == "i18n"
+
+
+class TestProjectYamlEdgeCases:
+    @pytest.mark.parametrize(
+        ("purpose", "goals", "similar", "missing"),
+        [
+            ("", ["goal"], ["product"], "purpose"),
+            ("purpose", [], ["product"], "goals"),
+            ("purpose", ["goal"], [], "similar"),
+        ],
+    )
+    def test_each_missing_project_detail_is_reported(
+        self,
+        tmp_path: Path,
+        purpose: str,
+        goals: list[str],
+        similar: list[str],
+        missing: str,
+    ) -> None:
+        (tmp_path / "project.yaml").write_text("name: demo\n", encoding="utf-8")
+        config = ProjectConfig(
+            name="demo",
+            purpose=purpose,
+            users="u",
+            stage="active",
+            goals=goals,
+            similar=similar,
+        )
+
+        findings = measure_project_yaml(tmp_path, config).findings
+
+        assert len(findings) == 1
+        assert missing in findings[0].description
+
+    @pytest.mark.parametrize(
+        ("purpose", "goals", "similar", "missing"),
+        [
+            (" ", ["goal"], ["product"], "purpose"),
+            ("purpose", [" "], ["product"], "goals"),
+            ("purpose", ["goal"], [" "], "similar"),
+        ],
+    )
+    def test_whitespace_only_project_details_are_missing(
+        self,
+        tmp_path: Path,
+        purpose: str,
+        goals: list[str],
+        similar: list[str],
+        missing: str,
+    ) -> None:
+        (tmp_path / "project.yaml").write_text("name: demo\n", encoding="utf-8")
+        config = ProjectConfig(
+            name="demo",
+            purpose=purpose,
+            users="u",
+            stage="active",
+            goals=goals,
+            similar=similar,
+        )
+
+        findings = measure_project_yaml(tmp_path, config).findings
+
+        assert len(findings) == 1
+        assert missing in findings[0].description
+
+    def test_all_missing_project_details_are_reported_together(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "project.yaml").write_text("name: demo\n", encoding="utf-8")
+        config = ProjectConfig(name="demo", purpose="", users="", stage="active")
+
+        findings = measure_project_yaml(tmp_path, config).findings
+
+        assert len(findings) == 3
+        assert {finding.priority for finding in findings} == {"P1", "P2"}
+
+    def test_all_whitespace_project_details_are_reported_together(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "project.yaml").write_text("name: demo\n", encoding="utf-8")
+        config = ProjectConfig(
+            name="demo",
+            purpose=" ",
+            users="",
+            stage="active",
+            goals=[" "],
+            similar=[""],
+        )
+
+        findings = measure_project_yaml(tmp_path, config).findings
+
+        assert len(findings) == 3
+
+    @pytest.mark.parametrize("purpose", [None, 0])
+    def test_non_string_purpose_is_reported_instead_of_raising(
+        self, tmp_path: Path, purpose: object
+    ) -> None:
+        (tmp_path / "project.yaml").write_text("name: demo\n", encoding="utf-8")
+        config = ProjectConfig(
+            name="demo",
+            purpose=purpose,
+            users="u",
+            stage="active",
+            goals=["goal"],
+            similar=["product"],
+        )
+
+        findings = measure_project_yaml(tmp_path, config).findings
+
+        assert len(findings) == 1
+        assert "purpose" in findings[0].description
+
+
+class TestEvaluationEdgeCases:
+    @pytest.mark.parametrize(
+        ("goals", "similar", "expected_titles"),
+        [
+            ([], [], []),
+            ([""], [], []),
+            (["   "], [], []),
+            (["goal"], [], ["Goal-aligned capability: goal"]),
+            (["first", "second"], [], [
+                "Goal-aligned capability: first",
+                "Goal-aligned capability: second",
+            ]),
+            (["first", "second", "third"], [], [
+                "Goal-aligned capability: first",
+                "Goal-aligned capability: second",
+            ]),
+            ([], ["competitor"], ["Feature parity review with competitor"]),
+            ([], ["", "  ", "competitor"], []),
+            (["goal"], ["competitor"], [
+                "Goal-aligned capability: goal",
+                "Feature parity review with competitor",
+            ]),
+            (["g1", "g2"], ["c1", "c2"], [
+                "Goal-aligned capability: g1",
+                "Goal-aligned capability: g2",
+                "Feature parity review with c1",
+            ]),
+            ([], ["one", "two", "three"], [
+                "Feature parity review with one",
+                "Feature parity review with two",
+            ]),
+            (["", "goal"], ["competitor"], [
+                "Goal-aligned capability: goal",
+                "Feature parity review with competitor",
+            ]),
+            (["", "second", "third"], [], ["Goal-aligned capability: second"]),
+        ],
+    )
+    def test_suggestions_handle_empty_whitespace_and_capacity_edges(
+        self, goals: list[str], similar: list[str], expected_titles: list[str]
+    ) -> None:
+        config = ProjectConfig(
+            name="demo",
+            purpose="p",
+            users="u",
+            stage="active",
+            goals=goals,
+            similar=similar,
+        )
+
+        suggestions = suggest_feature_improvements(config)
+
+        assert [suggestion["title"] for suggestion in suggestions] == expected_titles
+        assert len(suggestions) <= 3
+
+    def test_evaluation_clamps_excessive_deductions_at_zero(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        finding = QualityFinding(
+            category="tests", description="missing tests", priority="P0", weight=101
+        )
+        monkeypatch.setattr(
+            "agent.main.run_quality_checks_with_coverage",
+            lambda _path, _config, _repo=None: ([finding], QualityCoverage()),
+        )
+        config = ProjectConfig(name="demo", purpose="p", users="u", stage="active")
+
+        report = evaluate_project(tmp_path, config)
+
+        assert report["score"] == 0
+        assert report["findings"][0]["category"] == "tests"
+        assert report["coverage"]["summary"] == "0/0 measured"
