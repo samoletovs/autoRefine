@@ -1184,15 +1184,22 @@ def agent_name(mode: str) -> str:
 
 
 def build_agent_definition(mode: str, deployment: str) -> PromptAgentDefinition:
-    # Reasoning tokens bill as output, so routine luna work runs with none. No
-    # temperature/top_p: a luna prompt agent carrying them publishes fine but
-    # every responses.create against it then fails with HTTP 400.
-    reasoning = {"reasoning": Reasoning(effort="none")} if deployment == "gpt-6-luna" else {}
+    # Planning keeps its pre-luna temperature. Luna accepts and applies temperature
+    # only with reasoning effort none (measured 2026-11-09); without it every
+    # response against the version fails with HTTP 400. Non-reasoning models
+    # reject a reasoning parameter, and the blocked sol path carries no sampling.
+    sampling: dict[str, Any]
+    if deployment == "gpt-6-luna":
+        sampling = {"temperature": 0.3, "reasoning": Reasoning(effort="none")}
+    elif deployment.startswith("gpt-6-"):
+        sampling = {}
+    else:
+        sampling = {"temperature": 0.3}
     return PromptAgentDefinition(
         model=deployment,
         instructions=SYSTEM_PROMPT,
         tools=tool_definitions(mode),
-        **reasoning,
+        **sampling,
     )
 
 

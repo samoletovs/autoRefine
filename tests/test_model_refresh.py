@@ -35,14 +35,15 @@ def test_kwargs_only_output_control_cannot_buy_an_unbounded_run() -> None:
         agent._run_budget(unsupported)
 
 
-def test_luna_agent_definition_carries_no_sampling_parameters() -> None:
+def test_luna_agent_definition_pairs_temperature_with_reasoning_none() -> None:
     agents = FakeAgents()
     version = agent.create_agent(SimpleNamespace(agents=agents), mode="plan", model="gpt-6-luna")
     definition = agents.created[0]["definition"]
     assert version.model == definition.model == "gpt-6-luna"
     assert definition.reasoning.effort == "none"
     assert "max_tokens" not in definition.as_dict()
-    assert definition.temperature is None
+    assert definition.temperature == 0.3
+    assert definition.top_p is None
 
 
 def test_luna_and_caps_reach_every_request(tmp_path: Path) -> None:

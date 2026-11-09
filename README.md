@@ -259,12 +259,12 @@ Luna request contract, enforced by `tests/test_model_migration.py`:
 - Health Chat sends `max_completion_tokens<=4000` and `reasoning_effort=none`,
   never `max_tokens` (HTTP 400 on luna) or temperature. `HEALTH_SCAN_MAX_TOKENS`
   may lower but not raise the ceiling. `AZURE_OPENAI_DEPLOYMENT` is not used.
-- Prompt-agent definitions set `reasoning.effort=none` and **omit `temperature`
-  and `top_p`**. Measured 2026-11-09: a luna agent version carrying
-  `temperature` is created fine, but every `responses.create(agent_reference=...)`
-  then fails with HTTP 400 "Unsupported parameter: 'temperature'". Dropping the
-  old `temperature=0.3` changes the definition hash, so the next run publishes a
-  new `autorefine-plan` version.
+- Prompt-agent definitions keep planning's existing `temperature=0.3` and pair it
+  with `reasoning.effort=none` (no `top_p`). Measured 2026-11-09: luna accepts and
+  applies temperature/top_p only under reasoning effort none; without it, every
+  `responses.create(agent_reference=...)` fails with HTTP 400 "Unsupported
+  parameter: 'temperature'". Changing the model and adding reasoning changes the
+  definition hash, so the next run publishes a new `autorefine-plan` version.
 
 Foundry planning runs on the Foundry Agent Service API (`azure-ai-projects` 2.x):
 persistent, versioned prompt agents `autorefine-plan` / `autorefine-refine`, driven

@@ -149,7 +149,8 @@ def test_definition_fingerprint_tracks_model_prompt_tools_and_sampling() -> None
     assert base == fingerprint(build("plan", "gpt-6-luna"))
     assert base != fingerprint(build("plan", "gpt-6-sol"))
     assert base != fingerprint(build("refine", "gpt-6-luna"))
-    assert build("plan", "gpt-6-luna").temperature is None
+    assert build("plan", "gpt-6-luna").temperature == 0.3
+    assert build("plan", "gpt-6-luna").reasoning.effort == "none"
 
 
 def test_tool_schemas_match_the_dispatch_table() -> None:

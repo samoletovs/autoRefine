@@ -63,10 +63,12 @@ Bump rules:
   through `run_agent` — 4 rounds, 13 tool calls, `submit_plan` called, plan
   captured, ~51k prompt / 783 completion tokens. The 2026-10-02 `server_error`
   result was measured on the removed classic surface and no longer applies.
-- **Never put `temperature` or `top_p` on a luna agent definition.** Measured
-  2026-11-09: such a version is created fine, then every `responses.create`
-  against it fails with HTTP 400 "Unsupported parameter: 'temperature'". The
-  definition sets `reasoning.effort=none` instead (reasoning tokens bill as output).
+- **Temperature/top_p on luna need reasoning effort none.** Measured 2026-11-09:
+  without it a luna agent version is created fine, then every `responses.create`
+  against it fails with HTTP 400 "Unsupported parameter: 'temperature'"; with it,
+  temperature is accepted and applied. The definition keeps planning's
+  `temperature=0.3` with `reasoning.effort=none` (reasoning tokens bill as output).
+  Never send a reasoning parameter to a non-reasoning deployment (HTTP 400).
   Health Chat likewise sends `max_completion_tokens` (luna rejects `max_tokens`)
   and `reasoning_effort=none`.
 - Sol stays blocked. Admitting it needs its own measured gate and an explicit,

@@ -2,8 +2,8 @@
 
 gpt-4o, gpt-4o-mini and gpt-4.1(-mini/-nano) retire 2027-04-14; o3 and o4-mini
 retire 2026-11-19. Their deployments auto-upgrade to gpt-6-luna, which rejects
-``max_tokens`` (HTTP 400) and rejects ``temperature`` in a prompt-agent
-definition at response time. Each test here fails if one of those paths returns.
+``max_tokens`` (HTTP 400) and rejects ``temperature``/``top_p`` unless reasoning
+effort is none. Each test here fails if one of those paths returns.
 """
 
 from __future__ import annotations
@@ -47,14 +47,38 @@ def test_foundry_gate_refuses_retiring_and_unadmitted_models(model: str) -> None
 
 
 @pytest.mark.parametrize("mode", ["plan", "refine"])
-def test_luna_agent_definition_has_no_sampling_params_and_no_reasoning(mode: str) -> None:
-    definition = foundry_agent.build_agent_definition(mode, "gpt-6-luna")
-    serialized = definition.as_dict()
+def test_luna_agent_definition_keeps_temperature_only_with_reasoning_none(mode: str) -> None:
+    serialized = foundry_agent.build_agent_definition(mode, "gpt-6-luna").as_dict()
 
     assert serialized["model"] == "gpt-6-luna"
-    assert "temperature" not in serialized
+    assert serialized["temperature"] == 0.3
     assert "top_p" not in serialized
-    assert serialized["reasoning"]["effort"] == "none"
+    _assert_luna_sampling_is_accepted(serialized)
+
+
+@pytest.mark.parametrize("mode", ["plan", "refine"])
+def test_old_deployment_definition_keeps_sampling_and_carries_no_reasoning(mode: str) -> None:
+    # Non-reasoning deployments answer reasoning parameters with HTTP 400. The
+    # allowlist refuses them first; this pins the body if one is ever admitted.
+    serialized = foundry_agent.build_agent_definition(mode, "gpt-4o-mini").as_dict()
+
+    assert serialized["temperature"] == 0.3
+    assert "reasoning" not in serialized
+
+
+def _assert_luna_sampling_is_accepted(body: dict[str, Any]) -> None:
+    """Luna returns HTTP 400 for temperature/top_p unless reasoning effort is none."""
+    if "temperature" not in body and "top_p" not in body:
+        return
+    effort = body.get("reasoning_effort") or (body.get("reasoning") or {}).get("effort")
+    assert effort == "none", f"luna sampling without reasoning none: {body}"
+
+
+def test_luna_sampling_invariant_rejects_temperature_without_reasoning_none() -> None:
+    with pytest.raises(AssertionError):
+        _assert_luna_sampling_is_accepted({"model": "gpt-6-luna", "temperature": 0.3})
+    with pytest.raises(AssertionError):
+        _assert_luna_sampling_is_accepted({"top_p": 0.9, "reasoning": {"effort": "low"}})
 
 
 def _health_request(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
@@ -80,3 +104,4 @@ def test_health_request_uses_luna_request_shape(monkeypatch: pytest.MonkeyPatch)
     assert body["reasoning_effort"] == "none"
     assert "temperature" not in body
     assert "top_p" not in body
+    _assert_luna_sampling_is_accepted(body)
