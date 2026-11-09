@@ -544,7 +544,25 @@ def measure_security_headers(
         ))
         return _measured("security", findings)
 
+    if not isinstance(data, Mapping):
+        findings.append(QualityFinding(
+            category="security",
+            description="staticwebapp.config.json has invalid structure",
+            priority="P0",
+            weight=20,
+        ))
+        return _measured("security", findings)
+
     headers = data.get("globalHeaders", {})
+    if not isinstance(headers, Mapping):
+        findings.append(QualityFinding(
+            category="security",
+            description="staticwebapp.config.json has invalid structure for 'globalHeaders'",
+            priority="P0",
+            weight=20,
+        ))
+        return _measured("security", findings)
+
     missing = [h for h in REQUIRED_SECURITY_HEADERS if h not in headers]
 
     if missing:
@@ -674,7 +692,7 @@ def measure_project_yaml(
         ))
         return _measured("metadata", findings)
 
-    if not _config.purpose:
+    if not isinstance(_config.purpose, str) or not _config.purpose.strip():
         findings.append(QualityFinding(
             category="metadata",
             description="project.yaml has no 'purpose' field",
@@ -682,7 +700,7 @@ def measure_project_yaml(
             weight=10,
         ))
 
-    if not _config.goals:
+    if not any(goal.strip() for goal in _config.goals):
         findings.append(QualityFinding(
             category="metadata",
             description="project.yaml has no 'goals' — agent cannot evaluate feature completeness",
@@ -690,7 +708,7 @@ def measure_project_yaml(
             weight=10,
         ))
 
-    if not _config.similar:
+    if not any(product.strip() for product in _config.similar):
         findings.append(QualityFinding(
             category="metadata",
             description="project.yaml has no 'similar' — agent cannot research competition",
