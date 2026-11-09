@@ -14,8 +14,8 @@ with tests + PRs, and can file idea memos.
 3. **Never modify secrets or auth config.** Report findings, don't fix.
 4. **Always run tests** after making changes. Revert if tests fail.
 5. **Ask the user** when confidence is below 70% on any change.
-6. **Cost discipline.** Health Chat uses `gpt-6-luna`; Foundry agent planning stays on
-   `gpt-4o-mini` until its separate service gate passes. Budget target: €5/month on
+6. **Cost discipline.** Health Chat and Foundry agent planning both use `gpt-6-luna`;
+   `gpt-6-sol` stays blocked. Budget target: €5/month on
    autoRefine's own consumption. See "Model strategy" below before bumping.
 7. **Every measured number in this file and in code comments has expired.** They are
    observations with a date, not properties of the system. Quote one only with its date
@@ -42,37 +42,42 @@ strong models only where the cost is bounded.
 
 | Tier | Used by | Default deployment | Override env |
 |------|---------|--------------------|--------------|
-| Routine | `evaluate` (deterministic, no LLM) + `health-scan` AI analyst | `gpt-6-luna` candidate | `HEALTH_SCAN_MODEL` |
-| Routine planning | `plan` / `refine` / `file-ideas` Foundry prompt agent (`autorefine-plan` / `autorefine-refine`) | `gpt-4o-mini` | `FOUNDRY_DEFAULT_DEPLOYMENT`, or CLI `--model`; only mini / GPT-4.1 enabled |
-| Deep (blocked) | Prepared single-repo planning path | `gpt-6-sol` candidate, not enabled | Manual overrides cannot bypass the model gate |
+| Routine | `evaluate` (deterministic, no LLM) + `health-scan` AI analyst | `gpt-6-luna` | `HEALTH_SCAN_MODEL` (luna only) |
+| Routine planning | `plan` / `refine` / `file-ideas` Foundry prompt agent (`autorefine-plan` / `autorefine-refine`) | `gpt-6-luna` | `FOUNDRY_DEFAULT_DEPLOYMENT`, or CLI `--model`; luna only |
+| Deep (blocked) | Prepared single-repo planning path | `gpt-6-sol` candidate, not enabled | Manual overrides cannot bypass the allowlist |
 | Deep (rare) | Closed-loop PR reviewer (lives in `samoletovs/nauroLabs-github/scripts/claude-deep-review.py`, **not** in this repo) | `claude-opus-4` with `claude-sonnet-4` fallback, via GitHub Models | configured in the governance repo |
 
 Bump rules:
 
-- Candidate models are version `2026-09-22` on `foundrylab-aiservices`.
-  Preparation is not promotion. See [README.md](README.md#model-pilot).
-- Both Luna and Sol are blocked before agent-version publication or any
-  response request, including explicit manual overrides. The shared allowlist is
-  in `agent/config.py` (its `classic` names predate the 2026-10-08 Responses
-  migration); CLI permission is not service-compatibility proof.
-  Do not add an environment switch that bypasses the gate.
-- Parent reported on 2026-10-02 that both bounded synthetic runs on the
-  *classic* Agents surface accepted creation but failed with `server_error`.
-  That surface is gone; the gate has not been re-run on the Responses surface.
-  Baseline control is pending: this is a failed gate, not proof the models are
-  unsupported.
-- Run-wide prompt/completion caps are 200,000/16,000 for routine planning and
-  prepared at 40,000/4,000 for Sol if later admitted, now summed locally across
-  a run's responses. Existing deadlines, tool-round, activity, repeated-call and
+- `gpt-4o`, `gpt-4o-mini` and `gpt-4.1*` retire 2027-04-14 (o3/o4-mini
+  2026-11-19). None may reappear as a default, allowlist entry, fallback, IaC
+  value or example; `tests/test_model_migration.py` fails if one does. There is
+  no rollback model: `gpt-4.1` has no announced replacement.
+- Models are version `2026-09-22` on `foundrylab-aiservices`. See
+  [README.md](README.md#models). The shared allowlist is
+  `SUPPORTED_FOUNDRY_DEPLOYMENTS` in `agent/config.py`; it is checked before
+  agent-version publication or any response request, including explicit manual
+  overrides. Do not add an environment switch that bypasses it.
+- Luna passed the Responses-surface gate on 2026-11-09 (n=1): a throwaway agent
+  with the real `autorefine-plan` instructions and four function tools completed
+  through `run_agent` — 4 rounds, 13 tool calls, `submit_plan` called, plan
+  captured, ~51k prompt / 783 completion tokens. The 2026-10-02 `server_error`
+  result was measured on the removed classic surface and no longer applies.
+- **Never put `temperature` or `top_p` on a luna agent definition.** Measured
+  2026-11-09: such a version is created fine, then every `responses.create`
+  against it fails with HTTP 400 "Unsupported parameter: 'temperature'". The
+  definition sets `reasoning.effort=none` instead (reasoning tokens bill as output).
+  Health Chat likewise sends `max_completion_tokens` (luna rejects `max_tokens`)
+  and `reasoning_effort=none`.
+- Sol stays blocked. Admitting it needs its own measured gate and an explicit,
+  budget-approved allowlist change — never an automatic escalation from luna.
+- Run-wide prompt/completion caps are 200,000/16,000 (prepared at 40,000/4,000 for
+  Sol if it is ever admitted), summed locally across a
+  run's responses. Existing deadlines, tool-round, activity, repeated-call and
   publication gates remain in force.
-- `PromptAgentDefinition` does declare `reasoning`, but no version sets it: the
-  models that would use it stay gated. Never claim low reasoning is enforced
-  until the parent verifies model support, tool calling and run caps on this surface.
-- Rollback uses `gpt-4o-mini` or `gpt-4.1`. No cadence, secret or auth changes
-  accompany the pilot; existing deployment settings shadow code defaults.
 - The existing Container Apps Job has no model override and clones Python at
-  startup. Code, CLI, example environment and IaC defaults must stay mini;
-  a code-default change would reach that job without an IaC deployment.
+  startup, so a code-default change reaches it on the next run without an IaC
+  deployment.
 - The **PR reviewer** path (Claude Opus 4 via GitHub Models) is configured
   outside this repo because the merge gate lives in the governance
   workflows. See `samoletovs/nauroLabs-github` → `.github/workflows/auto-review.yml`.
@@ -108,8 +113,8 @@ fails if anything imports `azure.ai.agents` again or a manifest reinstalls it.
 tools). `create_agent()` hashes the definition — model, instructions, tools, sampling —
 into version metadata (`autorefine_definition_sha256`), reuses the newest of the last
 20 versions whose hash matches, and publishes a new version only when none does. Every
-request pins the exact version in `agent_reference`, so a concurrent `--model gpt-4.1`
-run publishing its own version cannot change the agent underneath a run in progress,
+request pins the exact version in `agent_reference`, so a concurrent run on a different
+definition publishing its own version cannot change the agent underneath a run in progress,
 and flipping back reuses the older version rather than minting another.
 
 This replaced the classic ephemeral agent and its orphan sweep. The classic agent was
