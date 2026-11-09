@@ -33,10 +33,10 @@ from tests.plan_fixtures import valid_plan
 
 # ── Fakes ────────────────────────────────────────────────────────────────────
 
-AGENT = foundry_agent.AgentVersion(name="autorefine-plan", version="7", model="gpt-4o-mini")
+AGENT = foundry_agent.AgentVersion(name="autorefine-plan", version="7", model="gpt-6-luna")
 
 
-def agent_for(model: str = "gpt-4o-mini", mode: str = "plan") -> foundry_agent.AgentVersion:
+def agent_for(model: str = "gpt-6-luna", mode: str = "plan") -> foundry_agent.AgentVersion:
     return foundry_agent.AgentVersion(foundry_agent.agent_name(mode), "7", model)
 
 
@@ -73,7 +73,7 @@ def _response(
     return SimpleNamespace(
         id=response_id,
         status=status,
-        model="gpt-4o-mini",
+        model="gpt-6-luna",
         output=list(calls or []),
         output_text=text,
         error=None,
