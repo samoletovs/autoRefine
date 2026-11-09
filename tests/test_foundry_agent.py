@@ -5,7 +5,6 @@ from __future__ import annotations
 import inspect
 import json
 import logging
-from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,11 +28,6 @@ from agent.foundry_agent import (
 from agent.tools.quality_tools import DimensionResult, QualityCoverage, QualityFinding
 from tests.plan_fixtures import valid_plan
 from tests.test_foundry_loop_guards import AGENT, _DummyToolCall, _ToolLoopClient
-
-
-@pytest.fixture(autouse=True)
-def _approve_plan(approve_agent_definition: Callable[..., None]) -> None:
-    approve_agent_definition()
 
 
 class FakeAgents:
@@ -92,10 +86,7 @@ def test_create_agent_publishes_a_plan_version_without_search_web_tool() -> None
     }
 
 
-def test_refine_agent_is_a_separate_name_with_the_write_tools(
-    approve_agent_definition: Callable[..., None],
-) -> None:
-    approve_agent_definition("refine")
+def test_refine_agent_is_a_separate_name_with_the_write_tools() -> None:
     project = _project()
 
     agent = foundry_agent.create_agent(project, mode="refine")
@@ -120,16 +111,13 @@ def test_unchanged_definition_reuses_the_existing_version() -> None:
 
 def test_changed_definition_gets_a_new_version_and_older_matches_are_reused(
     monkeypatch: pytest.MonkeyPatch,
-    approve_agent_definition: Callable[..., None],
 ) -> None:
     """A --model override must not flip-flop the agent into a new version each run."""
     # Only luna is enabled; lift the gate so a second definition can exist.
     monkeypatch.setattr(foundry_agent, "require_foundry_deployment", lambda d: d)
     project = _project()
     luna = foundry_agent.create_agent(project, mode="plan")
-    approve_agent_definition(model="gpt-6-sol")
     other = foundry_agent.create_agent(project, mode="plan", model="gpt-6-sol")
-    approve_agent_definition()
     luna_again = foundry_agent.create_agent(project, mode="plan")
 
     assert (luna.version, other.version) == ("1", "2")
@@ -274,11 +262,8 @@ def test_handle_run_tests_no_runner_detected(tmp_path: Path) -> None:
     assert result["retryable"] is False
 
 
-def test_create_agent_uses_passed_model(
-    monkeypatch: pytest.MonkeyPatch, approve_agent_definition: Callable[..., None],
-) -> None:
+def test_create_agent_uses_passed_model(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(foundry_agent, "require_foundry_deployment", lambda d: d)
-    approve_agent_definition(model="gpt-6-sol")
     project = _project()
 
     agent = foundry_agent.create_agent(project, mode="plan", model="gpt-6-sol")

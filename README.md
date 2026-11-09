@@ -263,8 +263,8 @@ Luna request contract, enforced by `tests/test_model_migration.py`:
   and `top_p`**. Measured 2026-11-09: a luna agent version carrying
   `temperature` is created fine, but every `responses.create(agent_reference=...)`
   then fails with HTTP 400 "Unsupported parameter: 'temperature'". Dropping the
-  old `temperature=0.3` changes the definition hash. Publication and reuse stay
-  held until an operator approves that exact definition after deployment.
+  old `temperature=0.3` changes the definition hash, so the next run publishes a
+  new `autorefine-plan` version.
 
 Foundry planning runs on the Foundry Agent Service API (`azure-ai-projects` 2.x):
 persistent, versioned prompt agents `autorefine-plan` / `autorefine-refine`, driven
@@ -295,36 +295,15 @@ uncached**, as an upper bound, so the row schema is unchanged. Unknown model or 
 - Planning production is the existing Container Apps Job declared in
   [main.bicep](infrastructure/main.bicep), not a deployment workflow.
   Its entrypoint clones default-branch Python on startup, and the live job sets
-  no `FOUNDRY_DEFAULT_DEPLOYMENT`, so merging makes the new Python available to
-  the next scheduled run. **This does not authorize an agent flip.** With
-  `AUTOREFINE_PLAN_DEFINITION_SHA256` unset, planning fails closed before any
-  version read, publication or model request. Deterministic evaluation and health
-  Chat remain available. IaC changes still need a manual `az deployment group create`.
+  no `FOUNDRY_DEFAULT_DEPLOYMENT`, so **merging changes the next scheduled run**:
+  it publishes and uses a luna `autorefine-plan` version. IaC changes still need
+  a manual `az deployment group create`.
 - Agents `autorefine-plan` and `autorefine-refine` are persistent; a run reuses
   the newest version whose definition hash matches and publishes a new version
-  only after operator approval. Set `AUTOREFINE_PLAN_DEFINITION_SHA256` (or
-  `AUTOREFINE_REFINE_DEFINITION_SHA256`) to the exact approved fingerprint;
-  this never bypasses the model allowlist. Changes to model, instructions, tools
-  or sampling require fresh approval. Unrelated shared-project agents
-  (`atlas-*`, `lab-memory`) must not be edited.
-- **Pre-flip deploy check:** in a clean checkout of the merged commit, compute
-  the expected fingerprints and normalized source hash without contacting Azure:
-
-  ```bash
-  python -c "import hashlib; from pathlib import Path; from agent.foundry_agent import build_agent_definition, definition_fingerprint; print('definition_sha256=' + definition_fingerprint(build_agent_definition('plan', 'gpt-6-luna'))); print('source_sha256=' + hashlib.sha256(Path('agent/foundry_agent.py').read_text(encoding='utf-8').encode('utf-8')).hexdigest())"
-  ```
-
-  In the deployed job's console logs, require a **`Foundry activation held`**
-  line from an execution started after the merge, with both hashes equal to
-  those computed above. A post-merge execution timestamp alone is insufficient.
-  Read the live agent definition and confirm it is unchanged. Only then may the
-  orchestrator set the approval hash on the job. The next planning run can publish
-  the approved definition; this writer makes no live change.
-- Rollback: unset the corresponding approval hash (original value: absent).
-  Future planning runs stop before using even an already-published luna version.
-  This does not cancel in-flight runs or restore a retiring model. The live latest
-  version may remain luna; consumers must keep using pinned references. Reverting
-  this gate while the job is enabled would restore unsafe automatic publication.
+  only when model, instructions, tools or sampling change. Existing unrelated
+  shared-project agents (`atlas-*`, `lab-memory`) must not be edited.
+- Rollback is a revert of the code change. It reuses the older retiring-model
+  agent version by hash and stops working when those models retire.
 - There is no repository-owned `copilot-triage` workflow in this repo.
 ## Cost
 

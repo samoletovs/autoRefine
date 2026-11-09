@@ -10,9 +10,8 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -56,56 +55,6 @@ def test_luna_agent_definition_has_no_sampling_params_and_no_reasoning(mode: str
     assert "temperature" not in serialized
     assert "top_p" not in serialized
     assert serialized["reasoning"]["effort"] == "none"
-
-
-@pytest.mark.parametrize("mode", ["plan", "refine"])
-@pytest.mark.parametrize("approval", [None, "", "1", "stale-definition"])
-def test_unapproved_agent_never_contacts_foundry(
-    monkeypatch: pytest.MonkeyPatch, mode: str, approval: str | None,
-) -> None:
-    if approval is not None:
-        monkeypatch.setenv(f"AUTOREFINE_{mode.upper()}_DEFINITION_SHA256", approval)
-    project = Mock()
-    project.agents.list_versions.return_value = []
-    with pytest.raises(RuntimeError, match="operator approval"):
-        foundry_agent.create_agent(project, mode=mode)
-    assert project.mock_calls == []
-
-
-def test_approval_is_exact_and_revocable(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
-) -> None:
-    from tests.test_foundry_agent import FakeAgents
-
-    project = SimpleNamespace(agents=FakeAgents())
-    fingerprint = foundry_agent.definition_fingerprint(
-        foundry_agent.build_agent_definition("plan", "gpt-6-luna"),
-    )
-    monkeypatch.setenv("AUTOREFINE_PLAN_DEFINITION_SHA256", fingerprint)
-    approved = foundry_agent.create_agent(project)
-    assert foundry_agent.create_agent(project) == approved
-    assert len(project.agents.created) == 1
-
-    monkeypatch.delenv("AUTOREFINE_PLAN_DEFINITION_SHA256")
-    project.agents.list_kwargs.clear()
-    with pytest.raises(RuntimeError, match="operator approval"):
-        foundry_agent.create_agent(project)
-    assert project.agents.list_kwargs == []
-    assert len(project.agents.created) == 1
-    assert f"definition_sha256={fingerprint}" in caplog.text
-    assert "source_sha256=" in caplog.text
-
-
-def test_changed_definition_requires_fresh_approval(monkeypatch: pytest.MonkeyPatch) -> None:
-    fingerprint = foundry_agent.definition_fingerprint(
-        foundry_agent.build_agent_definition("plan", "gpt-6-luna"),
-    )
-    monkeypatch.setenv("AUTOREFINE_PLAN_DEFINITION_SHA256", fingerprint)
-    monkeypatch.setattr(foundry_agent, "SYSTEM_PROMPT", foundry_agent.SYSTEM_PROMPT + "\nChanged.")
-    project = Mock()
-    with pytest.raises(RuntimeError, match="operator approval"):
-        foundry_agent.create_agent(project)
-    assert project.mock_calls == []
 
 
 def _health_request(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:

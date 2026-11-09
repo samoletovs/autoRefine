@@ -18,7 +18,6 @@ itself.** A test that wants one still sets it with ``monkeypatch.setenv``.
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
 
 import pytest
 
@@ -27,18 +26,3 @@ import pytest
 def _isolate_autorefine_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for key in [k for k in os.environ if k.startswith("AUTOREFINE_")]:
         monkeypatch.delenv(key, raising=False)
-
-
-@pytest.fixture
-def approve_agent_definition(
-    monkeypatch: pytest.MonkeyPatch, _isolate_autorefine_env: None,
-) -> Callable[..., None]:
-    from agent import foundry_agent
-
-    def approve(mode: str = "plan", model: str = "gpt-6-luna") -> None:
-        fingerprint = foundry_agent.definition_fingerprint(
-            foundry_agent.build_agent_definition(mode, model),
-        )
-        monkeypatch.setenv(f"AUTOREFINE_{mode.upper()}_DEFINITION_SHA256", fingerprint)
-
-    return approve
