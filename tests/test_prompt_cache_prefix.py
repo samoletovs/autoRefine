@@ -74,7 +74,12 @@ def _plan_tool_definitions() -> list[dict]:
             captured.update(kwargs)
             return SimpleNamespace(version="1", metadata=kwargs["metadata"])
 
-    foundry_agent.create_agent(SimpleNamespace(agents=Agents()), mode="plan")
+    fingerprint = foundry_agent.definition_fingerprint(
+        foundry_agent.build_agent_definition("plan", "gpt-6-luna"),
+    )
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setenv("AUTOREFINE_PLAN_DEFINITION_SHA256", fingerprint)
+        foundry_agent.create_agent(SimpleNamespace(agents=Agents()), mode="plan")
     return captured["definition"].as_dict()["tools"]
 
 

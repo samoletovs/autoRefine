@@ -1,5 +1,6 @@
 """Selective model costs and agent-version bounds, without service calls."""
 
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -12,6 +13,11 @@ from agent import main
 from agent.config import AutoRefineConfig, ProjectConfig
 from tests.test_foundry_agent import FakeAgents
 from tests.test_foundry_loop_guards import _ToolLoopClient, agent_for
+
+
+@pytest.fixture(autouse=True)
+def _approve_plan(approve_agent_definition: Callable[..., None]) -> None:
+    approve_agent_definition()
 
 
 @pytest.mark.parametrize(("model", "prompt_cap", "completion_cap"), [

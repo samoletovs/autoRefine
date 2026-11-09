@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -214,9 +215,11 @@ def test_response_cleanup_programming_error_still_propagates() -> None:
 
 def test_agent_version_published_after_deadline_is_harmless(
     monkeypatch: pytest.MonkeyPatch,
+    approve_agent_definition: Callable[..., None],
 ) -> None:
     """A late version is a reusable definition, not an orphan needing cleanup."""
     release, published = threading.Event(), threading.Event()
+    approve_agent_definition()
     monkeypatch.setattr(f, "resolve_run_timeout_seconds", lambda: 1)
 
     def create_version(**kwargs: object) -> SimpleNamespace:
@@ -287,7 +290,9 @@ def test_real_sdk_blocked_auth_cannot_hold_the_caller_or_reuse_closed_state(
 
 def test_retired_agent_lease_does_not_retire_the_responses_client(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    approve_agent_definition: Callable[..., None],
 ) -> None:
+    approve_agent_definition()
     release = threading.Event()
     monkeypatch.setattr(f, "resolve_run_timeout_seconds", lambda: 1)
 

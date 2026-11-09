@@ -1227,7 +1227,8 @@ def create_agent(
 
     Reuses the newest version whose stored definition fingerprint matches, and
     publishes a new version only when model, instructions, tools or sampling
-    differ. Nothing is created per run, so nothing can be orphaned by a hard
+    differ. Both reuse and publication require operator approval of the exact
+    definition hash. Nothing is created per run, so nothing can be orphaned by a hard
     kill; this replaced the classic per-run create/delete and its orphan sweep.
 
     :param model: Foundry deployment name to use. Falls back to
@@ -1239,6 +1240,24 @@ def create_agent(
     definition = build_agent_definition(mode, deployment)
     fingerprint = definition_fingerprint(definition)
     name = agent_name(mode)
+    approval_env = (
+        "AUTOREFINE_REFINE_DEFINITION_SHA256" if mode == "refine"
+        else "AUTOREFINE_PLAN_DEFINITION_SHA256"
+    )
+    if os.environ.get(approval_env) != fingerprint:
+        source_hash = hashlib.sha256(
+            Path(__file__).read_text(encoding="utf-8").encode("utf-8"),
+        ).hexdigest()
+        log.error(
+            "Foundry activation held: agent=%s model=%s definition_sha256=%s "
+            "source_sha256=%s; operator approval via %s is required",
+            name, deployment, fingerprint, source_hash, approval_env,
+        )
+        raise RuntimeError(
+            f"{name} requires operator approval: set {approval_env} to the verified "
+            "definition SHA256 only after checking the deployed code. "
+            "No agent version was read, published or used."
+        )
     boundary = client_boundary(project)
 
     try:

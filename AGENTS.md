@@ -76,8 +76,13 @@ Bump rules:
   run's responses. Existing deadlines, tool-round, activity, repeated-call and
   publication gates remain in force.
 - The existing Container Apps Job has no model override and clones Python at
-  startup, so a code-default change reaches it on the next run without an IaC
-  deployment.
+  startup, so Python changes reach it on the next run without an IaC deployment.
+  Publication and reuse require the exact definition fingerprint in
+  `AUTOREFINE_PLAN_DEFINITION_SHA256` (or `AUTOREFINE_REFINE_DEFINITION_SHA256`).
+  Unset or stale approval holds planning before any version read or model call.
+  Verify the deployed `Foundry activation held` log's definition and source hashes
+  against the merged checkout before the orchestrator sets approval. Clearing it
+  holds future runs; never roll back by selecting a retiring model.
 - The **PR reviewer** path (Claude Opus 4 via GitHub Models) is configured
   outside this repo because the merge gate lives in the governance
   workflows. See `samoletovs/nauroLabs-github` → `.github/workflows/auto-review.yml`.
@@ -112,7 +117,9 @@ fails if anything imports `azure.ai.agents` again or a manifest reinstalls it.
 `autorefine-plan` (read tools + `submit_plan`) and `autorefine-refine` (plus the write
 tools). `create_agent()` hashes the definition — model, instructions, tools, sampling —
 into version metadata (`autorefine_definition_sha256`), reuses the newest of the last
-20 versions whose hash matches, and publishes a new version only when none does. Every
+20 versions whose hash matches, and publishes a new version only when none does.
+Both reuse and publication require operator approval of the exact definition hash;
+merging code alone cannot authorize either. Every
 request pins the exact version in `agent_reference`, so a concurrent run on a different
 definition publishing its own version cannot change the agent underneath a run in progress,
 and flipping back reuses the older version rather than minting another.
