@@ -65,9 +65,16 @@ python -m agent.main --repo owner/repo --mode refine
 # All projects in a manifest
 python -m agent.main --manifest config/workspace-manifest.json --mode file-ideas
 
+# Open the self-guided setup guide (no repository access required)
+python -m agent.main --mode onboarding --output onboarding.html
+
 # Generate a browser dashboard with health, ideas, and progress tracking
 python -m agent.main --repo owner/repo --mode dashboard --output dashboard.html
 ```
+
+The onboarding guide walks through installation, `project.yaml`, evaluation, and
+planning. It saves progress and clarity feedback in the browser; use its download
+button to export feedback JSON for usability review. No feedback is sent automatically.
 
 `--model` selects the deployment for `plan`, `refine`, and both technical and functional
 planning in `file-ideas`. It overrides `FOUNDRY_DEFAULT_DEPLOYMENT`; the
