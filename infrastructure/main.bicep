@@ -99,13 +99,9 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
       // GiB-seconds, which is 6.0% of the 180k free vCPU-seconds and 6.0% of the 360k free
       // GiB-seconds for the month. A ceiling that is never reached bills nothing at all.
       //
-      // It also bounds the whole execution rather than each attempt: "The replicaTimeout
-      // setting takes precedence if it expires before all retries occur"
-      // (learn.microsoft.com/azure/container-apps/jobs, "Advanced job configuration"). So
-      // the worst case is 6h total, not 6h per try — and the deliberate single retry below
-      // only has room to accomplish anything if the ceiling is well clear of a normal run.
-      // Under the old 3h a run failing at 167.8 min left the retry 12 minutes, which would
-      // have timed out having done nothing.
+      // The timeout bounds the replica's whole execution. Automatic retries are disabled:
+      // the entrypoint preserves partial reports and cost rows, and replaying the sweep
+      // would repeat completed inference. The next scheduled run is the retry.
       //
       // Provisional. Eight samples spanning the activity-gate change is not a stable
       // distribution — the two shortest are post-gate — and the cost rows now landing in
@@ -113,8 +109,9 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
       // many projects or a few slow ones. That decides whether this ceiling or the gate is
       // the thing to move. Re-measure before quoting any number in this comment.
       replicaTimeout: 21600
-      // Not raised with the ceiling, deliberately: a retry re-runs the entire sweep.
-      replicaRetryLimit: 1
+      // The script preserves partial reports and cost rows on failure. Retrying the whole
+      // sweep would repeat completed inference; the next scheduled run is the retry.
+      replicaRetryLimit: 0
       scheduleTriggerConfig: {
         cronExpression: scheduleEnabled ? cronExpression : '0 0 31 2 *' // 31 Feb = never
         parallelism: 1

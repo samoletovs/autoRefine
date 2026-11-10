@@ -1177,12 +1177,12 @@ Three things that are easy to get wrong here:
   (`int`, required, no range), or `az containerapp job create --help`. 21600 is accepted by
   the RP — confirmed by `what-if` — but if you need a much larger value, verify it rather
   than assuming the field is unbounded.
-- **The timeout bounds the whole execution, not each attempt.** "The `replicaTimeout`
-  setting takes precedence if it expires before all retries occur"
-  ([jobs, Advanced job configuration](https://learn.microsoft.com/azure/container-apps/jobs)).
-  So worst case is 6h total, not 6h × attempts — and `replicaRetryLimit: 1` only has room to
-  achieve anything when the ceiling is well clear of a normal run. Under the old 3h, a run
-  failing at 167.8 min left its retry 12 minutes.
+- **Automatic retries are disabled.** `replicaRetryLimit: 0` prevents a failed long sweep
+  from replaying inference that already completed. The entrypoint preserves partial reports
+  and cost rows, and the next scheduled run is the retry.
+- **The timeout bounds the replica's whole execution.** The `replicaTimeout` setting takes
+  precedence over retries ([jobs, Advanced job configuration](https://learn.microsoft.com/azure/container-apps/jobs));
+  with automatic retries disabled, the 6h timeout is a hard limit on one sweep.
 - **The round guards do not make this redundant.** `DEFAULT_MAX_TOOL_ROUNDS = 200` and
   `DEFAULT_STUCK_REPEATS = 3` bound *iteration*, so a runaway tool loop is far less likely
   than when 10800 was chosen. They do not bound *wall clock*: `run_agent` uses
