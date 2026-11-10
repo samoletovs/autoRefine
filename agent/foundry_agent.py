@@ -29,7 +29,7 @@ from typing import Any, NoReturn, TypeVar
 
 import httpx
 import openai
-from azure.ai.projects.models import FunctionTool, PromptAgentDefinition
+from azure.ai.projects.models import FunctionTool, PromptAgentDefinition, Reasoning
 from azure.core.exceptions import (
     AzureError,
     HttpResponseError,
@@ -45,21 +45,19 @@ from tenacity import (
     wait_random_exponential,
 )
 
-from agent.config import DEFAULT_CLASSIC_DEPLOYMENT, ProjectConfig, require_classic_deployment
+from agent.config import DEFAULT_FOUNDRY_DEPLOYMENT, ProjectConfig, require_foundry_deployment
 from agent.plan_validation import plan_errors
 from agent.sdk_boundary import SdkBoundary, SdkDeadlineExceeded, client_boundary
 from agent.tools.quality_tools import plannable_findings
 
 log = logging.getLogger(__name__)
 
-DEFAULT_DEPLOYMENT = os.environ.get("FOUNDRY_DEFAULT_DEPLOYMENT", DEFAULT_CLASSIC_DEPLOYMENT)
+DEFAULT_DEPLOYMENT = os.environ.get("FOUNDRY_DEFAULT_DEPLOYMENT", DEFAULT_FOUNDRY_DEPLOYMENT)
 ENDPOINT = os.environ.get("FOUNDRY_PROJECT_ENDPOINT", "")
 MODEL_PRICES: dict[str, tuple[float, float, float]] = {
     # Global short-context USD/M: uncached input, output, cached input.
     "gpt-6-luna": (0.10, 0.50, 0.01),
     "gpt-6-sol": (2.00, 10.00, 0.20),
-    "gpt-4.1": (2.00, 8.00, 0.50),
-    "gpt-4o-mini": (0.15, 0.60, 0.075),
 }
 MAX_FOUNDRY_RETRY_ATTEMPTS = 5
 RETRYABLE_FOUNDRY_STATUS_CODES = {429, 502, 503, 504}
@@ -262,7 +260,7 @@ def resolve_max_completion_tokens() -> int:
 
 
 def _deployment(model: str | None, mode: str) -> str:
-    deployment = require_classic_deployment(model or DEFAULT_DEPLOYMENT)
+    deployment = require_foundry_deployment(model or DEFAULT_DEPLOYMENT)
     if deployment not in MODEL_PRICES:
         raise ValueError("Foundry deployment must name a supported actual model")
     if deployment == "gpt-6-sol" and (model is None or mode != "plan"):
@@ -1186,9 +1184,17 @@ def agent_name(mode: str) -> str:
 
 
 def build_agent_definition(mode: str, deployment: str) -> PromptAgentDefinition:
-    # Reasoning effort is not set: the gpt-6 models that would use it stay blocked
-    # by the deployment gate, and a model that ignores it must not be told otherwise.
-    sampling = {} if deployment.startswith("gpt-6-") else {"temperature": 0.3}
+    # Planning keeps its pre-luna temperature. Luna accepts and applies temperature
+    # only with reasoning effort none (measured 2026-11-09); without it every
+    # response against the version fails with HTTP 400. Non-reasoning models
+    # reject a reasoning parameter, and the blocked sol path carries no sampling.
+    sampling: dict[str, Any]
+    if deployment == "gpt-6-luna":
+        sampling = {"temperature": 0.3, "reasoning": Reasoning(effort="none")}
+    elif deployment.startswith("gpt-6-"):
+        sampling = {}
+    else:
+        sampling = {"temperature": 0.3}
     return PromptAgentDefinition(
         model=deployment,
         instructions=SYSTEM_PROMPT,
@@ -1232,9 +1238,8 @@ def create_agent(
     kill; this replaced the classic per-run create/delete and its orphan sweep.
 
     :param model: Foundry deployment name to use. Falls back to
-        ``FOUNDRY_DEFAULT_DEPLOYMENT`` env var, then to ``gpt-4o-mini``.
-        Luna/Sol are blocked until their separate service gate passes,
-        including explicit manual overrides.
+        ``FOUNDRY_DEFAULT_DEPLOYMENT`` env var, then to ``gpt-6-luna``.
+        Only gpt-6-luna is accepted; the prepared gpt-6-sol path stays blocked.
     """
     deployment = _deployment(model, mode)
     deadline = time.monotonic() + resolve_run_timeout_seconds()

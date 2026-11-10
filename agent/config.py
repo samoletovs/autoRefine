@@ -8,16 +8,18 @@ import yaml
 
 log = logging.getLogger(__name__)
 
-DEFAULT_CLASSIC_DEPLOYMENT = "gpt-4o-mini"
-VERIFIED_CLASSIC_DEPLOYMENTS = frozenset({"gpt-4o-mini", "gpt-4.1"})
+DEFAULT_FOUNDRY_DEPLOYMENT = "gpt-6-luna"
+# gpt-4o-mini and gpt-4.1 retire 2027-04-14 and are deliberately absent. The
+# prepared gpt-6-sol deep path stays blocked until it is separately verified.
+SUPPORTED_FOUNDRY_DEPLOYMENTS = frozenset({"gpt-6-luna"})
 
 
-def require_classic_deployment(deployment: str) -> str:
-    """A manual override is not evidence that a classic-service gate passed."""
-    if deployment not in VERIFIED_CLASSIC_DEPLOYMENTS:
+def require_foundry_deployment(deployment: str) -> str:
+    """Reject any deployment outside the supported, non-retiring set."""
+    if deployment not in SUPPORTED_FOUNDRY_DEPLOYMENTS:
         raise ValueError(
-            "Classic Foundry compatibility gate has not passed for this deployment; "
-            "only gpt-4o-mini and gpt-4.1 are enabled."
+            "Unsupported Foundry deployment; only gpt-6-luna is enabled "
+            "(the prepared gpt-6-sol deep path is not)."
         )
     return deployment
 
@@ -102,7 +104,7 @@ class AutoRefineConfig:
     # Default model: cheap Foundry tier for daily scans of 11 repos.
     # Override via CLI --model or FOUNDRY_DEFAULT_DEPLOYMENT env var.
     # See AGENTS.md "Model strategy" for the tiered plan.
-    model: str = DEFAULT_CLASSIC_DEPLOYMENT
+    model: str = DEFAULT_FOUNDRY_DEPLOYMENT
     dry_run: bool = False
     workdir: Path = field(default_factory=lambda: Path("/tmp/autorefine"))
     # True only for a manifest-driven sweep of every project. Such a sweep re-plans

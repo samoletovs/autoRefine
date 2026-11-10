@@ -112,8 +112,8 @@ def test_row_records_mode_rounds_and_tokens(
     assert row["prompt_tokens"] == 2000
     assert row["completion_tokens"] == 100
     assert row["total_tokens"] == 2100
-    assert row["model"] == "gpt-4o-mini"
-    assert row["estimated_usd_uncached"] == pytest.approx((2000 * 0.15 + 100 * 0.60) / 1e6)
+    assert row["model"] == "gpt-6-luna"
+    assert row["estimated_usd_uncached"] == pytest.approx((2000 * 0.10 + 100 * 0.50) / 1e6)
     assert isinstance(row["duration_s"], float)
     assert row["ts"].endswith("+00:00")
 

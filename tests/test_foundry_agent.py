@@ -70,7 +70,7 @@ def test_create_agent_publishes_a_plan_version_without_search_web_tool() -> None
 
     agent = foundry_agent.create_agent(project, mode="plan")
 
-    assert agent == foundry_agent.AgentVersion("autorefine-plan", "1", "gpt-4o-mini")
+    assert agent == foundry_agent.AgentVersion("autorefine-plan", "1", "gpt-6-luna")
     (created,) = project.agents.created
     assert created["agent_name"] == "autorefine-plan"
     assert _tool_names(created["definition"]) == {
@@ -109,16 +109,20 @@ def test_unchanged_definition_reuses_the_existing_version() -> None:
     assert project.agents.list_kwargs[-1]["order"] == "desc"
 
 
-def test_changed_definition_gets_a_new_version_and_older_matches_are_reused() -> None:
+def test_changed_definition_gets_a_new_version_and_older_matches_are_reused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A --model override must not flip-flop the agent into a new version each run."""
+    # Only luna is enabled; lift the gate so a second definition can exist.
+    monkeypatch.setattr(foundry_agent, "require_foundry_deployment", lambda d: d)
     project = _project()
-    mini = foundry_agent.create_agent(project, mode="plan")
-    gpt41 = foundry_agent.create_agent(project, mode="plan", model="gpt-4.1")
-    mini_again = foundry_agent.create_agent(project, mode="plan")
+    luna = foundry_agent.create_agent(project, mode="plan")
+    other = foundry_agent.create_agent(project, mode="plan", model="gpt-6-sol")
+    luna_again = foundry_agent.create_agent(project, mode="plan")
 
-    assert (mini.version, gpt41.version) == ("1", "2")
-    assert gpt41.model == "gpt-4.1"
-    assert mini_again == mini, "the older matching version is pinned, not republished"
+    assert (luna.version, other.version) == ("1", "2")
+    assert other.model == "gpt-6-sol"
+    assert luna_again == luna, "the older matching version is pinned, not republished"
     assert len(project.agents.created) == 2
 
 
@@ -140,12 +144,13 @@ def test_missing_agent_is_created_on_first_use() -> None:
 def test_definition_fingerprint_tracks_model_prompt_tools_and_sampling() -> None:
     fingerprint = foundry_agent.definition_fingerprint
     build = foundry_agent.build_agent_definition
-    base = fingerprint(build("plan", "gpt-4o-mini"))
+    base = fingerprint(build("plan", "gpt-6-luna"))
 
-    assert base == fingerprint(build("plan", "gpt-4o-mini"))
-    assert base != fingerprint(build("plan", "gpt-4.1"))
-    assert base != fingerprint(build("refine", "gpt-4o-mini"))
-    assert build("plan", "gpt-4o-mini").temperature == 0.3
+    assert base == fingerprint(build("plan", "gpt-6-luna"))
+    assert base != fingerprint(build("plan", "gpt-6-sol"))
+    assert base != fingerprint(build("refine", "gpt-6-luna"))
+    assert build("plan", "gpt-6-luna").temperature == 0.3
+    assert build("plan", "gpt-6-luna").reasoning.effort == "none"
 
 
 def test_tool_schemas_match_the_dispatch_table() -> None:
@@ -258,13 +263,14 @@ def test_handle_run_tests_no_runner_detected(tmp_path: Path) -> None:
     assert result["retryable"] is False
 
 
-def test_create_agent_uses_passed_model() -> None:
+def test_create_agent_uses_passed_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(foundry_agent, "require_foundry_deployment", lambda d: d)
     project = _project()
 
-    agent = foundry_agent.create_agent(project, mode="plan", model="gpt-4.1")
+    agent = foundry_agent.create_agent(project, mode="plan", model="gpt-6-sol")
 
-    assert agent.model == "gpt-4.1"
-    assert project.agents.created[0]["definition"].model == "gpt-4.1"
+    assert agent.model == "gpt-6-sol"
+    assert project.agents.created[0]["definition"].model == "gpt-6-sol"
 
 
 def test_create_agent_deadline_is_a_run_deadline_abort(
@@ -481,12 +487,17 @@ def test_run_agent_falls_back_to_the_final_text_only_when_it_validates(tmp_path:
     assert len(client.requests) == 1, "the final text is read off the response, not refetched"
 
 
-def test_run_agent_refuses_an_agent_pinned_to_another_model(tmp_path: Path) -> None:
+def test_run_agent_refuses_an_agent_pinned_to_another_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(foundry_agent, "require_foundry_deployment", lambda d: d)
     config = ProjectConfig(name="demo", purpose="", users="", stage="active")
     client = _ToolLoopClient(lambda n: None)
 
-    with pytest.raises(ValueError, match="pinned to gpt-4o-mini"):
-        foundry_agent.run_agent(client, AGENT, tmp_path, config, "task", model="gpt-4.1")
+    with pytest.raises(ValueError, match="pinned to gpt-6-luna"):
+        foundry_agent.run_agent(
+            client, AGENT, tmp_path, config, "task", model="gpt-6-sol", mode="plan",
+        )
     assert client.requests == []
 
 
@@ -676,7 +687,7 @@ def test_real_sdk_puts_the_loop_on_the_wire(tmp_path: Path) -> None:
             }]
         return httpx.Response(200, json={
             "id": f"resp_{n}", "object": "response", "created_at": 0, "status": "completed",
-            "model": "gpt-4o-mini", "output": output, "usage": usage,
+            "model": "gpt-6-luna", "output": output, "usage": usage,
             "parallel_tool_calls": True, "tool_choice": "auto", "tools": [],
         })
 

@@ -17,8 +17,6 @@ from tests.test_foundry_loop_guards import _ToolLoopClient, agent_for
 @pytest.mark.parametrize(("model", "prompt_cap", "completion_cap"), [
     ("gpt-6-luna", 200_000, 16_000),
     ("gpt-6-sol", 40_000, 4_000),
-    ("gpt-4.1", 200_000, 16_000),
-    ("gpt-4o-mini", 200_000, 16_000),
 ])
 def test_budget_parameters_do_not_imply_model_admission(
     model: str, prompt_cap: int, completion_cap: int,
@@ -37,55 +35,56 @@ def test_kwargs_only_output_control_cannot_buy_an_unbounded_run() -> None:
         agent._run_budget(unsupported)
 
 
-@pytest.mark.parametrize("model", ["gpt-4.1", "gpt-4o-mini"])
-def test_verified_agent_definition_preserves_legacy_parameters(model: str) -> None:
+def test_luna_agent_definition_pairs_temperature_with_reasoning_none() -> None:
     agents = FakeAgents()
-    version = agent.create_agent(SimpleNamespace(agents=agents), mode="plan", model=model)
+    version = agent.create_agent(SimpleNamespace(agents=agents), mode="plan", model="gpt-6-luna")
     definition = agents.created[0]["definition"]
-    assert version.model == definition.model == model
-    assert definition.reasoning is None
+    assert version.model == definition.model == "gpt-6-luna"
+    assert definition.reasoning.effort == "none"
     assert "max_tokens" not in definition.as_dict()
     assert definition.temperature == 0.3
+    assert definition.top_p is None
 
 
-def test_verified_model_and_caps_reach_every_request(tmp_path: Path) -> None:
+def test_luna_and_caps_reach_every_request(tmp_path: Path) -> None:
     client = _ToolLoopClient(lambda n: None)
     agent.run_agent(
-        client, agent_for("gpt-4.1"), tmp_path,
+        client, agent_for("gpt-6-luna"), tmp_path,
         ProjectConfig(name="synthetic", purpose="", users="", stage="active"),
-        "Synthetic task", mode="plan", model="gpt-4.1",
+        "Synthetic task", mode="plan", model="gpt-6-luna",
     )
     (request,) = client.requests
     assert request["extra_body"]["agent_reference"]["name"] == "autorefine-plan"
     assert request["max_output_tokens"] == 16_000
     assert request["truncation"] == "auto"
+    assert "temperature" not in request and "top_p" not in request
 
 
-def test_unconfigured_job_keeps_the_existing_model() -> None:
-    assert AutoRefineConfig(repos=[]).model == "gpt-4o-mini"
-    assert agent.DEFAULT_DEPLOYMENT == "gpt-4o-mini"
+def test_unconfigured_job_defaults_to_luna() -> None:
+    assert AutoRefineConfig(repos=[]).model == "gpt-6-luna"
+    assert agent.DEFAULT_DEPLOYMENT == "gpt-6-luna"
     agents = FakeAgents()
     agent.create_agent(SimpleNamespace(agents=agents))
-    assert agents.created[0]["definition"].model == "gpt-4o-mini"
+    assert agents.created[0]["definition"].model == "gpt-6-luna"
 
 
-@pytest.mark.parametrize("model", ["gpt-6-luna", "gpt-6-sol"])
+@pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-4o-mini", "gpt-4.1"])
 @pytest.mark.parametrize("mode", ["plan", "refine"])
-def test_unverified_models_are_blocked_before_any_agent_version_call(
+def test_unsupported_models_are_blocked_before_any_agent_version_call(
     model: str, mode: str,
 ) -> None:
     project = Mock()
-    with pytest.raises(ValueError, match="compatibility gate"):
+    with pytest.raises(ValueError, match="only gpt-6-luna is enabled"):
         agent.create_agent(project, mode=mode, model=model)
     assert project.mock_calls == []
 
 
-@pytest.mark.parametrize("model", ["gpt-6-luna", "gpt-6-sol"])
-def test_unverified_models_cannot_run_an_existing_agent(
+@pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-4o-mini", "gpt-4.1"])
+def test_unsupported_models_cannot_run_an_existing_agent(
     model: str, tmp_path: Path,
 ) -> None:
     client = Mock()
-    with pytest.raises(ValueError, match="compatibility gate"):
+    with pytest.raises(ValueError, match="only gpt-6-luna is enabled"):
         agent.run_agent(
             client, agent_for(model), tmp_path,
             ProjectConfig(name="synthetic", purpose="", users="", stage="active"),
@@ -93,15 +92,15 @@ def test_unverified_models_cannot_run_an_existing_agent(
         )
     assert client.mock_calls == []
 
-def test_iac_and_env_defaults_cannot_promote_an_unconfigured_job() -> None:
+
+def test_iac_and_env_defaults_name_luna() -> None:
     root = Path(__file__).resolve().parents[1]
     template = (root / "infrastructure" / "main.bicep").read_text(encoding="utf-8")
     example = (root / ".env.example").read_text(encoding="utf-8")
-    assert "param foundryDeployment string = 'gpt-4o-mini'" in template
-    assert "@allowed(['gpt-4.1', 'gpt-4o-mini'])" in template
-    assert "FOUNDRY_DEFAULT_DEPLOYMENT=gpt-4o-mini" in example
+    assert "param foundryDeployment string = 'gpt-6-luna'" in template
+    assert "@allowed(['gpt-6-luna'])" in template
+    assert "FOUNDRY_DEFAULT_DEPLOYMENT=gpt-6-luna" in example
     assert "HEALTH_SCAN_MODEL=gpt-6-luna" in example
-
 
 @pytest.mark.parametrize("arguments", [
     ["--manifest", "synthetic.json", "--mode", "plan", "--model", "gpt-6-sol"],
@@ -120,8 +119,8 @@ def test_sol_cannot_enter_fleet_or_write_modes(
     process.assert_not_called()
 
 
-@pytest.mark.parametrize("model", ["gpt-6-luna", "gpt-6-sol"])
-def test_unverified_classic_model_cannot_become_the_implicit_default(
+@pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-4o-mini", "gpt-4.1"])
+def test_unsupported_model_cannot_become_the_implicit_default(
     monkeypatch: pytest.MonkeyPatch, model: str,
 ) -> None:
     monkeypatch.setenv("FOUNDRY_DEFAULT_DEPLOYMENT", model)
@@ -134,8 +133,8 @@ def test_unverified_classic_model_cannot_become_the_implicit_default(
     process.assert_not_called()
 
 
-@pytest.mark.parametrize("model", ["gpt-6-luna", "gpt-6-sol"])
-def test_manual_permission_is_not_a_classic_compatibility_gate(
+@pytest.mark.parametrize("model", ["gpt-4o-mini", "gpt-4.1"])
+def test_manual_override_cannot_select_a_retiring_model(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, model: str,
 ) -> None:
     monkeypatch.setattr("sys.argv", [
@@ -150,10 +149,10 @@ def test_manual_permission_is_not_a_classic_compatibility_gate(
     process.assert_not_called()
 
 
-def test_health_chat_is_independent_of_a_rejected_classic_default(
+def test_health_chat_is_independent_of_a_rejected_planning_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("FOUNDRY_DEFAULT_DEPLOYMENT", "gpt-6-luna")
+    monkeypatch.setenv("FOUNDRY_DEFAULT_DEPLOYMENT", "gpt-4o-mini")
     monkeypatch.setattr("sys.argv", [
         "autorefine", "--repo", "example/synthetic", "--mode", "health-scan", "--dry-run",
     ])
@@ -182,8 +181,8 @@ def test_unknown_model_has_no_silent_price_default() -> None:
     assert estimate["cost_basis"] == "unavailable"
 
 
-def test_reasoning_effort_is_not_set_on_any_agent_version() -> None:
-    # Gated models stay blocked; admitted ones must not be told about effort they ignore.
+def test_reasoning_effort_none_is_set_on_every_luna_agent_version() -> None:
+    # Reasoning tokens bill as output; routine planning must not buy them.
     for mode in ("plan", "refine"):
-        for model in ("gpt-4o-mini", "gpt-4.1"):
-            assert agent.build_agent_definition(mode, model).reasoning is None
+        definition = agent.build_agent_definition(mode, "gpt-6-luna")
+        assert definition.reasoning.effort == "none"

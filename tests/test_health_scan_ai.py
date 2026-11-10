@@ -368,20 +368,17 @@ def test_unusable_max_tokens_env_falls_back_to_the_default(
 
 
 @pytest.mark.parametrize("model", ["gpt-4.1", "gpt-4o-mini"])
-def test_health_scan_model_env_preserves_callable_rollback(
+def test_health_scan_old_rollback_models_are_rejected(
     monkeypatch: pytest.MonkeyPatch, model: str,
 ) -> None:
+    # Both retire 2027-04-14; a rollback to them is no longer a safe default.
     monkeypatch.setenv("HEALTH_SCAN_MODEL", model)
 
     with mock_openai(CLEAN_JSON) as ctor:
-        health_scan.analyze_with_ai({}, {})
+        result = health_scan.analyze_with_ai({}, {})
 
-    options = ctor.client.chat.completions.create.call_args.kwargs
-    assert options["model"] == model
-    assert options["max_tokens"] == 4000
-    assert options["temperature"] == 0.1
-    assert "reasoning_effort" not in options
-    assert "max_completion_tokens" not in options
+    assert "error" in result
+    ctor.client.chat.completions.create.assert_not_called()
 
 
 @pytest.mark.parametrize("model", ["gpt-6-sol", "unknown-alias"])

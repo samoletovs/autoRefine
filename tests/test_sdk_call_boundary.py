@@ -260,7 +260,7 @@ def test_real_sdk_blocked_auth_cannot_hold_the_caller_or_reuse_closed_state(
             return httpx.Response(200, json={"id": "resp_1", "object": "response", "deleted": True})
         return httpx.Response(200, json={
             "id": "resp_1", "object": "response", "created_at": 0, "status": "completed",
-            "model": "gpt-4o-mini", "output": [], "parallel_tool_calls": True,
+            "model": "gpt-6-luna", "output": [], "parallel_tool_calls": True,
             "tool_choice": "auto", "tools": [],
         })
 

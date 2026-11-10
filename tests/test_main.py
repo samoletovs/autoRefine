@@ -260,7 +260,7 @@ def test_main_plan_passes_model_to_plan_project(
                 "--mode",
                 "plan",
                 "--model",
-                "gpt-4.1",
+                "gpt-6-luna",
                 "--workdir",
                 str(tmp_path),
             ],
@@ -274,15 +274,15 @@ def test_main_plan_passes_model_to_plan_project(
         main()
 
     assert mock_plan.call_count == 1
-    assert mock_plan.call_args.kwargs["model"] == "gpt-4.1"
+    assert mock_plan.call_args.kwargs["model"] == "gpt-6-luna"
 
 
 @pytest.mark.parametrize(
     ("deployment", "model_args", "expected"),
     [
-        (None, [], "gpt-4o-mini"),
-        ("gpt-4.1", [], "gpt-4.1"),
-        ("gpt-4.1", ["--model", "gpt-4o-mini"], "gpt-4o-mini"),
+        (None, [], "gpt-6-luna"),
+        ("gpt-6-luna", [], "gpt-6-luna"),
+        ("gpt-6-luna", ["--model", "gpt-6-luna"], "gpt-6-luna"),
     ],
 )
 def test_file_ideas_uses_same_model_for_both_planning_passes(
@@ -333,7 +333,7 @@ def test_main_refine_passes_model_to_plan_and_refine(
                 "--mode",
                 "refine",
                 "--model",
-                "gpt-4.1",
+                "gpt-6-luna",
                 "--workdir",
                 str(tmp_path),
             ],
@@ -347,8 +347,8 @@ def test_main_refine_passes_model_to_plan_and_refine(
     ):
         main()
 
-    assert mock_plan.call_args.kwargs["model"] == "gpt-4.1"
-    assert mock_refine.call_args.kwargs["model"] == "gpt-4.1"
+    assert mock_plan.call_args.kwargs["model"] == "gpt-6-luna"
+    assert mock_refine.call_args.kwargs["model"] == "gpt-6-luna"
 
 
 def test_plan_project_passes_model_to_create_agent(
@@ -371,12 +371,12 @@ def test_plan_project_passes_model_to_create_agent(
             "agent.foundry_agent.run_agent", return_value={"score": 80, "improvements": []},
         ) as mock_run,
     ):
-        result = main_module.plan_project(tmp_path, project_config, findings=[], model="gpt-4.1")
+        result = main_module.plan_project(tmp_path, project_config, findings=[], model="gpt-6-luna")
 
     assert result == {"score": 80, "improvements": []}
     mock_open.assert_called_once_with("https://example.test")
     assert mock_create.call_args.args == (fake_project,)
-    assert mock_create.call_args.kwargs["model"] == "gpt-4.1"
+    assert mock_create.call_args.kwargs["model"] == "gpt-6-luna"
     assert mock_run.call_args.args[:2] == (fake_client, "agent-1")
     assert fake_project.agents.mock_calls == []
 
@@ -414,10 +414,10 @@ def test_refine_project_passes_model_to_create_agent(
         patch("agent.tools.github_tools.create_pr", return_value=True),
     ):
         result = main_module.refine_project(
-            tmp_path, project_config, {"improvements": [{"title": "x", "description": "y"}]}, "owner/repo", model="gpt-4.1"
+            tmp_path, project_config, {"improvements": [{"title": "x", "description": "y"}]}, "owner/repo", model="gpt-6-luna"
         )
 
     assert result is True
-    assert mock_create.call_args.kwargs["model"] == "gpt-4.1"
+    assert mock_create.call_args.kwargs["model"] == "gpt-6-luna"
     assert mock_create.call_args.kwargs["mode"] == "refine"
     assert fake_project.agents.mock_calls == []

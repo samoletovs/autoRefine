@@ -715,22 +715,18 @@ Do NOT create issues for: subjective improvements, architecture decisions, or is
     )
 
     try:
-        if model not in {"gpt-6-luna", "gpt-4.1", "gpt-4o-mini"}:
-            raise ValueError("HEALTH_SCAN_MODEL must be gpt-6-luna or a supported rollback model")
+        if model != "gpt-6-luna":
+            raise ValueError("HEALTH_SCAN_MODEL must be gpt-6-luna")
         if max_tokens > 4000:
-            raise ValueError("HEALTH_SCAN_MAX_TOKENS must be <= 4000 during the pilot")
-        options = (
-            {"max_completion_tokens": max_tokens, "reasoning_effort": "none"}
-            if model == "gpt-6-luna"
-            else {"max_tokens": max_tokens, "temperature": 0.1}
-        )
+            raise ValueError("HEALTH_SCAN_MAX_TOKENS must be <= 4000")
         response = client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_msg},
             ],
-            **options,
+            max_completion_tokens=max_tokens,
+            reasoning_effort="none",
         )
         choice = response.choices[0]
         raw = (choice.message.content or "").strip()
@@ -746,7 +742,7 @@ Do NOT create issues for: subjective improvements, architecture decisions, or is
                 max_tokens,
             )
             raise ValueError(
-                f"model reply truncated at max_tokens={max_tokens}"
+                f"model reply truncated at max_completion_tokens={max_tokens}"
             )
         if getattr(choice, "finish_reason", None) not in {None, "stop"}:
             raise ValueError("model reply did not complete normally")
