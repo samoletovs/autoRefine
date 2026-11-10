@@ -90,6 +90,8 @@ _drift_shebang='#!/bin/sh'
 # drift:end
 
 cd /app
+# budget-gate:begin
+# The policy path below is substituted by the test.
 echo "==> [3/6] validating the published budget policy"
 if python -m agent.budget_policy --policy /gov/config/azure-budget.json; then
   echo "==> scheduled inference is permitted"
@@ -102,6 +104,7 @@ else
   echo "!!! budget policy could not be validated; scheduled inference is disabled"
   exit "${policy_status}"
 fi
+# budget-gate:end
 
 echo "==> [4/6] installing dependencies"
 # Not --quiet: if pip dies the last line before the silence is the only clue we get.
@@ -125,8 +128,8 @@ export AUTOREFINE_COST_LOG="${COST_LOG}"
 # allowing report and cost persistence to finish; the next daily schedule is the retry,
 # not a full container replay of completed inference.
 REPORT_PATH=/tmp/autorefine-report.json
-agent_status=0
 # agent-run:begin
+agent_status=0
 if python -m agent.main \
   --manifest /gov/config/workspace-manifest.json \
   --mode file-ideas \
