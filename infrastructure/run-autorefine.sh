@@ -29,13 +29,13 @@ GH_VERSION=2.63.2
 # python base image has git but not gh. Installed from the release tarball rather than apt
 # so there is no third-party apt repo or signing key to manage. gh reads GH_TOKEN itself,
 # so no `gh auth login` is needed.
-echo "==> [1/5] installing GitHub CLI ${GH_VERSION}"
+echo "==> [1/6] installing GitHub CLI ${GH_VERSION}"
 curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" -o /tmp/gh.tgz
 tar -xzf /tmp/gh.tgz -C /tmp
 install -m 0755 "/tmp/gh_${GH_VERSION}_linux_amd64/bin/gh" /usr/local/bin/gh
 gh --version
 
-echo "==> [2/5] cloning autoRefine + governance"
+echo "==> [2/6] cloning autoRefine + governance"
 git clone --depth 1 "${AUTH}/samoletovs/autoRefine.git" /app
 git clone --depth 1 "${AUTH}/samoletovs/nauroLabs-github.git" /gov
 
@@ -60,9 +60,8 @@ git clone --depth 1 "${AUTH}/samoletovs/nauroLabs-github.git" /gov
 # drift warning that fires when the check itself is broken is an alarm nobody reads.
 # Absence of both lines below is what "could not check" looks like.
 #
-# The block is `|| true` for the same reason as the cost commit at the bottom: set -e is
-# on and replicaRetryLimit would re-run the entire sweep, so a diagnostic must never be
-# able to buy a second 2h pass.
+# The block is `|| true` because this diagnostic cannot always establish an answer; a
+# missing or unreadable /proc entry is not itself a reason to stop the scheduled run.
 # drift:begin -- the two paths below are substituted by the test
 _drift_cmdline=/proc/1/cmdline
 _drift_repo_copy=/app/infrastructure/run-autorefine.sh
@@ -91,12 +90,28 @@ _drift_shebang='#!/bin/sh'
 # drift:end
 
 cd /app
-echo "==> [3/5] installing dependencies"
+# budget-gate:begin
+# The policy path below is substituted by the test.
+echo "==> [3/6] validating the published budget policy"
+if python -m agent.budget_policy --policy /gov/config/azure-budget.json; then
+  echo "==> scheduled inference is permitted"
+else
+  policy_status=$?
+  if [ "${policy_status}" -eq 3 ]; then
+    echo "==> scheduled inference skipped by the budget policy"
+    exit 0
+  fi
+  echo "!!! budget policy could not be validated; scheduled inference is disabled"
+  exit "${policy_status}"
+fi
+# budget-gate:end
+
+echo "==> [4/6] installing dependencies"
 # Not --quiet: if pip dies the last line before the silence is the only clue we get.
 pip install --no-cache-dir --progress-bar off -r requirements.txt
 
 mkdir -p "${WORK}"
-echo "==> [4/5] evaluating all projects"
+echo "==> [5/6] evaluating all projects"
 # The agent resolves scripts/file-idea.py and the wiki from the governance repo. Without
 # this it silently files zero ideas, which is the entire point of file-ideas mode, and it
 # re-clones governance once per project. The retired workflow used a .github-gov checkout;
@@ -108,29 +123,37 @@ export NAURO_GOVERNANCE_PATH=/gov
 # below, into the channel this script already treats as data.
 COST_LOG=/tmp/autorefine-cost.jsonl
 export AUTOREFINE_COST_LOG="${COST_LOG}"
-# Mirrors the retired workflow: manifest-driven, file-ideas mode. Never fail the job on a
-# single project's error — the agent already logs per-project failures and the report is
-# written regardless. stderr stays on the console so progress is visible live; stdout is
-# the report, so it is captured as data.
-python -m agent.main \
+# Mirrors the retired workflow: manifest-driven, file-ideas mode. The agent continues
+# after per-project errors and writes a partial report. Keep its failure status while
+# allowing report and cost persistence to finish; the next daily schedule is the retry,
+# not a full container replay of completed inference.
+REPORT_PATH=/tmp/autorefine-report.json
+# agent-run:begin
+agent_status=0
+if python -m agent.main \
   --manifest /gov/config/workspace-manifest.json \
   --mode file-ideas \
   --workdir "${WORK}" \
-  > /tmp/autorefine-report.json || echo "!!! agent.main exited non-zero"
+  > "${REPORT_PATH}"; then
+  echo "==> agent.main completed"
+else
+  agent_status=$?
+  echo "!!! agent.main exited non-zero: ${agent_status}"
+fi
+# agent-run:end
 
-echo "==> [5/5] report"
+echo "==> [6/6] report"
 # Console-log ingestion drops lines, so counting the report objects is the only trustworthy
 # measure of how many projects were actually processed.
-echo "==> projects in report: $(grep -c '^  \"project\":' /tmp/autorefine-report.json || echo 0)"
-tail -c 4000 /tmp/autorefine-report.json || true
+echo "==> projects in report: $(grep -c '^  \"project\":' "${REPORT_PATH}" || echo 0)"
+tail -c 4000 "${REPORT_PATH}" || true
 
 # Persist the cost rows: one PUT, inside a job that has already run for ~2h, so this adds
 # no scheduled run and no billed minute. A new file per sweep (same naming idea as the
 # health report) means no read-modify-write and nothing to conflict on.
 #
-# Every step here is best-effort and the whole block is `|| true`. `set -e` is on, and a
-# non-zero exit would let replicaRetryLimit re-run the entire 116-minute sweep — paying
-# for a second pass because telemetry failed would invert the point of measuring cost.
+# Every step here is best-effort; publishing optional telemetry must not conceal the
+# inference result.
 if [ -s "${COST_LOG}" ]; then
   echo "==> committing $(wc -l < "${COST_LOG}") cost row(s)"
   {
@@ -144,5 +167,12 @@ if [ -s "${COST_LOG}" ]; then
 else
   echo "==> no cost rows to commit"
 fi
+
+# agent-status:begin
+if [ "${agent_status}" -ne 0 ]; then
+  echo "!!! autoRefine failed after report and cost persistence (exit ${agent_status})"
+  exit "${agent_status}"
+fi
+# agent-status:end
 
 echo "==> done"

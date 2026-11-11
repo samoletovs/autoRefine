@@ -173,3 +173,23 @@ def test_ci_runs_on_infrastructure_changes(event: str) -> None:
         f"deployment template. Add '{INFRA_DIR.name}/**' to that path filter.\n"
         f"  current paths: {paths}"
     )
+
+
+def test_budget_policy_is_checked_before_dependency_install() -> None:
+    entrypoint = (INFRA_DIR / "run-autorefine.sh").read_text(encoding="utf-8")
+
+    policy_check = re.search(r"(?m)^if python -m agent\.budget_policy\b", entrypoint)
+    dependency_install = re.search(r"(?m)^pip install\b", entrypoint)
+
+    assert policy_check is not None
+    assert dependency_install is not None
+    assert policy_check.start() < dependency_install.start()
+
+
+def test_failed_sweep_is_not_replayed_as_a_container_retry() -> None:
+    template = BICEP.read_text(encoding="utf-8")
+
+    assert re.search(r"replicaRetryLimit:\s*0\b", template), (
+        "the report/cost-preserving failure path must not cause Container Apps "
+        "to repeat completed inference for the whole sweep"
+    )

@@ -20,8 +20,7 @@ that can drift from it.
 shape, unreadable ``/proc``, a PID 1 that is not this script, a missing clone —
 must print nothing at all, because a drift warning that fires when the check
 itself is broken is an alarm nobody reads. And nothing here may exit non-zero:
-``set -eu`` is on and ``replicaRetryLimit: 1`` would re-run the whole ~2h sweep
-because a diagnostic failed.
+``set -eu`` is on, so a diagnostic failure would abort the useful sweep.
 """
 
 from __future__ import annotations
@@ -253,12 +252,7 @@ def test_says_nothing_when_it_cannot_establish_an_answer(
 def test_never_exits_non_zero(
     tmp_path: Path, case: str, cmdline_kind: str, master_kind: str
 ) -> None:
-    """``set -e`` is on and ``replicaRetryLimit: 1`` re-runs the entire sweep.
-
-    A diagnostic that can fail the job would buy a second ~2h Foundry pass
-    because a comparison went wrong — the same inversion the cost-commit block
-    at the bottom of the script is wrapped against.
-    """
+    """A diagnostic failure must not abort the useful sweep under ``set -e``."""
     live = _script_text()
     cmdline = {
         "live": _cmdline(live),
@@ -273,7 +267,7 @@ def test_never_exits_non_zero(
 
     assert result.returncode == 0, (
         f"{case}: the drift block exited {result.returncode}. Under set -e that "
-        f"ends the job, and replicaRetryLimit re-runs the whole sweep.\n"
+        f"ends the job instead of allowing the useful sweep to continue.\n"
         f"stderr: {result.stderr}"
     )
 
