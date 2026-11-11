@@ -45,7 +45,7 @@ strong models only where the cost is bounded.
 | Routine | `evaluate` (deterministic, no LLM) + `health-scan` AI analyst | `gpt-6-luna` | `HEALTH_SCAN_MODEL` (luna only) |
 | Routine planning | `plan` / `refine` / `file-ideas` Foundry prompt agent (`autorefine-plan` / `autorefine-refine`) | `gpt-6-luna` | `FOUNDRY_DEFAULT_DEPLOYMENT`, or CLI `--model`; luna only |
 | Deep (blocked) | Prepared single-repo planning path | `gpt-6-sol` candidate, not enabled | Manual overrides cannot bypass the allowlist |
-| Deep (rare) | Closed-loop PR reviewer (lives in `samoletovs/nauroLabs-github/scripts/claude-deep-review.py`, **not** in this repo) | `claude-opus-4` with `claude-sonnet-4` fallback, via GitHub Models | configured in the governance repo |
+| None | PR review and merge for this repo | no model: `pr-janitor` in `samoletovs/nauroLabs-github` merges after CI and escalates high-risk paths to a human | not configurable here |
 
 Bump rules:
 
@@ -80,9 +80,14 @@ Bump rules:
 - The existing Container Apps Job has no model override and clones Python at
   startup, so a code-default change reaches it on the next run without an IaC
   deployment.
-- The **PR reviewer** path (Claude Opus 4 via GitHub Models) is configured
-  outside this repo because the merge gate lives in the governance
-  workflows. See `samoletovs/nauroLabs-github` → `.github/workflows/auto-review.yml`.
+- This repo has **no merge workflow and no LLM PR reviewer**. Its own
+  `auto-review.yml` and `claude-deep-review.py` were retired on 2026-11-11: the
+  reviewer called the retired GitHub Models endpoint, and because `agent/` and
+  `scripts/` were listed as both low- and high-risk, a degraded review let source
+  changes merge on CI alone. `pr-janitor` in `samoletovs/nauroLabs-github` is the
+  single merger; it escalates any PR touching high-risk paths (scripts,
+  workflows, infrastructure, auth/secret/credential) to a human. Changes under
+  `agent/` merge once CI passes, like product code in every other repo.
 
 ## Where things live
 

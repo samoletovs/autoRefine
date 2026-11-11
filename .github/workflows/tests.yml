@@ -1,9 +1,8 @@
 name: Tests
 
-# autoRefine is the lab's own evaluator — it scores ideas, files memos and, via
-# scripts/can-auto-merge.py, decides what merges unattended. It had 261 passing
-# tests and seven workflows, none of which ran them, so every change to the
-# thing that gates other changes went out unverified.
+# autoRefine is the lab's own evaluator — it scores ideas and files memos. It
+# had 261 passing tests and seven workflows, none of which ran them, so every
+# change to the thing that decides what the lab builds went out unverified.
 #
 # Deliberately a separate workflow rather than a step in an existing one: the
 # others are scheduled or issue-triggered, so they fire when nothing has

@@ -18,7 +18,6 @@ autorefine.egg-info/SOURCES.txt
 autorefine.egg-info/dependency_links.txt
 autorefine.egg-info/requires.txt
 autorefine.egg-info/top_level.txt
-tests/test_can_auto_merge.py
 tests/test_config.py
 tests/test_dashboard.py
 tests/test_foundry_agent.py
