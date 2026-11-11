@@ -226,8 +226,8 @@ autoRefine is a **Foundry hosted agent** with function-calling tools:
 
 - **Model**: `gpt-6-luna` for Foundry agent planning and health Chat.
   Sol, including explicit manual Sol plans, remains blocked.
-  The closed-loop PR reviewer (deep-review) lives in `samoletovs/nauroLabs-github`
-  and uses Claude Opus 4 (via GitHub Models) — see that repo's AGENT_ROLES.md.
+  PRs here are merged by `pr-janitor` in `samoletovs/nauroLabs-github` after CI
+  passes; high-risk paths wait for a human. See AGENTS.md "Model strategy".
 - **Tools**: GitHub API, file system, test runner, quality checkers
 - **Human-in-the-loop**: agent asks for confirmation on risky or uncertain changes
 - **Safety**: all changes are made on branches, tested, and submitted as PRs — never direct to main
