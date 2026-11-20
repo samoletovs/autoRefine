@@ -172,9 +172,13 @@ count, credentials, schedule or spending limit is changed.
 
 The workflow column describes the **latest workflow**, with its actual name,
 not aggregate CI health. A failed scheduled check-in is still reported as a
-failure, but is not called a failed build. Health probes only cover the URL or
-`health_path` declared in the manifest; a working homepage does not prove every
-backend dependency is healthy.
+failure, but is not called a failed build. GitHub-managed `dynamic` runs
+(including Dependabot and Copilot) stay visible there but do not produce
+Telegram workflow alerts or automatic workflow investigation issues. Alerting
+instead checks the newest repository-managed run within the 20 most recent runs.
+Track dependency risk using current Dependabot alerts, not a historical updater
+run. Health probes only cover the URL or `health_path` declared in the manifest;
+a working homepage does not prove every backend dependency is healthy.
 
 Measured alerts also survive an AI outage; scores/advice and automatic issue
 creation remain unavailable until analysis recovers. Repeated HTTP 5xx telemetry
