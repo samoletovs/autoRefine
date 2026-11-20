@@ -343,18 +343,19 @@ def scan_github(token: str, repos: list[str]) -> dict[str, Any]:
             try:
                 resp = client.get(
                     f"https://api.github.com/repos/{full_name}/actions/runs",
-                    params={"per_page": 1},
+                    params={"per_page": 20},
                 )
                 resp.raise_for_status()
                 runs = resp.json().get("workflow_runs", [])
                 if runs:
-                    latest = runs[0]
-                    repo_data["ci_status"] = latest["conclusion"] or latest["status"]
-                    repo_data["ci_name"] = latest["name"]
-                    repo_data["ci_event"] = latest.get("event", "unknown")
-                    repo_data["ci_branch"] = latest.get("head_branch", "unknown")
-                    repo_data["ci_url"] = latest.get("html_url", "")
-                    repo_data["ci_workflow_id"] = latest.get("workflow_id", latest["name"])
+                    repo_data.update(_workflow_evidence(runs[0]))
+                    if repo_data["ci_event"] == "dynamic":
+                        repository_run = next(
+                            (run for run in runs if run.get("event") and run["event"] != "dynamic"),
+                            None,
+                        )
+                        if repository_run is not None:
+                            repo_data["latest_repository_run"] = _workflow_evidence(repository_run)
                 else:
                     repo_data["ci_status"] = "none"
             except httpx.HTTPError:
@@ -363,6 +364,18 @@ def scan_github(token: str, repos: list[str]) -> dict[str, Any]:
             results[repo] = repo_data
 
     return results
+
+
+def _workflow_evidence(run: dict[str, Any]) -> dict[str, Any]:
+    name = run["name"]
+    return {
+        "ci_status": run["conclusion"] or run["status"],
+        "ci_name": name,
+        "ci_event": run.get("event", "unknown"),
+        "ci_branch": run.get("head_branch", "unknown"),
+        "ci_url": run.get("html_url", ""),
+        "ci_workflow_id": run.get("workflow_id", name),
+    }
 
 
 # ── App Insights Scanner ───────────────────────────────────────────────────
@@ -668,6 +681,8 @@ RULES:
 - Bugs with open issues = lower health
 - ci_status is the LATEST WORKFLOW of any kind, not an aggregate CI/build verdict.
   Use its name, event, branch and run URL; never call a scheduled check-in a CI failure.
+- A dynamic run is GitHub-managed (e.g. Dependabot or Copilot). Do not use its
+  failure as evidence of a repository workflow failure or propose a rerun.
 - Projects with 0 commits in 7 days = momentum = 1
 - Use only the supplied Azure currency, billing-period dates and selected budget.
 - Compare actual costs and the explicitly labelled cycle-end projection with that budget.
