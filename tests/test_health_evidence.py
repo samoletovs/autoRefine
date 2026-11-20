@@ -358,6 +358,11 @@ def test_managed_run_does_not_mask_latest_repository_workflow(
     ]})]
 
     data = health_scan.scan_github("test-token", ["prime"])
+    workflow_calls = [
+        call for call in probe.get.call_args_list if call.args[0].endswith("/actions/runs")
+    ]
+    assert len(workflow_calls) == 1
+    assert workflow_calls[0].kwargs["params"] == {"per_page": 20}
     analysis = health_scan.ground_analysis(
         {"issues_to_create": [{"finding_id": "workflow:prime:17"}]}, data, {}, {}, {},
     )
