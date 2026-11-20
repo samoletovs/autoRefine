@@ -126,6 +126,30 @@ def test_latest_operational_failure_is_named_not_called_ci() -> None:
     assert "actions/runs/123" in analysis["alerts"][0]
 
 
+def test_managed_run_does_not_page_or_file_generic_workflow_work() -> None:
+    analysis = health_scan.ground_analysis(
+        {"issues_to_create": [
+            {"finding_id": "workflow:mindDesk:123"},
+            {"finding_id": "workflow:prime:456"},
+        ]},
+        {
+            "mindDesk": {
+                "ci_status": "failure", "ci_name": "npm_and_yarn update for minimatch",
+                "ci_event": "dynamic", "ci_workflow_id": 123,
+            },
+            "prime": {
+                "ci_status": "failure", "ci_name": "Deploy",
+                "ci_event": "push", "ci_workflow_id": 456,
+            },
+        }, {}, {}, {},
+    )
+
+    [alert] = analysis["alerts"]
+    assert "prime" in alert and "Deploy" in alert
+    [issue] = analysis["issues_to_create"]
+    assert issue["finding_id"] == "workflow:prime:456"
+
+
 def test_unsubstantiated_issue_body_never_reaches_filer() -> None:
     analysis = health_scan.ground_analysis({
         "alerts": ["era is broken"],
@@ -318,6 +342,35 @@ def test_workflow_scan_keeps_run_provenance(probe: Mock) -> None:
     assert result["ci_branch"] == "main"
     assert result["ci_url"].endswith("/123")
     assert result["ci_workflow_id"] == 17
+
+
+@pytest.mark.parametrize("conclusion", ["failure", "success"])
+def test_managed_run_does_not_mask_latest_repository_workflow(
+    probe: Mock, conclusion: str,
+) -> None:
+    request = httpx.Request("GET", "https://api.github.com")
+    probe.get.side_effect = [
+        httpx.Response(200, request=request, json=[]) for _ in range(4)
+    ] + [httpx.Response(200, request=request, json={"workflow_runs": [
+        {"name": "Dependabot", "conclusion": "failure", "event": "dynamic"},
+        {"name": "Deploy", "conclusion": conclusion, "event": "push", "workflow_id": 17},
+        {"name": "Older build", "conclusion": "failure", "event": "push"},
+    ]})]
+
+    data = health_scan.scan_github("test-token", ["prime"])
+    analysis = health_scan.ground_analysis(
+        {"issues_to_create": [{"finding_id": "workflow:prime:17"}]}, data, {}, {}, {},
+    )
+
+    assert data["prime"]["ci_name"] == "Dependabot"
+    if conclusion == "failure":
+        [alert] = analysis["alerts"]
+        assert "'Deploy' failure" in alert
+        [issue] = analysis["issues_to_create"]
+        assert issue["finding_id"] == "workflow:prime:17"
+    else:
+        assert analysis["alerts"] == []
+        assert analysis["issues_to_create"] == []
 
 
 def test_model_failure_does_not_hide_measured_outage() -> None:
