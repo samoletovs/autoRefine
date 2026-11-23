@@ -761,18 +761,6 @@ def _build_file_idea_command(
     description = improvement.get("description", "").strip() or "No description provided."
     category = improvement.get("category", "quality")
     idea_type = _map_improvement_type(category)
-    if "evidence_status" in improvement:
-        evidence = improvement.get("evidence", [])
-        details = "\n".join(
-            f"- `{entry['path']}`: {entry['excerpt']}"
-            for entry in evidence
-            if isinstance(entry, dict) and "path" in entry and "excerpt" in entry
-        )
-        references += "\n- Repository evidence: " + (
-            "context only; the proposed gap is not verified" if details else "unverified"
-        )
-        if details:
-            references += "\n" + details
     memo_body = _build_idea_memo(improvement, references)
 
     cmd = [sys.executable, str(script_path)]
@@ -1560,6 +1548,11 @@ def handle_functional_ideas(
     ``cards`` files them as `needs-approval` + sends Telegram approval cards.
     ``notifier`` / ``filer`` / ``carder`` are injectable for tests.
     """
+    if mode in {"file", "cards"}:
+        plan = {**plan, "improvements": [
+            item for item in plan.get("improvements", [])
+            if isinstance(item, dict) and item.get("evidence_status") != "unverified"
+        ]}
     selected = _select_functional_improvements(plan)
     if not selected:
         log.info("No functional ideas selected for %s", repo)
@@ -1967,6 +1960,7 @@ def run_dashboard_mode(
     analysis = analyze_with_ai(github_data, cost_data, app_insights_data, url_health_data)
     analysis = ground_analysis(analysis, github_data, cost_data, app_insights_data, url_health_data)
 
+    suggestions = []
     if report_path:
         from agent.parse_scores import extract_json_objects
 
@@ -1978,7 +1972,6 @@ def run_dashboard_mode(
         analysis["quality_coverage"] = [
             report for report in reports if "project" in report and "score" in report
         ]
-        suggestions = list(analysis.get("feature_suggestions") or [])
         for report in reports:
             plan = report.get("functional_plan")
             items = plan.get("improvements", []) if isinstance(plan, dict) else (
@@ -1989,10 +1982,10 @@ def run_dashboard_mode(
                     {**item, "repo": report.get("repo")}
                     for item in items if isinstance(item, dict)
                 )
-        analysis["feature_suggestions"] = suggestions
 
     html = render_html_dashboard(
-        github_data, cost_data, analysis, app_insights_data, url_health_data
+        github_data, cost_data, analysis, app_insights_data, url_health_data,
+        repository_suggestions=suggestions,
     )
     out_path = Path(output)
     out_path.write_text(html, encoding="utf-8")

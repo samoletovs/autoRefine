@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 from pathlib import Path
 
 from agent.config import ProjectConfig
@@ -14,7 +15,12 @@ _EXCLUDED = {"node_modules", "vendor", "dist", "build", "coverage", "__pycache__
 _STOP_WORDS = {"improve", "support", "create", "provide", "users", "using", "features",
                "feature", "product", "application", "project", "enable", "with", "from"}
 _SENSITIVE = re.compile(
-    r"(?i)(secret|password|credential|api[_-]?key|access[_-]?token|private[_-]?key|bearer\s)"
+    r"(?i)(secret|password|credential|api[_-]?key|access[_-]?token|private[_-]?key|bearer\s|"
+    r"[a-z][a-z0-9+.-]*://|[a-z0-9+/=_-]{32,})"
+)
+_DECLARATION = re.compile(
+    r"^(?:#{1,6}\s+|(?:(?:export|default|public|private|async|static|abstract)\s+)*"
+    r"(?:def|class|function|func|fn|interface|struct|type)\s+)"
 )
 
 
@@ -27,6 +33,20 @@ def repository_inventory(project_dir: Path, config: ProjectConfig) -> list[dict[
     }
     if not terms:
         return []
+    try:
+        root = subprocess.run(
+            ["git", "-C", str(project_dir), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=5, check=True,
+        ).stdout.strip()
+        if Path(root).resolve() != project_dir.resolve():
+            return []
+        tracked = subprocess.run(
+            ["git", "-C", str(project_dir), "ls-files", "-z", "--cached"],
+            capture_output=True, timeout=5, check=True,
+        ).stdout.decode("utf-8").split("\0")
+    except (OSError, UnicodeError, subprocess.SubprocessError):
+        return []
+    tracked_paths = set(tracked)
     inventory: list[dict[str, str]] = []
     scanned = 0
     for visited, (root, dirs, files) in enumerate(os.walk(project_dir, followlinks=False), 1):
@@ -39,7 +59,8 @@ def repository_inventory(project_dir: Path, config: ProjectConfig) -> list[dict[
         for name in sorted(files):
             path = Path(root) / name
             if (name.startswith(".") or path.suffix.lower() not in _SUFFIXES
-                    or _SENSITIVE.search(name) or path.is_symlink()):
+                    or _SENSITIVE.search(name) or path.is_symlink()
+                    or path.relative_to(project_dir).as_posix() not in tracked_paths):
                 continue
             scanned += 1
             if scanned > 500:
@@ -55,7 +76,8 @@ def repository_inventory(project_dir: Path, config: ProjectConfig) -> list[dict[
             for line in lines:
                 excerpt = line.strip()
                 words = set(re.findall(r"[a-z0-9]+", excerpt.lower()))
-                if terms & words and excerpt and not _SENSITIVE.search(excerpt):
+                if (terms & words and _DECLARATION.match(excerpt) and not _SENSITIVE.search(excerpt)
+                        and not any(char in excerpt for char in ("'", '"', "`"))):
                     inventory.append({
                         "path": path.relative_to(project_dir).as_posix(),
                         "excerpt": excerpt[:200],

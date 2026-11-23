@@ -283,7 +283,9 @@ def _render_list(items: list[Any], ordered: bool = False) -> str:
     return f"<{tag}>{lis}</{tag}>"
 
 
-def _render_feature_suggestions(suggestions: list[Any]) -> str:
+def _render_feature_suggestions(
+    suggestions: list[Any], *, verified_evidence: bool = False,
+) -> str:
     """Render feature/improvement suggestions as a card list.
 
     Each suggestion is expected to be a dict with ``title``, ``description``,
@@ -355,7 +357,7 @@ def _render_feature_suggestions(suggestions: list[Any]) -> str:
         desc_html = f"<div class=\"suggestion-desc\">{desc}</div>" if desc else ""
         evidence = s.get("evidence")
         evidence_html = ""
-        if isinstance(evidence, list) and evidence:
+        if verified_evidence and isinstance(evidence, list) and evidence:
             entries = []
             repo = s.get("repo")
             for entry in evidence:
@@ -458,6 +460,7 @@ def render_html_dashboard(
     app_insights_data: dict[str, Any] | None = None,
     url_health_data: dict[str, Any] | None = None,
     refresh_seconds: int = 300,
+    repository_suggestions: list[Any] | None = None,
 ) -> str:
     """Return a self-contained HTML dashboard page from health-scan data.
 
@@ -509,7 +512,14 @@ def render_html_dashboard(
             "measured alerts remain below.</p>" + alerts_html
         )
     recs_html = _render_list(recs, ordered=True)
-    suggestions_html = _render_feature_suggestions(feature_suggestions)
+    if repository_suggestions:
+        suggestions_html = _render_feature_suggestions(
+            repository_suggestions, verified_evidence=True,
+        )
+        if feature_suggestions:
+            suggestions_html += _render_feature_suggestions(feature_suggestions)
+    else:
+        suggestions_html = _render_feature_suggestions(feature_suggestions)
     progress_html = _render_progress_tracking(github_data)
 
     issues_rows = "".join(

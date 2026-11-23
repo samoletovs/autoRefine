@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -66,6 +67,8 @@ def _wire_functional(monkeypatch: pytest.MonkeyPatch, client: _ToolLoopClient) -
 
 def test_functional_plan_preserves_inventory_citation_through_dispatcher(tmp_path, monkeypatch):
     (tmp_path / "export.py").write_text("def export(rows): pass\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "add", "export.py"], check=True)
     config = _config()
     config.goals = ["Export visible rows"]
     plan = valid_plan()

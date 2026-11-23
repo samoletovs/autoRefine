@@ -119,9 +119,10 @@ python -m agent.main --repo owner/repo --mode evaluate
 
 The output is a JSON object containing the project name, score, findings, measurement
 coverage, and feature suggestions.
-Feature suggestions include short matching repository excerpts where available.
+Feature suggestions include short matching declarations or headings from tracked
+repository files where available. Non-Git directories do not produce an inventory.
 An excerpt supplies context, not proof that a proposed capability is missing; suggestions
-without a matching citation are marked unverified.
+without a matching citation are marked unverified and are not automatically filed.
 
 ### Generate an improvement plan
 
