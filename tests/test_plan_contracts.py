@@ -64,6 +64,23 @@ def _wire_functional(monkeypatch: pytest.MonkeyPatch, client: _ToolLoopClient) -
     monkeypatch.setattr(m.time, "sleep", lambda seconds: None)
 
 
+def test_functional_plan_preserves_inventory_citation_through_dispatcher(tmp_path, monkeypatch):
+    (tmp_path / "export.py").write_text("def export(rows): pass\n", encoding="utf-8")
+    config = _config()
+    config.goals = ["Export visible rows"]
+    plan = valid_plan()
+    plan["improvements"][0]["evidence"] = [{"path": "export.py"}]
+    client = _ToolLoopClient(lambda round_no: _submit(plan) if round_no == 1 else None)
+    _wire_functional(monkeypatch, client)
+
+    result = m.plan_functional(tmp_path, config)
+
+    assert result["improvements"][0]["evidence"] == [
+        {"path": "export.py", "excerpt": "def export(rows): pass"}
+    ]
+    assert result["improvements"][0]["evidence_status"] == "repository-context"
+
+
 @pytest.mark.parametrize("mode", ["propose", "file", "cards"])
 @pytest.mark.parametrize("empty", [[], "[]", " [ ]\n"])
 def test_evidenced_no_gap_finishes_without_retry_filer_or_notification(
@@ -116,7 +133,9 @@ def test_missing_or_transient_output_still_retries_then_returns_a_valid_plan(
 
     result = m.plan_functional(tmp_path, _config())
 
-    assert result["improvements"] == valid_plan()["improvements"]
+    expected = valid_plan()["improvements"][0]
+    assert {key: result["improvements"][0][key] for key in expected} == expected
+    assert result["improvements"][0]["evidence_status"] == "unverified"
     assert _first_requests(client) == 2
     assert client.deleted == client.created == ["resp-1", "resp-2", "resp-3"]
 

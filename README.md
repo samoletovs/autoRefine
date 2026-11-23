@@ -119,6 +119,9 @@ python -m agent.main --repo owner/repo --mode evaluate
 
 The output is a JSON object containing the project name, score, findings, measurement
 coverage, and feature suggestions.
+Feature suggestions include short matching repository excerpts where available.
+An excerpt supplies context, not proof that a proposed capability is missing; suggestions
+without a matching citation are marked unverified.
 
 ### Generate an improvement plan
 
@@ -142,6 +145,10 @@ python -m agent.main --repo owner/repo --mode file-ideas --dry-run
 
 The command prints the evaluation report and runs planning, but suppresses issue creation
 and Telegram delivery. Foundry is still called and may incur usage charges.
+When functional ideation is enabled, its plan is also printed as JSON with repository
+citations checked against the bounded inventory. Save this output and pass it to dashboard
+mode with `--report` to show the suggestions and their GitHub file links. Local reports
+without a repository identity show paths without links.
 
 ### Evaluate a workspace manifest
 
