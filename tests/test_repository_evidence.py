@@ -20,6 +20,10 @@ def _config() -> ProjectConfig:
 def _track(root, *paths):
     subprocess.run(["git", "init", "-q", str(root)], check=True)
     subprocess.run(["git", "-C", str(root), "add", "--", *paths], check=True)
+    subprocess.run(
+        ["git", "-C", str(root), "-c", "user.name=Test", "-c",
+         "user.email=test@example.invalid", "commit", "-qm", "fixture"], check=True,
+    )
 
 
 def test_evaluation_suggestions_include_matching_repository_context(tmp_path, monkeypatch):
@@ -32,14 +36,14 @@ def test_evaluation_suggestions_include_matching_repository_context(tmp_path, mo
     )
     report = evaluate_project(tmp_path, _config(), RepoContext(slug="owner/demo"))
     suggestion, parity = report["feature_suggestions"]
-    assert suggestion["evidence"] == [{"path": "onboarding.py", "excerpt": "def onboarding():"}]
+    assert suggestion["evidence"] == [{"path": "onboarding.py", "excerpt": "def onboarding"}]
     assert suggestion["evidence_status"] == "repository-context"
     assert parity["evidence_status"] == "unverified"
     html = _render_feature_suggestions(
         [{**suggestion, "repo": report["repo"]}, parity], verified_evidence=True,
     )
     assert 'href="https://github.com/owner/demo/blob/HEAD/onboarding.py"' in html
-    assert "def onboarding():" in html
+    assert "def onboarding" in html
     assert "unverified" in html
 
 
@@ -54,7 +58,7 @@ def test_inventory_excludes_secrets_hidden_directories_and_symlinks(tmp_path):
     (tmp_path / "local.py").write_text("def onboarding_local(): pass\n", encoding="utf-8")
     _track(tmp_path, "app.py", ".private/hidden.py", "secret.py", "link.py")
     assert repository_inventory(tmp_path, _config()) == [
-        {"path": "app.py", "excerpt": "def onboarding(): pass"}
+        {"path": "app.py", "excerpt": "def onboarding"}
     ]
 
 
@@ -78,7 +82,7 @@ def test_functional_plan_passes_inventory_and_canonicalizes_citations(tmp_path, 
     plan = plan_functional(tmp_path, _config())
     assert '"path": "onboarding.py"' in captured["task"]
     assert plan["improvements"][0]["evidence"] == [
-        {"path": "onboarding.py", "excerpt": "def onboarding(): pass"}
+        {"path": "onboarding.py", "excerpt": "def onboarding"}
     ]
     assert plan["improvements"][1]["evidence_status"] == "unverified"
     assert json.dumps(plan["improvements"][1]["evidence"]) == "[]"
@@ -102,6 +106,16 @@ def test_untrusted_model_evidence_is_never_rendered_as_verified():
     }])
     assert "invented" not in html
     assert "unverified" in html
+
+
+def test_inventory_uses_committed_declarations_without_comments_or_local_edits(tmp_path):
+    source = tmp_path / "onboarding.ts"
+    source.write_text("export const Onboarding = () => null; // private detail\n", encoding="utf-8")
+    _track(tmp_path, "onboarding.ts")
+    source.write_text("export const OnboardingLocal = 1; // local detail\n", encoding="utf-8")
+    assert repository_inventory(tmp_path, _config()) == [
+        {"path": "onboarding.ts", "excerpt": "export const Onboarding"}
+    ]
 
 
 def test_malformed_citations_are_unverified():

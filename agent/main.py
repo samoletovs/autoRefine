@@ -1139,6 +1139,19 @@ def plan_functional(
         plan = run_agent(client, agent, project_dir, config, task, mode="file-ideas", model=model)
         if plan is not None:
             verify_plan_evidence(plan, inventory)
+            for improvement in plan.get("improvements", []):
+                if not isinstance(improvement, dict) or not isinstance(
+                    improvement.get("description"), str
+                ):
+                    continue
+                evidence = improvement["evidence"]
+                context = "; ".join(
+                    f"{entry['path']}: {entry['excerpt']}" for entry in evidence
+                )
+                improvement["description"] += (
+                    f"\n\nRepository context (not proof of a gap): {context}"
+                    if context else "\n\nRepository evidence: unverified."
+                )
             if plan.get("outcome") == "no_gap":
                 log.info("Functional ideation for %s: evidence-backed no_gap.", config.name)
             return plan

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 
 from agent.config import ProjectConfig
@@ -19,8 +20,9 @@ _SENSITIVE = re.compile(
     r"[a-z][a-z0-9+.-]*://|[a-z0-9+/=_-]{32,})"
 )
 _DECLARATION = re.compile(
-    r"^(?:#{1,6}\s+|(?:(?:export|default|public|private|async|static|abstract)\s+)*"
-    r"(?:def|class|function|func|fn|interface|struct|type)\s+)"
+    r"^(?:(?:export|default|public|private|async|static|abstract)\s+)*"
+    r"(?:def|class|function|func|fn|interface|struct|type|const|let|var)\s+"
+    r"[A-Za-z_][A-Za-z0-9_]*"
 )
 
 
@@ -49,6 +51,7 @@ def repository_inventory(project_dir: Path, config: ProjectConfig) -> list[dict[
     tracked_paths = set(tracked)
     inventory: list[dict[str, str]] = []
     scanned = 0
+    deadline = time.monotonic() + 10
     for visited, (root, dirs, files) in enumerate(os.walk(project_dir, followlinks=False), 1):
         if visited > 500:
             return inventory
@@ -58,28 +61,45 @@ def repository_inventory(project_dir: Path, config: ProjectConfig) -> list[dict[
         )
         for name in sorted(files):
             path = Path(root) / name
+            relative = path.relative_to(project_dir).as_posix()
             if (name.startswith(".") or path.suffix.lower() not in _SUFFIXES
                     or _SENSITIVE.search(name) or path.is_symlink()
-                    or path.relative_to(project_dir).as_posix() not in tracked_paths):
+                    or not re.fullmatch(r"[A-Za-z0-9_./-]+", relative)
+                    or relative not in tracked_paths):
                 continue
             scanned += 1
-            if scanned > 500:
+            if scanned > 500 or time.monotonic() >= deadline:
                 return inventory
             try:
-                with path.open("rb") as source:
-                    data = source.read(65537)
-                if len(data) > 65536 or b"\0" in data:
+                remaining = max(0.01, deadline - time.monotonic())
+                object_name = f"HEAD:{relative}"
+                size = int(subprocess.run(
+                    ["git", "-C", str(project_dir), "cat-file", "-s", object_name],
+                    capture_output=True, timeout=remaining, check=True,
+                ).stdout)
+                if size > 65536:
+                    continue
+                remaining = max(0.01, deadline - time.monotonic())
+                data = subprocess.run(
+                    ["git", "-C", str(project_dir), "show", object_name],
+                    capture_output=True, timeout=remaining, check=True,
+                ).stdout
+                if b"\0" in data:
                     continue
                 lines = data.decode("utf-8").splitlines()
-            except (OSError, UnicodeError):
+            except (OSError, UnicodeError, ValueError, subprocess.SubprocessError):
                 continue
             for line in lines:
-                excerpt = line.strip()
-                words = set(re.findall(r"[a-z0-9]+", excerpt.lower()))
-                if (terms & words and _DECLARATION.match(excerpt) and not _SENSITIVE.search(excerpt)
-                        and not any(char in excerpt for char in ("'", '"', "`"))):
+                match = _DECLARATION.match(line.strip())
+                if not match:
+                    continue
+                excerpt = match.group()
+                words = set(re.findall(r"[a-z0-9]+", re.sub(
+                    r"([a-z0-9])([A-Z])", r"\1 \2", excerpt
+                ).lower()))
+                if terms & words and not _SENSITIVE.search(excerpt):
                     inventory.append({
-                        "path": path.relative_to(project_dir).as_posix(),
+                        "path": relative,
                         "excerpt": excerpt[:200],
                     })
                     break
@@ -96,7 +116,10 @@ def matching_evidence(text: str, inventory: list[dict[str, str]]) -> list[dict[s
     }
     return [
         entry for entry in inventory
-        if terms & set(re.findall(r"[a-z0-9]+", entry["excerpt"].lower()))
+        if terms & set(re.findall(
+            r"[a-z0-9]+",
+            re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", entry["excerpt"]).lower(),
+        ))
     ][:2]
 
 
