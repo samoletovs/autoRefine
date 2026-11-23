@@ -118,6 +118,20 @@ def test_inventory_uses_committed_declarations_without_comments_or_local_edits(t
     ]
 
 
+def test_inventory_recognizes_methods_without_copying_their_bodies(tmp_path):
+    examples = {
+        "app.cs": "public async Task Onboarding() { /* private detail */ }\n",
+        "app.java": "public void onboarding() { /* private detail */ }\n",
+        "app.go": "func (s *Server) Onboarding() { /* private detail */ }\n",
+    }
+    for path, content in examples.items():
+        (tmp_path / path).write_text(content, encoding="utf-8")
+    _track(tmp_path, *examples)
+    entries = repository_inventory(tmp_path, _config())
+    assert {entry["path"] for entry in entries} == set(examples)
+    assert all("private detail" not in entry["excerpt"] for entry in entries)
+
+
 def test_malformed_citations_are_unverified():
     plan = {"improvements": [{"evidence": [{"path": []}]}, {"evidence": "invalid"}]}
     verify_plan_evidence(plan, [{"path": "app.py", "excerpt": "onboarding"}])

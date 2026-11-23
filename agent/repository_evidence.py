@@ -24,6 +24,12 @@ _DECLARATION = re.compile(
     r"(?:def|class|function|func|fn|interface|struct|type|const|let|var)\s+"
     r"[A-Za-z_][A-Za-z0-9_]*"
 )
+_METHOD = re.compile(
+    r"^(?:(?:public|private|protected|internal|static|async|virtual|override|final)\s+)*"
+    r"[A-Za-z_][A-Za-z0-9_<>,.?\[\]]*\s+[A-Za-z_][A-Za-z0-9_]*\s*\("
+    r"|^func\s+\([A-Za-z_][A-Za-z0-9_]*\s+\*?[A-Za-z_][A-Za-z0-9_]*\)\s+"
+    r"[A-Za-z_][A-Za-z0-9_]*\s*\("
+)
 
 
 def repository_inventory(project_dir: Path, config: ProjectConfig) -> list[dict[str, str]]:
@@ -90,7 +96,7 @@ def repository_inventory(project_dir: Path, config: ProjectConfig) -> list[dict[
             except (OSError, UnicodeError, ValueError, subprocess.SubprocessError):
                 continue
             for line in lines:
-                match = _DECLARATION.match(line.strip())
+                match = _DECLARATION.match(line.strip()) or _METHOD.match(line.strip())
                 if not match:
                     continue
                 excerpt = match.group()
