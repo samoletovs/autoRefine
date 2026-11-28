@@ -54,11 +54,15 @@ def collect_findings(
 ) -> list[HealthFinding]:
     findings: list[HealthFinding] = []
     for repo, data in github_data.items():
+        if data.get("ci_event") == "dynamic":
+            # Keep the managed run on the dashboard without letting it mask
+            # the latest repository workflow in the same API response.
+            data = data.get("latest_repository_run") or {}
         if data.get("ci_status") not in FAILED_WORKFLOW_STATES:
             continue
         name = data.get("ci_name", "unnamed workflow")
         message = (
-            f"{repo}: latest workflow '{name}' {data['ci_status']} "
+            f"{repo}: latest workflow (repository-managed) '{name}' {data['ci_status']} "
             f"(event={data.get('ci_event', 'unknown')}, "
             f"branch={data.get('ci_branch', 'unknown')})."
         )
