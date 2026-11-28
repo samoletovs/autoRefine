@@ -588,6 +588,14 @@ _PLAN_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
                             "category": {"type": "string"},
                             "approach": {"type": "string"},
                             "success_criteria": {"type": "string"},
+                            "evidence": {
+                                "type": "array",
+                                "description": "Relevant repository inventory entries by path.",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {"path": {"type": "string"}},
+                                },
+                            },
                         },
                     },
                 },

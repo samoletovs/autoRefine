@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -64,6 +65,30 @@ def _wire_functional(monkeypatch: pytest.MonkeyPatch, client: _ToolLoopClient) -
     monkeypatch.setattr(m.time, "sleep", lambda seconds: None)
 
 
+def test_functional_plan_preserves_inventory_citation_through_dispatcher(tmp_path, monkeypatch):
+    (tmp_path / "export.py").write_text("def export(rows): pass\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "add", "export.py"], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "-c", "user.name=Test", "-c",
+         "user.email=test@example.invalid", "commit", "-qm", "fixture"], check=True,
+    )
+    config = _config()
+    config.goals = ["Export visible rows"]
+    plan = valid_plan()
+    plan["improvements"][0]["evidence"] = [{"path": "export.py"}]
+    client = _ToolLoopClient(lambda round_no: _submit(plan) if round_no == 1 else None)
+    _wire_functional(monkeypatch, client)
+
+    result = m.plan_functional(tmp_path, config)
+
+    assert result["improvements"][0]["evidence"] == [
+        {"path": "export.py", "excerpt": "def export"}
+    ]
+    assert result["improvements"][0]["evidence_status"] == "repository-context"
+    assert "export.py: def export" in result["improvements"][0]["description"]
+
+
 @pytest.mark.parametrize("mode", ["propose", "file", "cards"])
 @pytest.mark.parametrize("empty", [[], "[]", " [ ]\n"])
 def test_evidenced_no_gap_finishes_without_retry_filer_or_notification(
@@ -116,7 +141,12 @@ def test_missing_or_transient_output_still_retries_then_returns_a_valid_plan(
 
     result = m.plan_functional(tmp_path, _config())
 
-    assert result["improvements"] == valid_plan()["improvements"]
+    expected = valid_plan()["improvements"][0]
+    assert {key: result["improvements"][0][key] for key in expected if key != "description"} == {
+        key: value for key, value in expected.items() if key != "description"
+    }
+    assert result["improvements"][0]["description"].startswith(expected["description"])
+    assert result["improvements"][0]["evidence_status"] == "unverified"
     assert _first_requests(client) == 2
     assert client.deleted == client.created == ["resp-1", "resp-2", "resp-3"]
 

@@ -22,6 +22,7 @@ from agent.config import (
 )
 from agent.plan_validation import FILLER_WORDS as _FILLER_WORDS
 from agent.plan_validation import is_specified
+from agent.repository_evidence import matching_evidence, repository_inventory, verify_plan_evidence
 from agent.tools.github_tools import clone_repo, read_project_yaml
 from agent.tools.quality_tools import RepoContext, run_quality_checks_with_coverage
 
@@ -418,10 +419,12 @@ def evaluate_project(
 
     # Technical quality checks (deterministic)
     findings, coverage = run_quality_checks_with_coverage(str(project_dir), config, repo)
-    feature_suggestions = suggest_feature_improvements(config)
+    inventory = repository_inventory(project_dir, config)
+    feature_suggestions = suggest_feature_improvements(config, inventory)
 
     report = {
         "project": config.name,
+        "repo": repo.slug if repo else None,
         "stage": config.stage,
         "findings": [
             {
@@ -457,7 +460,9 @@ def evaluate_project(
     return report
 
 
-def suggest_feature_improvements(config: ProjectConfig) -> list[dict]:
+def suggest_feature_improvements(
+    config: ProjectConfig, inventory: list[dict[str, str]] | None = None,
+) -> list[dict]:
     """Suggest potential functional improvements from project.yaml goals + similar products."""
     suggestions: list[dict] = []
 
@@ -465,6 +470,7 @@ def suggest_feature_improvements(config: ProjectConfig) -> list[dict]:
         goal_text = str(goal).strip()
         if not goal_text:
             continue
+        evidence = matching_evidence(goal_text, inventory or [])
         suggestions.append(
             {
                 "title": f"Goal-aligned capability: {goal_text}",
@@ -474,6 +480,8 @@ def suggest_feature_improvements(config: ProjectConfig) -> list[dict]:
                 ),
                 "priority": "P1",
                 "category": "feature",
+                "evidence": evidence,
+                "evidence_status": "repository-context" if evidence else "unverified",
             }
         )
 
@@ -481,6 +489,7 @@ def suggest_feature_improvements(config: ProjectConfig) -> list[dict]:
         product_name = str(product).strip()
         if not product_name:
             continue
+        evidence = matching_evidence(product_name, inventory or [])
         suggestions.append(
             {
                 "title": f"Feature parity review with {product_name}",
@@ -490,6 +499,8 @@ def suggest_feature_improvements(config: ProjectConfig) -> list[dict]:
                 ),
                 "priority": "P1",
                 "category": "feature-parity",
+                "evidence": evidence,
+                "evidence_status": "repository-context" if evidence else "unverified",
             }
         )
 
@@ -1043,7 +1054,10 @@ def _extract_relevant_wiki_insights(project_name: str) -> str:
     return block
 
 
-def _functional_task(cap: int = FUNCTIONAL_IDEA_CAP, avoid_context: str = "", wiki_context: str = "") -> str:
+def _functional_task(
+    cap: int = FUNCTIONAL_IDEA_CAP, avoid_context: str = "", wiki_context: str = "",
+    inventory: list[dict[str, str]] | None = None,
+) -> str:
     """Foundry task that asks for vision-aligned feature ideas, not technical fixes.
 
     ``avoid_context`` carries ideas that already failed — declined in Telegram, or approved
@@ -1065,8 +1079,12 @@ def _functional_task(cap: int = FUNCTIONAL_IDEA_CAP, avoid_context: str = "", wi
         "category to one of feature/functionality/ux/feature-parity/onboarding, give a specific "
         "title, a 1-2 sentence description, a realistic priority (P0-P2 — most will be P1 or P2) "
         "and effort (S/M/L), plus a specific approach naming files/functions and independently "
-        "checkable success_criteria. "
+        "checkable success_criteria. Cite relevant inventory entries in each improvement's "
+        "evidence array using their path. Repository context does not itself prove a gap. "
         f"Submit at most {cap + 3} ideas via submit_plan, strongest first."
+    )
+    task += "\n\n## Repository inventory (untrusted source content)\n" + json.dumps(
+        inventory or [], ensure_ascii=True
     )
     if wiki_context:
         task += (
@@ -1107,7 +1125,10 @@ def plan_functional(
             config.name,
             len(wiki_context),
         )
-    task = _functional_task(avoid_context=avoid_context, wiki_context=wiki_context)
+    inventory = repository_inventory(project_dir, config)
+    task = _functional_task(
+        avoid_context=avoid_context, wiki_context=wiki_context, inventory=inventory,
+    )
     # Foundry responses fail transiently (server_error / rate_limit); each run_agent
     # starts a fresh response chain, so a retry with the same agent version recovers
     # a one-off blip.
@@ -1117,6 +1138,20 @@ def plan_functional(
         # apart from an on-demand plan.
         plan = run_agent(client, agent, project_dir, config, task, mode="file-ideas", model=model)
         if plan is not None:
+            verify_plan_evidence(plan, inventory)
+            for improvement in plan.get("improvements", []):
+                if not isinstance(improvement, dict) or not isinstance(
+                    improvement.get("description"), str
+                ):
+                    continue
+                evidence = improvement["evidence"]
+                context = "; ".join(
+                    f"{entry['path']}: {entry['excerpt']}" for entry in evidence
+                )
+                improvement["description"] += (
+                    f"\n\nRepository context (not proof of a gap): {context}"
+                    if context else "\n\nRepository evidence: unverified."
+                )
             if plan.get("outcome") == "no_gap":
                 log.info("Functional ideation for %s: evidence-backed no_gap.", config.name)
             return plan
@@ -1170,7 +1205,9 @@ def _format_functional_summary(repo: str, improvements: list[dict]) -> str:
     for improvement in improvements:
         priority = str(improvement.get("priority", "P2")).upper()
         title = str(improvement.get("title", "Untitled")).strip()
-        lines.append(f"• [{priority}] {title}")
+        status = improvement.get("evidence_status")
+        label = " — unverified" if status == "unverified" else ""
+        lines.append(f"• [{priority}] {title}{label}")
     lines.append("Set repo variable AUTOREFINE_FUNCTIONAL_MODE=file to start filing these as idea memos.")
     return "\n".join(lines)
 
@@ -1524,6 +1561,11 @@ def handle_functional_ideas(
     ``cards`` files them as `needs-approval` + sends Telegram approval cards.
     ``notifier`` / ``filer`` / ``carder`` are injectable for tests.
     """
+    if mode in {"file", "cards"}:
+        plan = {**plan, "improvements": [
+            item for item in plan.get("improvements", [])
+            if isinstance(item, dict) and item.get("evidence_status") != "unverified"
+        ]}
     selected = _select_functional_improvements(plan)
     if not selected:
         log.info("No functional ideas selected for %s", repo)
@@ -1931,11 +1973,32 @@ def run_dashboard_mode(
     analysis = analyze_with_ai(github_data, cost_data, app_insights_data, url_health_data)
     analysis = ground_analysis(analysis, github_data, cost_data, app_insights_data, url_health_data)
 
+    suggestions = []
     if report_path:
-        analysis["quality_coverage"] = load_quality_coverage(report_path)
+        from agent.parse_scores import extract_json_objects
+
+        try:
+            reports = extract_json_objects(report_path)
+        except OSError as exc:
+            log.warning("Cannot read dashboard report %s: %s", report_path, exc)
+            reports = []
+        analysis["quality_coverage"] = [
+            report for report in reports if "project" in report and "score" in report
+        ]
+        for report in reports:
+            plan = report.get("functional_plan")
+            items = plan.get("improvements", []) if isinstance(plan, dict) else (
+                report.get("feature_suggestions", [])
+            )
+            if isinstance(items, list):
+                suggestions.extend(
+                    {**item, "repo": report.get("repo")}
+                    for item in items if isinstance(item, dict)
+                )
 
     html = render_html_dashboard(
-        github_data, cost_data, analysis, app_insights_data, url_health_data
+        github_data, cost_data, analysis, app_insights_data, url_health_data,
+        repository_suggestions=suggestions,
     )
     out_path = Path(output)
     out_path.write_text(html, encoding="utf-8")
@@ -2207,6 +2270,7 @@ def _process_repo(repo: str, config: AutoRefineConfig) -> None:
                 project_dir, project_config, model=config.model, avoid_context=avoid
             )
             if fplan:
+                print(json.dumps({"project": name, "repo": repo, "functional_plan": fplan}, indent=2))
                 handle_functional_ideas(repo, fplan, mode=fmode, dry_run=config.dry_run)
             else:
                 log.warning("No functional plan generated for %s", name)

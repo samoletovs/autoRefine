@@ -718,6 +718,24 @@ def _run_dashboard(output_file: str, report_path: str | None) -> str:
     return open(output_file, encoding="utf-8").read()
 
 
+def test_run_dashboard_mode_renders_functional_plan_evidence(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("GH_TOKEN", "fake-token")
+    report = tmp_path / "report.json"
+    report.write_text(json.dumps({
+        "project": "demo", "repo": "owner/demo",
+        "functional_plan": {"improvements": [{
+            "title": "Welcome flow",
+            "evidence": [{"path": "app/onboarding.py", "excerpt": "def onboarding():"}],
+        }]},
+    }), encoding="utf-8")
+
+    html = _run_dashboard(str(tmp_path / "dashboard.html"), str(report))
+
+    assert "Welcome flow" in html
+    assert 'href="https://github.com/owner/demo/blob/HEAD/app/onboarding.py"' in html
+    assert "def onboarding():" in html
+
+
 def test_run_dashboard_mode_fills_coverage_from_an_evaluate_report(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

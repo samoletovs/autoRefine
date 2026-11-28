@@ -36,7 +36,9 @@ import datetime
 import hashlib
 import html as html_lib
 import logging
+import re
 from typing import Any
+from urllib.parse import quote
 
 from agent.azure_costs import budget_status, cost_details, cost_scan_error, format_cost
 from agent.health_evidence import describe_probes
@@ -281,7 +283,9 @@ def _render_list(items: list[Any], ordered: bool = False) -> str:
     return f"<{tag}>{lis}</{tag}>"
 
 
-def _render_feature_suggestions(suggestions: list[Any]) -> str:
+def _render_feature_suggestions(
+    suggestions: list[Any], *, verified_evidence: bool = False,
+) -> str:
     """Render feature/improvement suggestions as a card list.
 
     Each suggestion is expected to be a dict with ``title``, ``description``,
@@ -351,11 +355,40 @@ def _render_feature_suggestions(suggestions: list[Any]) -> str:
             badges += f"<span class=\"badge badge-cat\">{category}</span>"
         badges_html = f"<div class=\"suggestion-badges\">{badges}</div>" if badges else ""
         desc_html = f"<div class=\"suggestion-desc\">{desc}</div>" if desc else ""
+        evidence = s.get("evidence")
+        evidence_html = ""
+        if verified_evidence and isinstance(evidence, list) and evidence:
+            entries = []
+            repo = s.get("repo")
+            for entry in evidence:
+                if not isinstance(entry, dict):
+                    continue
+                path, excerpt = entry.get("path"), entry.get("excerpt")
+                if not isinstance(path, str) or not path or not isinstance(excerpt, str):
+                    continue
+                label = _esc(path)
+                if (
+                    isinstance(repo, str)
+                    and re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo)
+                    and all(part not in ("", ".", "..") for part in path.split("/"))
+                    and "\\" not in path
+                ):
+                    url = f"https://github.com/{quote(repo, safe='/')}/blob/HEAD/{quote(path, safe='/')}"
+                    label = f'<a href="{_esc(url)}">{label}</a>'
+                entries.append(f"<li>{label}: {_esc(excerpt)}</li>")
+            if entries:
+                evidence_html = (
+                    '<div class="suggestion-evidence">Repository context '
+                    "(does not verify the proposed gap):<ul>" + "".join(entries) + "</ul></div>"
+                )
+        if not evidence_html:
+            evidence_html = '<div class="suggestion-evidence">Repository evidence: unverified.</div>'
         cards.append(
             f"<div class=\"suggestion-card\">"
             f"<div class=\"suggestion-title\">{title}</div>"
             f"{badges_html}"
             f"{desc_html}"
+            f"{evidence_html}"
             f"{_feedback_controls(suggestion_id)}"
             f"</div>"
         )
@@ -427,6 +460,7 @@ def render_html_dashboard(
     app_insights_data: dict[str, Any] | None = None,
     url_health_data: dict[str, Any] | None = None,
     refresh_seconds: int = 300,
+    repository_suggestions: list[Any] | None = None,
 ) -> str:
     """Return a self-contained HTML dashboard page from health-scan data.
 
@@ -478,7 +512,14 @@ def render_html_dashboard(
             "measured alerts remain below.</p>" + alerts_html
         )
     recs_html = _render_list(recs, ordered=True)
-    suggestions_html = _render_feature_suggestions(feature_suggestions)
+    if repository_suggestions:
+        suggestions_html = _render_feature_suggestions(
+            repository_suggestions, verified_evidence=True,
+        )
+        if feature_suggestions:
+            suggestions_html += _render_feature_suggestions(feature_suggestions)
+    else:
+        suggestions_html = _render_feature_suggestions(feature_suggestions)
     progress_html = _render_progress_tracking(github_data)
 
     issues_rows = "".join(

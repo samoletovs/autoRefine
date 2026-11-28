@@ -8,7 +8,7 @@ import json
 import sys
 
 
-def extract_score_objects(path: str) -> list[dict]:
+def extract_json_objects(path: str) -> list[dict]:
     dec = json.JSONDecoder()
     with open(path, encoding="utf-8") as f:
         content = f.read()
@@ -17,12 +17,19 @@ def extract_score_objects(path: str) -> list[dict]:
     while idx < len(content):
         try:
             obj, size = dec.raw_decode(content, idx)
-            if isinstance(obj, dict) and "score" in obj and "project" in obj:
+            if isinstance(obj, dict):
                 objects.append(obj)
             idx = size
         except json.JSONDecodeError:
             idx += 1
     return objects
+
+
+def extract_score_objects(path: str) -> list[dict]:
+    return [
+        obj for obj in extract_json_objects(path)
+        if "score" in obj and "project" in obj
+    ]
 
 
 if __name__ == "__main__":
