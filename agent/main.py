@@ -661,11 +661,16 @@ def _normalize_title(title: str) -> frozenset[str]:
     a title verbatim. Filler is dropped so two titles are not judged similar merely
     for both containing "add" and "the".
     """
+    # Filed ideas are titled "[idea] ..."; the tag is on every open idea, so it is
+    # not evidence of similarity and only dilutes the comparison.
+    title = re.sub(r"^\s*\[[^\]]*\]\s*", "", title)
     words = re.sub(r"[^0-9a-zA-Z]+", " ", title).lower().split()
     return frozenset(_stem(w) for w in words if w not in _FILLER_WORDS)
 
 
-def _is_near_duplicate(title: str, existing: list[str], threshold: float = 0.5) -> str | None:
+def _is_near_duplicate(
+    title: str, existing: list[str], threshold: float = 0.5, repo: str = "",
+) -> str | None:
     """The title of an open idea this one substantially repeats, or None.
 
     Returns the match so the caller can name it in the log - "skipped, duplicates
@@ -690,12 +695,17 @@ def _is_near_duplicate(title: str, existing: list[str], threshold: float = 0.5) 
                        somebody's time closing it.
 
     The cheap error is the one to prefer, so this leans toward catching duplicates.
+
+    Every idea for a repo is about that repo, so its owner and name ("dealScout")
+    are dropped: one title naming the repo and the other not made a real duplicate
+    pair score 3/7 instead of 3/6 and slip through.
     """
-    new = _normalize_title(title)
+    ignored = _normalize_title(repo.replace("/", " "))
+    new = _normalize_title(title) - ignored
     if not new:
         return None
     for other in existing:
-        old = _normalize_title(other)
+        old = _normalize_title(other) - ignored
         if not old:
             continue
         overlap = len(new & old) / min(len(new), len(old))
@@ -875,7 +885,7 @@ def file_ideas_for_plan(
             )
             continue
 
-        match = _is_near_duplicate(title, already_open)
+        match = _is_near_duplicate(title, already_open, repo=repo)
         if match:
             duplicates += 1
             log.info(

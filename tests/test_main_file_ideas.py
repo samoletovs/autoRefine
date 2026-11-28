@@ -332,6 +332,23 @@ def test_the_match_is_returned_so_it_can_be_named():
     assert m == "Educational Features Enhancement"
 
 
+def test_the_real_dealscout_pair_is_caught_despite_naming_the_repo():
+    """dealScout#95 repeated the open #93 and was closed by hand.
+
+    The new title named the repo and the open one carried the "[idea]" tag, so
+    each side had a word the other could never share and the pair scored 3/7.
+    """
+    open_idea = "[idea] Validate user YAML configuration before any scheduled run"
+    new_idea = "Reject malformed dealScout configuration before a run starts"
+    assert main._is_near_duplicate(new_idea, [open_idea], repo="samoletovs/dealScout") == open_idea
+
+
+def test_the_repo_name_alone_is_not_similarity():
+    assert main._is_near_duplicate(
+        "Add dealScout alerts", ["[idea] Speed up dealScout startup"],
+        repo="samoletovs/dealScout") is None
+
+
 def test_empty_and_filler_only_titles_do_not_match_everything():
     assert main._is_near_duplicate("", ["Anything"]) is None
     assert main._is_near_duplicate("Implement the feature", [""]) is None
