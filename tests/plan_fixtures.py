@@ -11,7 +11,10 @@ def valid_plan(score: int = 72) -> dict:
             "priority": "P1",
             "effort": "S",
             "category": "feature",
-            "approach": "Implement serialize_csv in src/export.py using csv.writer.",
-            "success_criteria": "pytest tests/test_export.py verifies header order and quoted cells.",
+            "approach": "Create src/export.py with serialize_csv built on csv.writer.",
+            "success_criteria": (
+                "A new tests/test_export.py passes under pytest tests/test_export.py, "
+                "checking header order and quoted cells."
+            ),
         }],
     }

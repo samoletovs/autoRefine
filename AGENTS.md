@@ -183,7 +183,13 @@ summary=..., no_gap_evidence=[{"path": ..., "observation": ...}])` is a successf
 empty result only with an explanation and files successfully read in that run.
 Missing output and transient service failures still have the existing bounded retry.
 `agent/plan_validation.py` supplies the shared specificity check for tool feedback
-and filing. Rejected submissions get one-based item/field errors and at most two
+and filing; `success_criteria` must also be measurable (a threshold, before/after
+value or pass/fail result). At `submit_plan` time `plan_errors(..., project_dir=...)`
+also grounds each memo in the checked-out repo: paths named in `approach` must
+exist unless the memo says it creates them, and test commands in `success_criteria`
+(npm/pnpm/yarn scripts, `npx` runners, pytest and its path arguments, `go`/`cargo`/
+`dotnet test`) must be defined there. Functions named in `approach` are not checked.
+Rejected submissions get one-based item/field errors and at most two
 repair opportunities (three rejected submissions total). Only a wholly acceptable
 plan from a completed run is returned; the final filer still independently rejects
 unspecified memos. Text fallback cannot bypass validation.
