@@ -556,8 +556,11 @@ _PLAN_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
         "description": (
             "Submit a structured improvement plan after analyzing the project. Each "
             "improvement's `approach` must name the actual files/commands to change, not "
-            "restate the title; `success_criteria` must be checkable by someone who did not "
-            "do the work, e.g. 'pytest exits 0 with >=60 passing tests'. Use outcome "
+            "restate the title; paths must exist in this repo unless you say you create "
+            "them. `success_criteria` must be a measurable check (threshold, before/after "
+            "value or pass/fail result) that someone who did not do the work can run, "
+            "e.g. 'pytest exits 0 with >=60 passing tests', using a test command this "
+            "repo defines. Use outcome "
             "'no_gap' with improvements [] only when no evidence-backed P0-P2 gap exists, "
             "citing files successfully read this run in no_gap_evidence."
         ),
@@ -1085,7 +1088,7 @@ def _normalize_plan_args(args: dict) -> dict:
 
 
 def _handle_submit_plan(
-    _project_dir: Path, args: dict, *, read_paths: set[str] | None = None,
+    project_dir: Path, args: dict, *, read_paths: set[str] | None = None,
 ) -> str:
     """Validate before acknowledgement, while the model can still repair its memo."""
     if not isinstance(args, dict):
@@ -1094,7 +1097,7 @@ def _handle_submit_plan(
             "errors": [{"item": None, "field": "arguments", "error": "Supply a JSON object."}],
         })
     plan = _normalize_plan_args(args)
-    errors = plan_errors(plan, read_paths=read_paths or set())
+    errors = plan_errors(plan, read_paths=read_paths or set(), project_dir=project_dir)
     if errors:
         return json.dumps({
             "status": "plan_rejected",
@@ -1892,7 +1895,9 @@ def run_agent(
             # Fallback: if agent didn't call submit_plan, parse from text
             if plan_result is None and "Score:" in agent_text:
                 candidate = _parse_plan_from_text(agent_text)
-                if candidate and not plan_errors(candidate, read_paths=read_paths):
+                if candidate and not plan_errors(
+                    candidate, read_paths=read_paths, project_dir=project_dir,
+                ):
                     plan_result = candidate
                     log.info("Parsed plan from text response (submit_plan not called)")
 

@@ -93,7 +93,7 @@ Each entry in `improvements` is an object with these fields:
 | `effort` | expected | `S`, `M`, or `L`. |
 | `category` | expected | e.g. `feature`, `tests`, `security`, `performance`. |
 | `approach` | validated | The actual files, functions, or commands to change. |
-| `success_criteria` | validated | A check a stranger could run for a yes or no. |
+| `success_criteria` | validated | A measurable check a stranger could run for a yes or no. |
 
 `approach` and `success_criteria` are machine-validated, not merely stored.
 Each must say at least two substantive things that its `title` does not.
@@ -103,6 +103,19 @@ rejected submissions the run stops; no rejected plan reaches filing.
 Vague verbs do not count as substance: implement, add,
 enhance, improve, optimize, support, ensure, update and their variants are
 ignored when deciding whether you actually said anything.
+
+Both fields are also checked against the repository you are reviewing:
+
+- Every file path in `approach` must exist. Copy paths from list_directory
+  output instead of guessing a layout. A file you will create must say so,
+  e.g. "create src/export.py" or "src/export.py (new)".
+- `success_criteria` must be measurable: a threshold ("p95 under 300 ms"), a
+  before/after value ("from 4 clicks to 1"), or a pass/fail result.
+- A test command in `success_criteria` must be one this repo defines:
+  `npm test` / `npm run <script>` needs that script in package.json, `pytest`
+  needs Python tests or pytest config, `npx jest` needs jest as a dependency,
+  `go test` needs go.mod. If the memo adds the script or runner, say so in
+  `approach`.
 
 ### Worked example — accepted
 
