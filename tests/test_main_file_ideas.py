@@ -349,6 +349,12 @@ def test_the_repo_name_alone_is_not_similarity():
         repo="samoletovs/dealScout") is None
 
 
+def test_a_title_that_is_only_the_repo_name_still_matches_its_repeat():
+    assert main._is_near_duplicate(
+        "Improve dealScout", ["[idea] Improve dealScout"],
+        repo="samoletovs/dealScout") == "[idea] Improve dealScout"
+
+
 def test_empty_and_filler_only_titles_do_not_match_everything():
     assert main._is_near_duplicate("", ["Anything"]) is None
     assert main._is_near_duplicate("Implement the feature", [""]) is None
@@ -422,3 +428,38 @@ def test_file_ideas_for_plan_actually_skips_an_already_open_duplicate(monkeypatc
     titles = [c[-1] for c in calls]
     assert not any("Educational" in t for t in titles), \
         "file_ideas_for_plan did not consult the open-issue list"
+
+
+def test_file_ideas_for_plan_ignores_the_repo_name_when_deduplicating(monkeypatch, tmp_path):
+    """Wiring for the dealScout#95 fix: dropping repo= at the call site must fail this."""
+    calls: list[list[str]] = []
+
+    def _fake_run(cmd, *args, **kwargs):
+        if cmd and cmd[0] == "gh":
+            return SimpleNamespace(
+                returncode=0,
+                stdout="[idea] Validate user YAML configuration before any scheduled run\n",
+                stderr="")
+        calls.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    script = tmp_path / "file-idea.py"
+    script.write_text("# stub", encoding="utf-8")
+    monkeypatch.setattr(main, "_resolve_file_idea_script", lambda: script)
+    monkeypatch.setattr(main, "_build_run_references", lambda: "- commit: `abc`")
+    monkeypatch.setattr(main, "_discover_file_idea_options", lambda p: {"--repo"})
+    monkeypatch.setattr(main.subprocess, "run", _fake_run)
+
+    filed = main.file_ideas_for_plan(
+        repo="samoletovs/dealScout",
+        plan={"improvements": [{
+            "title": "Reject malformed dealScout configuration before a run starts",
+            "priority": "P1", "category": "bugfix",
+            "approach": "Validate the YAML against a schema before the scheduler starts a run.",
+            "success_criteria": "A config with a missing price field fails before any scrape begins.",
+        }]},
+        dry_run=False,
+    )
+
+    assert filed == 0
+    assert calls == []

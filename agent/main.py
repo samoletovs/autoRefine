@@ -701,13 +701,18 @@ def _is_near_duplicate(
     pair score 3/7 instead of 3/6 and slip through.
     """
     ignored = _normalize_title(repo.replace("/", " "))
-    new = _normalize_title(title) - ignored
-    if not new:
+    new_words = _normalize_title(title)
+    if not new_words:
         return None
     for other in existing:
-        old = _normalize_title(other) - ignored
-        if not old:
+        old_words = _normalize_title(other)
+        if not old_words:
             continue
+        new, old = new_words - ignored, old_words - ignored
+        if not new or not old:
+            # "Improve dealScout" has nothing but the repo name to compare, so
+            # keep it rather than let an exact repeat through.
+            new, old = new_words, old_words
         overlap = len(new & old) / min(len(new), len(old))
         if overlap >= threshold:
             return other
